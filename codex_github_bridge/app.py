@@ -26,8 +26,30 @@ class BridgeApp:
         self._token_owner = ""
         self.allowed_users: set[str] = set(cfg.github_allowed_users)
 
+    def _select_working_github_auth(self) -> None:
+        errors: list[str] = []
+        for token, source in self.cfg.github_auth_candidates:
+            client = GitHubClient(token, self.cfg.github_repo)
+            try:
+                owner = client.whoami().lower()
+            except Exception as exc:
+                errors.append(f"{source}: {exc}")
+                continue
+            self.github = client
+            self._token_owner = owner
+            print(f"GitHub auth ok: {source} as @{owner}")
+            return
+        detail = "\n".join(errors[-5:]) if errors else "no token candidates"
+        raise RuntimeError(
+            "No valid GitHub authentication token found.\n"
+            "Fix one of these options:\n"
+            "1. Leave GITHUB_TOKEN blank and run: gh auth login\n"
+            "2. Or set GITHUB_TOKEN to a valid token with Issues read/write permission.\n\n"
+            f"Tried candidates:\n{detail}"
+        )
+
     def setup(self) -> None:
-        self._token_owner = self.github.whoami().lower()
+        self._select_working_github_auth()
         if not self.allowed_users:
             self.allowed_users = {self._token_owner}
         if self.issue_number <= 0:
@@ -40,6 +62,7 @@ class BridgeApp:
             self.post(
                 "Codex GitHub Bridge 已启动。\n\n"
                 f"- repo: `{self.cfg.github_repo}`\n"
+                f"- auth: `{self.cfg.github_token_source}`\n"
                 f"- issue: `#{self.issue_number}`\n"
                 f"- local repo: `{self.cfg.repo_path}`\n"
                 f"- allowed users: `{', '.join(sorted(self.allowed_users))}`\n\n"
@@ -170,6 +193,7 @@ class BridgeApp:
             f"- codex: `{s.status}`\n"
             f"- pid: `{s.current_pid}`\n"
             f"- repo: `{self.cfg.github_repo}`\n"
+            f"- auth: `{self.cfg.github_token_source}`\n"
             f"- issue: `#{self.issue_number}`\n"
             f"- local repo: `{self.cfg.repo_path}`\n"
             f"- last started: `{s.last_started_at or '-'}`\n"

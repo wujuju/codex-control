@@ -20,9 +20,36 @@ GitHub Issue 评论
 
 ---
 
-## 1. 准备 GitHub Token
+## 1. 准备 GitHub 登录
 
-需要一个能给 `wujuju/codex-control` 发 Issue 评论的 token。
+本工具需要能读取 Issue 评论、创建 Issue、回复 Issue 评论。
+
+### 推荐方式：复用 GitHub CLI 登录
+
+如果你本机已经安装 GitHub CLI，并且执行过：
+
+```bat
+gh auth login
+```
+
+那么 `.env` 里的 `GITHUB_TOKEN` 可以留空。bridge 会自动尝试：
+
+```bat
+gh auth token
+```
+
+来读取当前 GitHub CLI 保存的 token。
+
+检查方式：
+
+```bat
+gh auth status
+gh auth token
+```
+
+### 备用方式：手动填 Token
+
+如果你没有安装 GitHub CLI，才需要手动准备一个能给 `wujuju/codex-control` 发 Issue 评论的 token。
 
 推荐 Fine-grained token：
 
@@ -59,7 +86,8 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 
 ```env
 GITHUB_REPO=wujuju/codex-control
-GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+# GITHUB_TOKEN 可以留空，程序会自动尝试 gh auth token
+GITHUB_TOKEN=
 GITHUB_ALLOWED_USERS=你的GitHub用户名
 REPO_PATH=D:\Sam\HGameAI
 CODEX_BIN=codex
@@ -219,9 +247,45 @@ GITHUB_ALLOWED_USERS=你的GitHub用户名
 
 ## 10. 常见问题
 
-### 1）启动时报 GITHUB_TOKEN is required
+### GITHUB_TOKEN 可以不填吗？
 
-编辑 `.env`，填入 GitHub token。
+可以，但前提是本机已经安装 GitHub CLI，并且 `gh auth status` 显示已经登录。
+
+浏览器登录 GitHub 或 Git remote 能 push，不等于 Python 程序能直接调用 GitHub REST API。bridge 不会读取浏览器 cookie，也不会读取 Git 的 HTTPS 凭据。它只会按顺序尝试：
+
+1. `.env` 里的 `GITHUB_TOKEN`
+2. 系统环境变量 `GH_TOKEN`
+3. `gh auth token`
+
+如果三者都没有，就会报 GitHub authentication is required。
+
+
+
+### 启动时报 401 Bad credentials
+
+这通常是 `.env` 里 `GITHUB_TOKEN` 填了过期 token、示例 token，或系统环境变量 `GH_TOKEN` 里有旧 token。
+
+推荐处理：
+
+```bat
+set GITHUB_TOKEN=
+set GH_TOKEN=
+gh auth status
+gh auth login
+gh auth token
+```
+
+然后把 `.env` 里的 `GITHUB_TOKEN` 留空：
+
+```env
+GITHUB_TOKEN=
+```
+
+新版会自动跳过明显的示例 token，并且启动时验证每个候选 token；如果 `GITHUB_TOKEN` 无效，会继续尝试 `GH_TOKEN` 和 `gh auth token`。
+
+### 1）启动时报 GitHub authentication is required
+
+没有可用认证。最简单做法：安装 GitHub CLI，然后执行 `gh auth login`。或者在 `.env` 填入有效的 `GITHUB_TOKEN`。
 
 ### 2）启动时报 REPO_PATH does not exist
 
