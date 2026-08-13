@@ -1,5 +1,0 @@
-**/__pycache__/
-.venv*/
-.pycache/**
-.env
-.env.example
