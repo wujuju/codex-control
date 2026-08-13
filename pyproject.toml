@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Control local Codex from the Windows WeChat desktop client"
 requires-python = ">=3.10,<3.14"
 dependencies = [
+  "PySide6>=6.8,<7",
   "PyYAML>=6.0,<7",
   "psutil>=7.0,<8",
   "pywin32>=310",
@@ -17,5 +18,11 @@ dependencies = [
 [project.scripts]
 wechat-codex = "wechat_codex.cli:main"
 
+[project.gui-scripts]
+wechat-codex-gui = "wechat_codex.gui:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+wechat_codex = ["qml/*.qml"]

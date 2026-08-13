@@ -1,10 +1,10 @@
 $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$python = Join-Path $projectRoot ".venv\Scripts\python.exe"
+$executable = Join-Path $projectRoot ".venv\Scripts\wechat-codex-gui.exe"
 
-if (-not (Test-Path -LiteralPath $python)) {
-    throw "未找到 .venv，请先运行：python -m venv .venv；.\.venv\Scripts\python.exe -m pip install -e ."
+if (-not (Test-Path -LiteralPath $executable)) {
+    throw "GUI executable not found. Run: .\.venv\Scripts\python.exe -m pip install -e ."
 }
 
 $env:PYTHONUTF8 = "1"
-& $python -m wechat_codex --config (Join-Path $projectRoot "config.yaml") start
+& $executable --config (Join-Path $projectRoot "config.yaml")

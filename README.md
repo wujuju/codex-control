@@ -2,6 +2,8 @@
 
 一个纯本地 Windows 小工具：读取已登录的 PC 微信消息，普通消息交给 Codex 做只读聊天，只有带“干活”前缀的消息才允许 Codex 修改预配置项目。
 
+桌面端使用 PySide6 + QML：左侧显示私聊/群聊会话，右侧显示收到的消息、Codex 回复和手动发送区。窗口可正常最小化，最小化后微信监听与 Codex 任务继续运行。
+
 ## 当前能力
 
 - 固定监听一个联系人、群聊或“文件传输助手”
@@ -63,13 +65,21 @@ projects:
 .\.venv\Scripts\wechat-codex.exe --config config.yaml send "连接测试成功"
 ```
 
-开始监听：
+启动可视化 QML 桌面端：
+
+```powershell
+.\start.cmd
+# 或
+.\.venv\Scripts\wechat-codex-gui.exe --config config.yaml
+```
+
+也可以双击 `start.cmd`。窗口右上角或界面中的“最小化”按钮都可最小化；最小化不会停止桥接。关闭窗口才会结束程序。
+
+纯命令行监听仍可使用：
 
 ```powershell
 .\.venv\Scripts\wechat-codex.exe --config config.yaml start
 ```
-
-也可以双击 `start.cmd`。关闭运行窗口或按 `Ctrl+C` 停止。
 
 如果 PowerShell 允许执行本地脚本，也可以在后台运行：
 

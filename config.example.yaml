@@ -1,10 +1,14 @@
 contact: "文件传输助手"
+chat_type: "friend"
+bot_name: "ChatGpt机器人"
+authorized_senders:
+  - "無惧"
 background_mode: true
 allow_self_messages: true
 voice_recognition: true
 voice_retry_count: 3
 response_prefix: "[Codex助手] "
-send_ready_message: true
+send_ready_message: false
 poll_seconds: 1.0
 max_reply_chars: 1800
 

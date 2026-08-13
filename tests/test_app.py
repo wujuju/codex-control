@@ -25,8 +25,11 @@ class FakeRunner:
 class BridgeAppTests(unittest.TestCase):
     def test_unauthorized_sender_cannot_start_work(self) -> None:
         app = BridgeApp.__new__(BridgeApp)
+        app._event_sink = None
+        app._state_sink = None
         app.config = SimpleNamespace(
             authorized_senders=frozenset({"無惧"}),
+            bot_name="ChatGpt机器人",
             projects={"control": "."},
             default_project="control",
         )
