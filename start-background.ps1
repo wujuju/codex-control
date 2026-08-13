@@ -30,5 +30,5 @@ $process = Start-Process `
     -RedirectStandardError $stderrLog `
     -PassThru
 Set-Content -LiteralPath $pidFile -Value $process.Id -Encoding ascii
-Write-Output "WeChat Codex bridge started. PID: $($process.Id)"
+Write-Output "WeCom intelligent bot bridge started. PID: $($process.Id)"
 Write-Output "Log: $stderrLog"

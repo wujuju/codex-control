@@ -7,10 +7,8 @@ src/wechat_codex/chatgpt_runner.py
 src/wechat_codex/cli.py
 src/wechat_codex/codex_runner.py
 src/wechat_codex/config.py
-src/wechat_codex/gui.py
 src/wechat_codex/router.py
-src/wechat_codex/wechat_client.py
-src/wechat_codex/qml/Main.qml
+src/wechat_codex/wecom_bot.py
 src/wechat_codex_control.egg-info/PKG-INFO
 src/wechat_codex_control.egg-info/SOURCES.txt
 src/wechat_codex_control.egg-info/dependency_links.txt
@@ -22,4 +20,4 @@ tests/test_chatgpt_runner.py
 tests/test_codex_runner.py
 tests/test_config.py
 tests/test_router.py
-tests/test_wechat_client.py
+tests/test_wecom_bot.py

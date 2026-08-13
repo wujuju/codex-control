@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -10,22 +11,22 @@ import yaml
 @dataclass(frozen=True)
 class AppConfig:
     source: Path
-    contact: str
-    chat_type: str
-    bot_name: str
+    wecom_bot_id: str
+    wecom_bot_secret_env: str
+    wecom_websocket_url: str
+    group_only: bool
+    allowed_group_chat_ids: frozenset[str]
     authorized_senders: frozenset[str]
-    background_mode: bool
-    allow_self_messages: bool
-    voice_recognition: bool
-    voice_retry_count: int
-    response_prefix: str
-    send_ready_message: bool
-    poll_seconds: float
-    max_reply_chars: int
+    default_group_chat_name: str
+    group_chat_names: dict[str, str]
+    user_chat_names: dict[str, str]
     chatgpt_browser_channel: str
     chatgpt_headless: bool
-    codex_command: str
     chat_timeout_seconds: int
+    wecom_timeout_seconds: int
+    response_prefix: str
+    max_reply_bytes: int
+    codex_command: str
     work_timeout_seconds: int
     default_project: str
     projects: dict[str, Path]
@@ -38,6 +39,16 @@ class AppConfig:
     def chatgpt_profile_dir(self) -> Path:
         return self.runtime_dir / "chatgpt-plus-profile"
 
+    def require_secret(self, environment_name: str) -> str:
+        value = os.environ.get(environment_name, "").strip()
+        if not value:
+            raise RuntimeError(f"环境变量 {environment_name} 尚未设置")
+        return value
+
+    @property
+    def wecom_bot_secret(self) -> str:
+        return self.require_secret(self.wecom_bot_secret_env)
+
 
 def _required_text(data: dict[str, Any], key: str) -> str:
     value = str(data.get(key, "")).strip()
@@ -46,11 +57,40 @@ def _required_text(data: dict[str, Any], key: str) -> str:
     return value
 
 
+def _environment_name(data: dict[str, Any], key: str, default: str) -> str:
+    value = str(data.get(key, default)).strip()
+    if not value or not value.replace("_", "A").isalnum():
+        raise ValueError(f"配置项 {key!r} 必须是环境变量名称")
+    return value
+
+
+def _text_set(data: dict[str, Any], key: str) -> frozenset[str]:
+    values = data.get(key) or []
+    if isinstance(values, str):
+        values = [values]
+    if not isinstance(values, list):
+        raise ValueError(f"配置项 {key!r} 必须是字符串列表")
+    return frozenset(str(value).strip() for value in values if str(value).strip())
+
+
+def _text_map(data: dict[str, Any], key: str) -> dict[str, str]:
+    values = data.get(key) or {}
+    if not isinstance(values, dict):
+        raise ValueError(f"配置项 {key!r} 必须是键值对象")
+    result: dict[str, str] = {}
+    for raw_key, raw_value in values.items():
+        name = str(raw_key).strip()
+        title = str(raw_value).strip()
+        if not name or not title:
+            raise ValueError(f"配置项 {key!r} 不能包含空的 ID 或名称")
+        result[name] = title
+    return result
+
+
 def load_config(path: str | Path) -> AppConfig:
     source = Path(path).expanduser().resolve()
     if not source.is_file():
         raise FileNotFoundError(f"配置文件不存在：{source}")
-
     raw = yaml.safe_load(source.read_text(encoding="utf-8")) or {}
     if not isinstance(raw, dict):
         raise ValueError("配置文件顶层必须是 YAML 对象")
@@ -58,7 +98,6 @@ def load_config(path: str | Path) -> AppConfig:
     project_values = raw.get("projects") or {}
     if not isinstance(project_values, dict) or not project_values:
         raise ValueError("至少需要配置一个 projects 项目")
-
     projects: dict[str, Path] = {}
     for alias, value in project_values.items():
         name = str(alias).strip()
@@ -73,78 +112,58 @@ def load_config(path: str | Path) -> AppConfig:
     if default_project not in projects:
         raise ValueError(f"default_project {default_project!r} 不在 projects 中")
 
-    poll_seconds = float(raw.get("poll_seconds", 1.0))
-    max_reply_chars = int(raw.get("max_reply_chars", 1800))
+    wecom_timeout = int(raw.get("wecom_timeout_seconds", 30))
     chat_timeout = int(raw.get("chat_timeout_seconds", 180))
     work_timeout = int(raw.get("work_timeout_seconds", 3600))
-    voice_retry_count = int(raw.get("voice_retry_count", 3))
-    if poll_seconds < 0.2:
-        raise ValueError("poll_seconds 不能小于 0.2")
-    if max_reply_chars < 100:
-        raise ValueError("max_reply_chars 不能小于 100")
-    if chat_timeout < 10 or work_timeout < 10:
-        raise ValueError("任务超时不能小于 10 秒")
-    if not 1 <= voice_retry_count <= 5:
-        raise ValueError("voice_retry_count 必须在 1 到 5 之间")
+    max_reply_bytes = int(raw.get("max_reply_bytes", 18000))
+    if wecom_timeout < 10 or chat_timeout < 10 or work_timeout < 10:
+        raise ValueError("超时时间不能小于 10 秒")
+    if not 256 <= max_reply_bytes <= 20480:
+        raise ValueError("max_reply_bytes 必须在 256 到 20480 之间")
 
-    response_prefix = str(raw.get("response_prefix", "[Codex助手] "))
-    if not response_prefix:
-        raise ValueError("response_prefix 不能为空，否则可能形成自动回复循环")
-
-    chat_type = str(raw.get("chat_type", "friend")).strip().lower()
-    if chat_type not in {"friend", "group", "auto"}:
-        raise ValueError("chat_type 必须是 friend、group 或 auto")
-
-    bot_name = str(raw.get("bot_name", "ChatGpt机器人")).strip()
-    if not bot_name:
-        raise ValueError("bot_name 不能为空")
-
-    chatgpt_browser_channel = str(
-        raw.get("chatgpt_browser_channel", "msedge")
-    ).strip().lower()
-    if chatgpt_browser_channel not in {
-        "msedge",
-        "msedge-beta",
-        "msedge-dev",
-        "msedge-canary",
+    browser_channel = str(raw.get("chatgpt_browser_channel", "chrome")).lower()
+    if browser_channel not in {
         "chrome",
         "chrome-beta",
         "chrome-dev",
         "chrome-canary",
+        "msedge",
+        "msedge-beta",
+        "msedge-dev",
+        "msedge-canary",
     }:
-        raise ValueError("chatgpt_browser_channel 必须是受支持的 Edge 或 Chrome 通道")
+        raise ValueError("chatgpt_browser_channel 必须是受支持的 Chrome 或 Edge 通道")
 
-    authorized_values = raw.get("authorized_senders", ["無惧"])
-    if isinstance(authorized_values, str):
-        authorized_values = [authorized_values]
-    if not isinstance(authorized_values, list):
-        raise ValueError("authorized_senders 必须是名称列表")
-    authorized_senders = frozenset(
-        str(value).strip() for value in authorized_values if str(value).strip()
-    )
+    websocket_url = str(
+        raw.get("wecom_websocket_url", "wss://openws.work.weixin.qq.com")
+    ).strip()
+    if not websocket_url.startswith("wss://"):
+        raise ValueError("wecom_websocket_url 必须使用 wss://")
+
+    authorized_senders = _text_set(raw, "authorized_senders")
     if not authorized_senders:
-        raise ValueError("authorized_senders 至少需要一个名称")
+        raise ValueError("authorized_senders 至少需要一个企业微信 userid")
 
     return AppConfig(
         source=source,
-        contact=_required_text(raw, "contact"),
-        chat_type=chat_type,
-        bot_name=bot_name,
+        wecom_bot_id=_required_text(raw, "wecom_bot_id"),
+        wecom_bot_secret_env=_environment_name(
+            raw, "wecom_bot_secret_env", "WECOM_BOT_SECRET"
+        ),
+        wecom_websocket_url=websocket_url,
+        group_only=bool(raw.get("group_only", True)),
+        allowed_group_chat_ids=_text_set(raw, "allowed_group_chat_ids"),
         authorized_senders=authorized_senders,
-        background_mode=bool(raw.get("background_mode", True)),
-        allow_self_messages=bool(raw.get("allow_self_messages", True)),
-        voice_recognition=bool(raw.get("voice_recognition", True)),
-        voice_retry_count=voice_retry_count,
-        response_prefix=response_prefix,
-        send_ready_message=bool(raw.get("send_ready_message", True)),
-        poll_seconds=poll_seconds,
-        max_reply_chars=max_reply_chars,
-        chatgpt_browser_channel=chatgpt_browser_channel,
+        default_group_chat_name=str(raw.get("default_group_chat_name", "")).strip(),
+        group_chat_names=_text_map(raw, "group_chat_names"),
+        user_chat_names=_text_map(raw, "user_chat_names"),
+        chatgpt_browser_channel=browser_channel,
         chatgpt_headless=bool(raw.get("chatgpt_headless", True)),
-        codex_command=_required_text(raw, "codex_command")
-        if "codex_command" in raw
-        else "codex",
         chat_timeout_seconds=chat_timeout,
+        wecom_timeout_seconds=wecom_timeout,
+        response_prefix=str(raw.get("response_prefix", "")).strip(),
+        max_reply_bytes=max_reply_bytes,
+        codex_command=str(raw.get("codex_command", "codex")).strip() or "codex",
         work_timeout_seconds=work_timeout,
         default_project=default_project,
         projects=projects,

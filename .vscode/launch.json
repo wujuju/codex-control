@@ -2,42 +2,7 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "首次登录 ChatGPT Plus",
-      "type": "debugpy",
-      "request": "launch",
-      "module": "wechat_codex.cli",
-      "python": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
-      "cwd": "${workspaceFolder}",
-      "args": [
-        "--config",
-        "${workspaceFolder}\\config.yaml",
-        "chatgpt-login"
-      ],
-      "env": {
-        "PYTHONUTF8": "1"
-      },
-      "console": "integratedTerminal",
-      "justMyCode": true
-    },
-    {
-      "name": "启动微信助手（GUI）",
-      "type": "debugpy",
-      "request": "launch",
-      "module": "wechat_codex.gui",
-      "python": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
-      "cwd": "${workspaceFolder}",
-      "args": [
-        "--config",
-        "${workspaceFolder}\\config.yaml"
-      ],
-      "env": {
-        "PYTHONUTF8": "1"
-      },
-      "console": "integratedTerminal",
-      "justMyCode": true
-    },
-    {
-      "name": "启动微信助手（命令行）",
+      "name": "启动企业微信 ChatGpt 群机器人",
       "type": "debugpy",
       "request": "launch",
       "module": "wechat_codex.cli",
@@ -55,7 +20,7 @@
       "justMyCode": true
     },
     {
-      "name": "检查运行环境（Doctor）",
+      "name": "检查企业微信机器人与 ChatGPT Plus",
       "type": "debugpy",
       "request": "launch",
       "module": "wechat_codex.cli",
@@ -66,6 +31,24 @@
         "${workspaceFolder}\\config.yaml",
         "doctor",
         "--connect"
+      ],
+      "env": {
+        "PYTHONUTF8": "1"
+      },
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "登录 ChatGPT Plus（首次运行）",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "wechat_codex.cli",
+      "python": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "--config",
+        "${workspaceFolder}\\config.yaml",
+        "chatgpt-login"
       ],
       "env": {
         "PYTHONUTF8": "1"

@@ -23,4 +23,4 @@ if ($actualPath -ne $expectedExecutable) {
 
 Stop-Process -Id $bridgePid
 Remove-Item -LiteralPath $pidFile
-Write-Output "WeChat Codex bridge stopped"
+Write-Output "WeCom intelligent bot bridge stopped"

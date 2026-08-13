@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import queue
 import re
 import threading
 import time
@@ -15,25 +14,24 @@ from typing import Any, Protocol
 
 log = logging.getLogger(__name__)
 
-
 CHATGPT_HOME = "https://chatgpt.com/"
 CHAT_URL = re.compile(r"^https://chatgpt\.com/(?:g/[^/]+/)?c/", re.IGNORECASE)
 PROMPT_SELECTOR = '[data-testid="prompt-textarea"], #prompt-textarea'
 SEND_SELECTOR = (
-    'button[data-testid="send-button"], '
-    'button[data-testid="composer-submit-button"]'
+    'button[data-testid="send-button"], button[data-testid="composer-submit-button"]'
 )
 STOP_SELECTOR = (
-    'button[data-testid="stop-button"], '
-    'button[data-testid="composer-stop-button"]'
+    'button[data-testid="stop-button"], button[data-testid="composer-stop-button"]'
 )
 ASSISTANT_SELECTOR = '[data-message-author-role="assistant"]'
 ASSISTANT_FALLBACK_SELECTOR = 'article[data-turn="assistant"]'
 CHAT_PROMPT_PREFIX = (
-    "这是从我的个人微信转发到 ChatGPT 的消息。请使用中文，回答适合微信阅读，"
+    "这是从我的企业微信群转发到 ChatGPT 的消息。请使用中文，回答适合企业微信阅读，"
     "简洁、直接、准确。需要操作本地项目时，请提示我使用“干活：任务”命令。\n\n"
-    "微信消息：\n"
+    "企业微信消息：\n"
 )
+TITLE_ACTION = re.compile(r"^(?:Rename|重命名)$", re.IGNORECASE)
+SAVE_ACTION = re.compile(r"^(?:Save|保存|Rename|重命名)$", re.IGNORECASE)
 
 
 class ChatStopped(RuntimeError):
@@ -49,17 +47,13 @@ class BrowserSession(Protocol):
         self,
         conversation_url: str | None,
         prompt: str,
+        conversation_title: str,
         timeout_seconds: int,
         stopped: Callable[[], bool],
     ) -> tuple[str, str]: ...
 
 
 SessionFactory = Callable[[Path, str, bool], BrowserSession]
-
-
-@dataclass(frozen=True)
-class ChatEvent:
-    text: str
 
 
 @dataclass
@@ -122,6 +116,7 @@ class PlaywrightChatSession:
         self,
         conversation_url: str | None,
         prompt: str,
+        conversation_title: str,
         timeout_seconds: int,
         stopped: Callable[[], bool],
     ) -> tuple[str, str]:
@@ -136,7 +131,9 @@ class PlaywrightChatSession:
         except RuntimeError:
             if not conversation_url:
                 raise
-            log.warning("原 ChatGPT 网页对话不可用，改为创建新对话：%s", conversation_url)
+            log.warning(
+                "原 ChatGPT 网页对话不可用，改为创建新对话：%s", conversation_url
+            )
             self._navigate(page, CHATGPT_HOME, timeout_seconds)
             composer = self._wait_for_composer(page)
 
@@ -160,6 +157,12 @@ class PlaywrightChatSession:
             stopped,
         )
         conversation_url = self._wait_for_conversation_url(page)
+        try:
+            self._set_conversation_title(page, conversation_url, conversation_title)
+        except Exception as exc:
+            log.warning(
+                "设置 ChatGPT 网页对话标题失败（%s）：%s", conversation_title, exc
+            )
         return text, conversation_url
 
     @staticmethod
@@ -183,7 +186,7 @@ class PlaywrightChatSession:
                     "ChatGPT Plus 尚未登录，请先运行 chatgpt-login"
                 ) from exc
             raise RuntimeError(
-                "找不到 ChatGPT 输入框；请确认已登录，或网页结构可能已经更新"
+                "找不到 ChatGPT 输入框；请确认登录状态，或网页结构可能已经更新"
             ) from exc
 
     @staticmethod
@@ -201,13 +204,14 @@ class PlaywrightChatSession:
         while time.monotonic() < deadline:
             if stopped():
                 raise ChatStopped("ChatGPT 请求已停止")
-
             count = assistant_messages.count()
             if count > previous_count:
                 try:
-                    current = assistant_messages.nth(count - 1).inner_text(
-                        timeout=2_000
-                    ).strip()
+                    current = (
+                        assistant_messages.nth(count - 1)
+                        .inner_text(timeout=2_000)
+                        .strip()
+                    )
                 except Exception:
                     current = ""
                 if current:
@@ -218,14 +222,15 @@ class PlaywrightChatSession:
                         generating = page.locator(STOP_SELECTOR).first.is_visible(
                             timeout=500
                         )
-                        ready = page.locator(SEND_SELECTOR).first.is_visible(timeout=500)
+                        ready = page.locator(SEND_SELECTOR).first.is_visible(
+                            timeout=500
+                        )
                         if (
                             not generating
                             and ready
                             and time.monotonic() - unchanged_since >= 1.5
                         ):
                             return current
-
             page.wait_for_timeout(250)
 
         if last_text:
@@ -242,6 +247,54 @@ class PlaywrightChatSession:
             page.wait_for_timeout(100)
         raise RuntimeError("ChatGPT 已回复，但未获得可继续的对话地址")
 
+    @staticmethod
+    def _set_conversation_title(page: Any, conversation_url: str, title: str) -> None:
+        cleaned_title = " ".join(title.split()).strip()[:100]
+        match = re.search(r"/c/([^/?#]+)", conversation_url)
+        if not cleaned_title or not match:
+            return
+
+        conversation_id = match.group(1)
+        link = page.locator(f'a[href*="/c/{conversation_id}"]').first
+        if not link.is_visible(timeout=2_000):
+            sidebar_button = page.locator(
+                'button[aria-label*="sidebar" i], '
+                'button[aria-label*="侧边栏"], '
+                'button[data-testid="open-sidebar-button"]'
+            ).first
+            if sidebar_button.is_visible(timeout=1_000):
+                sidebar_button.click()
+        link.wait_for(state="visible", timeout=5_000)
+        if " ".join(link.inner_text(timeout=2_000).split()).strip() == cleaned_title:
+            return
+        link.hover()
+
+        options = link.locator(
+            'button[data-testid*="conversation"], '
+            'button[aria-label*="conversation options" i], '
+            'button[aria-label*="对话选项"]'
+        ).first
+        if not options.is_visible(timeout=1_000):
+            options = link.locator("xpath=..").locator("button").last
+        if not options.is_visible(timeout=1_000):
+            options = link.locator("xpath=../..").locator("button").last
+        options.click()
+
+        rename = page.get_by_role("menuitem", name=TITLE_ACTION).first
+        if not rename.is_visible(timeout=2_000):
+            rename = page.get_by_text(TITLE_ACTION, exact=True).last
+        rename.click()
+
+        dialog = page.get_by_role("dialog").last
+        textbox = dialog.get_by_role("textbox").first
+        if not textbox.is_visible(timeout=2_000):
+            textbox = page.locator('input[type="text"]:visible').last
+        textbox.fill(cleaned_title)
+        save = dialog.get_by_role("button", name=SAVE_ACTION).last
+        if not save.is_visible(timeout=2_000):
+            save = page.get_by_role("button", name=SAVE_ACTION).last
+        save.click()
+
 
 class ChatGPTRunner:
     def __init__(
@@ -256,14 +309,12 @@ class ChatGPTRunner:
         self.browser_channel = browser_channel
         self.headless = headless
         self.timeout_seconds = timeout_seconds
-        self.runtime_dir = runtime_dir
         self.profile_dir = runtime_dir / "chatgpt-plus-profile"
-        self.events: queue.Queue[ChatEvent] = queue.Queue()
         self._session_factory = session_factory or PlaywrightChatSession
         self._state = ChatState()
         self._lock = threading.RLock()
         self._conversation_file = runtime_dir / "chatgpt_web_conversations.json"
-        self.runtime_dir.mkdir(parents=True, exist_ok=True)
+        runtime_dir.mkdir(parents=True, exist_ok=True)
         self._conversations = self._load_conversations()
 
     @property
@@ -271,38 +322,75 @@ class ChatGPTRunner:
         with self._lock:
             return self._state.active
 
-    def begin_chat(self, session_key: str, prompt: str) -> tuple[bool, str]:
+    def begin_chat(
+        self,
+        session_key: str,
+        prompt: str,
+        on_result: Callable[[str], None],
+        *,
+        conversation_title: str,
+    ) -> tuple[bool, str]:
         with self._lock:
             if self._state.active:
-                return False, "已有 ChatGPT 请求在执行，请发送“状态”或“停止”"
+                return False, "已有 ChatGPT Plus 请求在执行，请稍后再试"
             self._state = ChatState(
                 active=True,
                 session_key=session_key,
                 started_at=time.time(),
             )
-
         worker = threading.Thread(
             target=self._run_chat,
-            args=(session_key, prompt),
+            args=(session_key, prompt, conversation_title, on_result),
             name="chatgpt-plus-web",
             daemon=True,
         )
         worker.start()
         return True, "已开始 ChatGPT Plus 网页请求"
 
-    def begin_reset(self, session_key: str) -> tuple[bool, str]:
+    def reset(self, session_key: str) -> tuple[bool, str]:
         with self._lock:
             if self._state.active:
-                return False, "已有 ChatGPT 请求在执行，请发送“状态”或“停止”"
-            if session_key not in self._conversations:
-                return False, "当前已经是新的 ChatGPT 对话"
-        self._remove_conversation(session_key)
-        self.events.put(
-            ChatEvent("已切换到新的 ChatGPT 对话；旧对话仍保留在你的 ChatGPT 历史中")
-        )
-        return True, "已切换到新的 ChatGPT 对话"
+                return False, "已有 ChatGPT Plus 请求在执行，请稍后再试"
+            existed = self._conversations.pop(session_key, None) is not None
+            if existed:
+                self._save_conversations(dict(self._conversations))
+        if existed:
+            return True, "已切换到新的 ChatGPT 对话；旧对话仍保留在网页历史中"
+        return False, "当前已经是新的 ChatGPT 对话"
 
-    def _run_chat(self, session_key: str, prompt: str) -> None:
+    def is_active(self, session_key: str) -> bool:
+        with self._lock:
+            return self._state.active and self._state.session_key == session_key
+
+    def status(self, session_key: str) -> str:
+        with self._lock:
+            state = self._state
+            if not state.active:
+                return "ChatGPT Plus 网页当前空闲"
+            elapsed = int(time.time() - (state.started_at or time.time()))
+            return f"ChatGPT Plus 网页正在生成回复，已运行 {elapsed} 秒"
+
+    def stop(self, session_key: str) -> str:
+        with self._lock:
+            if not self._state.active:
+                return "当前没有执行中的 ChatGPT Plus 请求"
+            if self._state.session_key != session_key:
+                return "当前执行中的 ChatGPT Plus 请求属于另一个群会话"
+            self._state.stop_requested = True
+        return "正在停止 ChatGPT Plus 请求"
+
+    def stop_all(self) -> None:
+        with self._lock:
+            if self._state.active:
+                self._state.stop_requested = True
+
+    def _run_chat(
+        self,
+        session_key: str,
+        prompt: str,
+        conversation_title: str,
+        on_result: Callable[[str], None],
+    ) -> None:
         try:
             with self._lock:
                 conversation_url = self._conversations.get(session_key)
@@ -314,22 +402,30 @@ class ChatGPTRunner:
                 text, new_url = session.ask(
                     conversation_url,
                     prompt,
+                    conversation_title,
                     self.timeout_seconds,
-                    self._stopped,
+                    lambda: self._stopped(session_key),
                 )
-
-            if self._stopped():
-                self.events.put(ChatEvent("ChatGPT 请求已停止"))
+            if self._stopped(session_key):
                 return
             self._set_conversation(session_key, new_url)
-            self.events.put(ChatEvent(text))
+            on_result(text)
         except ChatStopped:
-            self.events.put(ChatEvent("ChatGPT 请求已停止"))
+            return
         except Exception as exc:
-            detail = str(exc).strip() or type(exc).__name__
-            self.events.put(ChatEvent(f"ChatGPT Plus 网页请求失败：{detail[-1000:]}"))
+            if not self._stopped(session_key):
+                detail = str(exc).strip() or type(exc).__name__
+                try:
+                    on_result(f"ChatGPT Plus 网页请求失败：{detail[-1000:]}")
+                except Exception:
+                    log.exception("发送 ChatGPT Plus 错误通知失败")
         finally:
-            self._finish()
+            with self._lock:
+                self._state = ChatState()
+
+    def _stopped(self, session_key: str) -> bool:
+        with self._lock:
+            return self._state.session_key == session_key and self._state.stop_requested
 
     def _load_conversations(self) -> dict[str, str]:
         if not self._conversation_file.is_file():
@@ -344,7 +440,11 @@ class ChatGPTRunner:
                 if str(key) and _is_chat_url(str(value))
             }
         except Exception as exc:
-            log.warning("忽略无法读取的 ChatGPT 网页会话映射 %s：%s", self._conversation_file, exc)
+            log.warning(
+                "忽略无法读取的 ChatGPT 网页会话映射 %s：%s",
+                self._conversation_file,
+                exc,
+            )
             return {}
 
     def _set_conversation(self, session_key: str, url: str) -> None:
@@ -352,14 +452,7 @@ class ChatGPTRunner:
             raise ValueError(f"无效的 ChatGPT 对话地址：{url}")
         with self._lock:
             self._conversations[session_key] = url
-            snapshot = dict(self._conversations)
-        self._save_conversations(snapshot)
-
-    def _remove_conversation(self, session_key: str) -> None:
-        with self._lock:
-            self._conversations.pop(session_key, None)
-            snapshot = dict(self._conversations)
-        self._save_conversations(snapshot)
+            self._save_conversations(dict(self._conversations))
 
     def _save_conversations(self, conversations: dict[str, str]) -> None:
         temporary = self._conversation_file.with_suffix(".json.tmp")
@@ -368,38 +461,6 @@ class ChatGPTRunner:
             encoding="utf-8",
         )
         os.replace(temporary, self._conversation_file)
-
-    def _stopped(self) -> bool:
-        with self._lock:
-            return self._state.stop_requested
-
-    def _finish(self) -> None:
-        with self._lock:
-            self._state.active = False
-            self._state.stop_requested = False
-
-    def stop(self) -> str:
-        with self._lock:
-            if not self._state.active:
-                return "当前没有执行中的 ChatGPT 请求"
-            self._state.stop_requested = True
-        return "正在停止 ChatGPT 请求"
-
-    def status(self) -> str:
-        with self._lock:
-            state = self._state
-            if not state.active:
-                return "ChatGPT Plus 网页当前空闲"
-            elapsed = int(time.time() - (state.started_at or time.time()))
-            return f"正在执行 ChatGPT Plus 网页聊天，已运行 {elapsed} 秒"
-
-    def drain_events(self) -> list[ChatEvent]:
-        result: list[ChatEvent] = []
-        while True:
-            try:
-                result.append(self.events.get_nowait())
-            except queue.Empty:
-                return result
 
 
 def login_chatgpt(profile_dir: Path, browser_channel: str) -> None:
@@ -418,8 +479,8 @@ def login_chatgpt(profile_dir: Path, browser_channel: str) -> None:
             try:
                 page = context.pages[0] if context.pages else context.new_page()
                 page.goto(CHATGPT_HOME, wait_until="domcontentloaded", timeout=60_000)
-                print("请在打开的浏览器中登录你的 ChatGPT Plus 账号。")
-                input("登录完成并看到 ChatGPT 输入框后，回到这里按 Enter 保存登录状态：")
+                print("请在打开的专用浏览器中登录你的 ChatGPT Plus 账号。")
+                input("确认看到 ChatGPT 输入框后，回到这里按 Enter 保存登录状态：")
                 composer = page.locator(PROMPT_SELECTOR).first
                 if not composer.is_visible(timeout=5_000):
                     raise RuntimeError("未检测到 ChatGPT 输入框，登录可能尚未完成")

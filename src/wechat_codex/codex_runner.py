@@ -91,19 +91,23 @@ class CodexRunner:
         with self._lock:
             return self._state.active
 
-    def begin_work(self, project: str, project_path: Path, prompt: str) -> tuple[bool, str]:
+    def begin_work(
+        self, project: str, project_path: Path, prompt: str
+    ) -> tuple[bool, str]:
         if not project_path.is_dir():
             return False, f"项目目录不存在：{project_path}"
         if not (project_path / ".git").exists():
             return False, f"项目不是 Git 仓库：{project_path}"
 
         work_prompt = (
-            "你正在通过微信接受本机开发任务。请在当前项目内完成任务并进行必要验证。"
+            "你正在通过企业微信 API 接受本机开发任务。请在当前项目内完成任务并进行必要验证。"
             "不要提交或推送 Git，不要部署，不要修改项目目录之外的文件，不要执行破坏性操作。"
             "最终用中文简洁说明改了什么、验证结果和未解决问题。\n\n任务：\n" + prompt
         )
         args = self.build_work_args(project_path, work_prompt)
-        return self._begin(args, "work", project, project_path, self.work_timeout_seconds)
+        return self._begin(
+            args, "work", project, project_path, self.work_timeout_seconds
+        )
 
     def begin_continue(self, prompt: str) -> tuple[bool, str]:
         with self._lock:
@@ -113,11 +117,13 @@ class CodexRunner:
         if not thread_id or not project or not project_path:
             return False, "当前程序运行期间还没有可继续的干活会话"
         continue_prompt = (
-            "继续处理微信用户的新要求。仍然不要提交、推送或部署。完成后用中文简洁汇报。\n\n新要求：\n"
+            "继续处理企业微信用户的新要求。仍然不要提交、推送或部署。完成后用中文简洁汇报。\n\n新要求：\n"
             + prompt
         )
         args = self.build_continue_args(thread_id, continue_prompt)
-        return self._begin(args, "continue", project, project_path, self.work_timeout_seconds)
+        return self._begin(
+            args, "continue", project, project_path, self.work_timeout_seconds
+        )
 
     def build_work_args(self, project_path: Path, prompt: str) -> list[str]:
         return [
@@ -219,7 +225,9 @@ class CodexRunner:
                 self.events.put(RunnerEvent(f"任务失败：{detail[-1200:]}"))
         except FileNotFoundError:
             self.events.put(RunnerEvent(f"找不到 Codex 命令：{self.codex_command}"))
-        except Exception as exc:  # pragma: no cover - defensive boundary around subprocesses
+        except (
+            Exception
+        ) as exc:  # pragma: no cover - defensive boundary around subprocesses
             self.events.put(RunnerEvent(f"Codex 执行异常：{type(exc).__name__}: {exc}"))
         finally:
             with self._lock:

@@ -1,11 +1,8 @@
 Metadata-Version: 2.4
 Name: wechat-codex-control
-Version: 0.1.0
-Summary: Bridge Windows WeChat to a personal ChatGPT web session and local Codex tasks
+Version: 0.3.2
+Summary: Bridge a WeCom intelligent bot to ChatGPT Plus and local Codex tasks
 Requires-Python: <3.14,>=3.10
 Requires-Dist: playwright<2,>=1.62
-Requires-Dist: PySide6<7,>=6.8
 Requires-Dist: PyYAML<7,>=6.0
-Requires-Dist: psutil<8,>=7.0
-Requires-Dist: pywin32>=310
-Requires-Dist: wxauto4<42,>=41.1
+Requires-Dist: websockets<18,>=17.0

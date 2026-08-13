@@ -1,25 +1,37 @@
-contact: "文件传输助手"
-chat_type: "friend"
-bot_name: "ChatGpt机器人"
-authorized_senders:
-  - "無惧"
-background_mode: true
-allow_self_messages: true
-voice_recognition: true
-voice_retry_count: 3
-response_prefix: "[Codex助手] "
-send_ready_message: false
-poll_seconds: 1.0
-max_reply_chars: 1800
+# 企业微信管理后台 → 智能机器人 → API 模式 → 长连接
+wecom_bot_id: "REPLACE_WITH_BOT_ID"
+wecom_bot_secret_env: "WECOM_BOT_SECRET"
+wecom_websocket_url: "wss://openws.work.weixin.qq.com"
 
+# 测试阶段仅处理群聊消息。群名称不会出现在 API 回调中。
+group_only: true
+
+# 首次启动先留空；在“ChatGpt”群里 @机器人 后，从日志复制 chatid 再填入。
+# 留空会响应该机器人所在的所有群。
+allowed_group_chat_ids: []
+
+# ChatGPT 网页对话标题。取得真实 chatid/userid 后可按下面方式映射。
+default_group_chat_name: "ChatGpt"
+group_chat_names:
+  # "wrxxxxxxxx": "ChatGpt"
+user_chat_names:
+  # "zhangsan": "张三"
+
+# 只有这些企业微信 userid 可以执行“干活/继续/状态/停止”等 Codex 命令。
+authorized_senders:
+  - "your-userid"
+
+# 普通聊天使用 ChatGPT Plus 的独立浏览器登录态，不需要 OPENAI_API_KEY。
 chatgpt_browser_channel: "chrome"
 chatgpt_headless: true
 chat_timeout_seconds: 180
+wecom_timeout_seconds: 30
+
+response_prefix: ""
+max_reply_bytes: 18000
 
 codex_command: "codex"
 work_timeout_seconds: 3600
-
 default_project: "control"
 projects:
   control: "."
-  # demo: "D:\\Sam\\demo"

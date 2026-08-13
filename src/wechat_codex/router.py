@@ -26,7 +26,9 @@ _WORK = re.compile(
     r"^(?:干活|/work)(?:\s+([A-Za-z0-9_.-]+))?\s*[：:]\s*(.+)$",
     re.IGNORECASE | re.DOTALL,
 )
-_CONTINUE = re.compile(r"^(?:继续|/continue)\s*[：:]\s*(.+)$", re.IGNORECASE | re.DOTALL)
+_CONTINUE = re.compile(
+    r"^(?:继续|/continue)\s*[：:]\s*(.+)$", re.IGNORECASE | re.DOTALL
+)
 
 
 def route_message(text: str) -> Route:
@@ -43,7 +45,9 @@ def route_message(text: str) -> Route:
 
     match = _WORK.match(cleaned)
     if match:
-        return Route(RouteKind.WORK, prompt=match.group(2).strip(), project=match.group(1))
+        return Route(
+            RouteKind.WORK, prompt=match.group(2).strip(), project=match.group(1)
+        )
 
     match = _CONTINUE.match(cleaned)
     if match:
@@ -59,7 +63,7 @@ def help_text(projects: list[str], default_project: str) -> str:
         f"干活：任务：让 Codex 修改默认项目 {default_project}\n"
         "干活 项目名：任务：修改指定项目\n"
         "继续：要求：继续上次干活会话\n"
-        "新对话：下条消息新建 ChatGPT 对话（旧对话保留）\n"
+        "新对话：下条消息新建 ChatGPT 对话\n"
         "状态：查看任务\n"
         "停止：终止当前任务\n"
         f"可用项目：{project_text}"

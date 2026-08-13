@@ -1,151 +1,131 @@
-# PC 微信接入 ChatGPT 与 Codex
+# 企业微信 ChatGpt 群机器人
 
-一个 Windows 小工具：读取已登录的 PC 微信消息，普通消息通过你自己的 ChatGPT Plus 网页登录态聊天，只有带“干活”前缀的消息才交给本机 Codex 修改预配置项目。
+本程序通过企业微信“智能机器人长连接 API”监听群消息，再把普通问题交给个人 ChatGPT Plus 网页，把明确的开发命令交给本机 Codex。企业微信端完全使用 API，不控制企业微信窗口，也不需要公网回调地址。
 
-桌面端使用 PySide6 + QML：左侧显示私聊/群聊会话，右侧显示收到的消息、ChatGPT/Codex 回复和手动发送区。窗口可正常最小化，最小化后微信监听与请求继续运行。
+```text
+企业微信群 ChatGpt 中 @机器人
+        ↓ WebSocket aibot_msg_callback
+本程序：群限制、成员权限、去重、命令路由
+        ├─ 普通问题 → 后台 Chrome → ChatGPT Plus
+        └─ 干活命令 → 本机 codex exec
+        ↓ WebSocket aibot_respond_msg
+企业微信群中的机器人回复
+```
 
-## 当前能力
+## 1. 创建并加入群
 
-- 固定监听一个联系人、群聊或“文件传输助手”
-- 私聊直接回复；群聊只有明确 `@ChatGpt机器人` 才回复
-- 只有白名单中的“無惧”可以执行干活、继续、状态和停止命令
-- 普通中文聊天使用 ChatGPT Plus 网页，程序重启后继续原网页对话
-- 私聊按会话保存上下文；群聊按“群名 + 成员”隔离上下文
-- `新对话` 切换到新网页对话，旧对话仍保留在 ChatGPT 历史中
-- `干活：任务` 修改默认项目
-- `干活 control：任务` 修改指定项目
-- `继续：要求` 继续最近一次干活会话
-- `状态` 查看任务
-- `停止` 终止任务
-- 启动时忽略已有历史消息，回复自动防循环
-- 可选在登录连接成功后发送一条“已上线”消息（当前默认关闭）
-- 读取微信原生自动转写结果，识别内容按普通消息继续处理
+1. 在企业微信中创建“智能机器人”，启用 **API 模式**。
+2. 接入方式选择 **长连接**，复制 `BotID` 和长连接 `Secret`。
+3. 把机器人加入企业微信群 **ChatGpt**。
+4. 把 `BotID` 写到 [config.yaml](config.yaml) 的 `wecom_bot_id`。
 
-## 环境
+企业微信的长连接地址固定为 `wss://openws.work.weixin.qq.com`。一个机器人同时只能保留一条有效长连接；重复启动程序或运行连接检查会让旧连接断开并自动重连。
 
-- Windows 10/11
-- Python 3.10～3.13
-- PC 微信 4.x，已登录
-- 已安装并登录 Codex CLI
-- ChatGPT Plus 账号
-- Google Chrome（当前配置）或 Microsoft Edge
+官方文档：[智能机器人长连接](https://developer.work.weixin.qq.com/document/path/101463)
 
-## 安装
+## 2. 配置密钥
+
+只有企业微信机器人的 Secret 需要环境变量。PowerShell 当前窗口临时设置：
 
 ```powershell
-python -m venv .venv
+$env:WECOM_BOT_SECRET = "企业微信机器人的长连接 Secret"
+```
+
+需要持久保存到当前 Windows 用户时：
+
+```powershell
+[Environment]::SetEnvironmentVariable("WECOM_BOT_SECRET", "你的 Secret", "User")
+```
+
+持久设置后重新打开 VS Code。不要把 Secret 写进 YAML、提交到 Git，或贴到聊天记录中。
+
+普通聊天复用你的 ChatGPT Plus 网页账号，**不需要 `OPENAI_API_KEY`，也不调用 OpenAI Platform API**。它属于个人网页自动化，不是 ChatGPT 官方 API；页面结构变化、登录验证和 Plus 用量限制仍可能影响运行。
+
+## 3. 安装与检查
+
+```powershell
+py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e .
-```
-
-不需要 `OPENAI_API_KEY`。首次使用前，打开独立 Chrome/Edge 配置并手动登录 ChatGPT Plus：
-
-```powershell
 .\.venv\Scripts\wechat-codex.exe --config config.yaml chatgpt-login
+.\.venv\Scripts\wechat-codex.exe --config config.yaml doctor
 ```
 
-在打开的浏览器中完成登录，确认看到 ChatGPT 输入框，然后回到终端按 Enter。登录状态保存在 `.runtime/chatgpt-plus-profile`，不要把这个目录复制给别人。
+`chatgpt-login` 会打开一个自动化专用的 Chrome。请在该窗口登录 ChatGPT Plus，看到输入框后回到终端按 Enter。日常运行使用这个专用登录资料，不会占用你当前已打开的普通 Chrome。
 
-这是个人使用的网页 UI 自动化，不是 OpenAI 官方程序接口。ChatGPT 页面结构变化、登录验证或订阅用量限制都可能使它暂时失效；需要稳定的程序化接入时仍应使用官方 API。
-
-编辑 `config.yaml`：
-
-```yaml
-contact: "無惧"
-chat_type: "friend" # 监听群聊时改为 group
-bot_name: "ChatGpt机器人"
-authorized_senders: ["無惧"]
-background_mode: true
-voice_recognition: true
-voice_retry_count: 3
-chatgpt_browser_channel: "chrome"
-chatgpt_headless: true
-chat_timeout_seconds: 180
-default_project: "control"
-projects:
-  control: "."
-  demo: "D:\\Sam\\demo"
-```
-
-项目必须是 Git 仓库。微信消息不能直接指定磁盘路径，只能使用这里登记的项目别名。
-
-## 运行
-
-先完成一次 ChatGPT Plus 登录，再打开并登录 PC 微信，然后检查：
+需要实际验证企业微信订阅时，先停止正在运行的机器人，再执行：
 
 ```powershell
 .\.venv\Scripts\wechat-codex.exe --config config.yaml doctor --connect
 ```
 
-发送测试消息：
+## 4. 在 ChatGpt 群测试
+
+启动程序：
 
 ```powershell
-.\.venv\Scripts\wechat-codex.exe --config config.yaml send "连接测试成功"
+.\start.ps1
 ```
 
-启动可视化 QML 桌面端：
+或者在 VS Code 的“运行和调试”中选择 **启动企业微信 ChatGpt 群机器人**。
 
-```powershell
-.\start.cmd
-# 或
-.\.venv\Scripts\wechat-codex-gui.exe --config config.yaml
+然后在企业微信群 **ChatGpt** 中发送：
+
+```text
+@机器人 你好，请回复“测试成功”
 ```
 
-也可以双击 `start.cmd`。窗口右上角或界面中的“最小化”按钮都可最小化；最小化不会停止桥接。关闭窗口才会结束程序。
+程序收到消息时会打印类似日志：
 
-纯命令行监听仍可使用：
-
-```powershell
-.\.venv\Scripts\wechat-codex.exe --config config.yaml start
+```text
+收到企业微信消息：chat_type=group chatid=wrxxxxxxxx userid=xxxx msgid=xxxx
 ```
 
-如果 PowerShell 允许执行本地脚本，也可以在后台运行：
+企业微信回调只给 `chatid`，不给群名称。首次确认该日志确实来自“ChatGpt”群后，把 ID 写回配置，防止机器人在其他群响应：
+
+```yaml
+group_only: true
+allowed_group_chat_ids:
+  - "wrxxxxxxxx"
+```
+
+测试阶段 `allowed_group_chat_ids: []` 表示响应机器人所在的所有群；最安全的做法是测试时只把机器人加入 ChatGpt 群，取得 ID 后立即锁定。
+
+## 5. 消息与权限
+
+普通文字直接进入 ChatGPT Plus 网页对话。群聊会话按 `群 chatid + 发言者 userid` 隔离，同一群不同成员不会共享上下文。
+
+ChatGPT 侧边栏的对话标题由企业微信会话名称决定。机器人回调不包含可读名称，因此需要在配置中维护映射：
+
+```yaml
+# 当前测试群没有单独映射时使用该名称
+default_group_chat_name: "ChatGpt"
+
+group_chat_names:
+  "wrxxxxxxxx": "ChatGpt"
+
+user_chat_names:
+  "zhangsan": "张三"
+```
+
+群聊优先使用 `chatid → 群名`，没有映射时使用 `default_group_chat_name`；个人聊天使用 `userid → 姓名`，没有映射时暂用 `userid`。若要同时接收机器人单聊，将 `group_only` 改为 `false`。新旧 ChatGPT 对话都会在下一次收到消息时校准标题。
+
+以下命令会进行特殊路由：
+
+- `帮助`：显示命令
+- `新对话`：切换该成员在该群的 ChatGPT 网页对话
+- `干活：任务内容`：让本机 Codex 修改默认项目
+- `干活 项目名：任务内容`：修改指定项目
+- `继续：补充要求`：继续最近一次 Codex 任务
+- `状态`：查看 ChatGPT Plus/Codex 状态
+- `停止`：停止当前请求或任务
+
+涉及本机 Codex 的命令只允许 [config.yaml](config.yaml) 中 `authorized_senders` 列出的企业微信 `userid`。第一次群测试后可从日志复制实际 `userid`，再写入白名单。
+
+## 6. 后台运行
 
 ```powershell
 .\start-background.ps1
 .\stop.ps1
 ```
 
-后台日志在 `.runtime/bridge.err.log`。如果微信尚未登录，程序会每 5 秒自动重试，登录后无需重启。
-
-## 微信命令
-
-```text
-你好，解释一下什么是 Git rebase
-干活：检查项目并运行测试
-干活 control：给 README 增加安装说明并验证
-继续：再补一个测试
-新对话
-状态
-停止
-帮助
-```
-
-监听普通联系人时请设置 `allow_self_messages: false`，只处理对方发来的消息。使用“文件传输助手”时可改成 `true`；程序发出的内容带 `[Codex助手]` 前缀并会被忽略，不会自我回复。
-
-监听群聊时，把 `contact` 改为群名并设置 `chat_type: group`。群消息必须包含 `@ChatGpt机器人`，程序会先去掉该 @ 再进行聊天或命令解析。每个群成员有独立的 ChatGPT 对话。普通聊天对群成员开放，但 `干活`、`继续`、`状态`、`停止` 只接受 `authorized_senders` 中的发送者；当前仅允许“無惧”。每个运行实例仍只监听一个已配置会话，但程序只观察该会话在微信会话列表中的预览和未读标记：用户停留在其他聊天时不会反复搜索或强制切换，检测到目标会话出现新消息后才在后台切入读取，回复发送前也会切回正确会话。
-
-## 安全边界
-
-- 普通聊天通过独立浏览器访问 `chatgpt.com`，不使用 API Key，也不运行本地命令。
-- 本地在 `.runtime/chatgpt_web_conversations.json` 保存微信会话与 ChatGPT 网页地址的映射。
-- `.runtime/chatgpt-plus-profile` 包含可复用的登录状态，必须像密码一样保护，且已被 `.gitignore` 排除。
-- 发送 `新对话` 只清除本地映射；旧对话仍保留在你的 ChatGPT 历史中，可在网页里查看或删除。
-- 干活使用 `workspace-write`，只在配置的项目里运行。
-- 系统提示明确禁止 Git 提交、推送、部署及破坏性操作。
-- 不使用微信 Hook、不读取微信数据库，只通过 Windows UI Automation 操作窗口。
-
-## 后台执行说明
-
-`chatgpt_headless: true` 时，日常 ChatGPT 聊天通过无界面的 Chrome/Edge 进程完成，不会激活浏览器窗口。只有首次运行 `chatgpt-login`、登录过期或出现人机验证时需要显示浏览器并由本人操作。同一个独立浏览器资料目录不能同时被两个桥接器实例占用。
-
-如果无界面模式持续遇到验证，可临时把 `chatgpt_headless` 改为 `false` 排查；这样每次聊天都会显示浏览器窗口。
-
-`background_mode: true` 时，程序绕过会激活窗口的 `ChatBox.get_msgs()` 和语音气泡右键操作；它不移动鼠标、不发送全局模拟按键，也不使用剪贴板。文本通过 UI Automation 的 `ValuePattern` 写入，并优先通过发送按钮的 `InvokePattern` 在后台提交。若当前微信版本的后台 `InvokePattern` 无效，程序会短暂聚焦微信输入框，通过只发给微信窗口的 Win32 消息提交，随后恢复原前台窗口并把微信放回后台；这种兼容回退在部分系统上可能造成一次短暂闪窗。桥接器自身以隐藏进程运行。
-
-微信 4.x 偶尔会在刚启动时返回 `事件无法调用任何订户`，直到用户点击一次左上角头像才发布完整 UI Automation 控件树。程序识别到这个特定 COM 错误后会自动完成一次头像点击并切回聊天页，同时恢复鼠标位置、原前台窗口和后台层级；正常连接不会执行该动作，同一次持续失败也不会反复点击。
-
-微信 4.1.12 在窗口最小化或关闭到托盘后会卸载消息控件，因此微信主窗口需要保持“已打开、未最小化”。程序会把微信放到其他窗口后面，并且不会主动切到前台。
-
-语音依赖微信“设置 → 通用 → 聊天中的语音消息自动转成文字”开关。程序只读取微信生成的转写，不点击或右键语音气泡，因此不会为了识别语音抢占焦点。识别后的内容会直接进入聊天/命令路由，所以语音说“干活：运行测试”与发送同样文字效果一致。连续读取不到转写时只写日志，不主动给联系人发送状态提示。
-
-这类 UI 自动化同时依赖微信和 ChatGPT 网页结构。微信大版本更新后若连接失败，先运行 `doctor --connect` 查看错误并升级 `wxauto4`；若回复提示找不到 ChatGPT 输入框，先重新运行 `chatgpt-login`，仍失败时需要更新网页选择器。
+日志位于 `.runtime/bridge.out.log` 和 `.runtime/bridge.err.log`。企业微信始终通过后台 API 收发，不会打开或激活企业微信窗口。`chatgpt_headless: true` 时，日常 ChatGPT 聊天也不显示 Chrome；只有首次登录、登录过期或出现人机验证时才需要可见浏览器。

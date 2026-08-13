@@ -4,26 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wechat-codex-control"
-version = "0.1.0"
-description = "Bridge Windows WeChat to a personal ChatGPT web session and local Codex tasks"
+version = "0.3.2"
+description = "Bridge a WeCom intelligent bot to ChatGPT Plus and local Codex tasks"
 requires-python = ">=3.10,<3.14"
 dependencies = [
   "playwright>=1.62,<2",
-  "PySide6>=6.8,<7",
   "PyYAML>=6.0,<7",
-  "psutil>=7.0,<8",
-  "pywin32>=310",
-  "wxauto4>=41.1,<42",
+  "websockets>=17.0,<18",
 ]
 
 [project.scripts]
 wechat-codex = "wechat_codex.cli:main"
 
-[project.gui-scripts]
-wechat-codex-gui = "wechat_codex.gui:main"
-
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.setuptools.package-data]
-wechat_codex = ["qml/*.qml"]

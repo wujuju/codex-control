@@ -1,29 +1,35 @@
-# 要监听的微信联系人或群名。默认用“文件传输助手”，方便直接从手机给自己发指令。
-contact: "無惧"
-# 当前监听对象类型。监听群聊时改为 group，并把 contact 改为群名。
-chat_type: "friend"
-bot_name: "ChatGpt机器人"
+# 企业微信管理后台 → 智能机器人 → API 模式 → 长连接
+wecom_bot_id: "REPLACE_WITH_BOT_ID"
+
+# 企业微信密钥只从环境变量读取，不要写进本文件。
+wecom_bot_secret_env: "WECOM_BOT_SECRET"
+wecom_websocket_url: "wss://openws.work.weixin.qq.com"
+
+# 先在群“ChatGpt”测试。首次 @机器人 后，日志会打印 chatid。
+group_only: true
+allowed_group_chat_ids: []
+
+# ChatGPT 网页对话标题。企业微信回调不包含可读群名/昵称，需要在这里映射。
+default_group_chat_name: "ChatGpt"
+group_chat_names: {}
+user_chat_names:
+  "your-userid": "your-name"
+
+# 只有这些企业微信 userid 可以执行 Codex 命令。
 authorized_senders:
-  - "無惧"
-background_mode: true
+  - "your-userid"
 
-# 文件传输助手里的手机消息通常会被识别为自己发送，因此默认允许处理 self 消息。
-# 程序自己的回复都带 response_prefix，会被自动忽略，不会形成循环。
-allow_self_messages: false
-voice_recognition: true
-voice_retry_count: 3
-response_prefix: "[Codex助手] "
-send_ready_message: false
-poll_seconds: 1.0
-max_reply_chars: 1800
-
+# 普通聊天使用 ChatGPT Plus 的独立 Chrome 登录态。
 chatgpt_browser_channel: "chrome"
 chatgpt_headless: true
 chat_timeout_seconds: 180
+wecom_timeout_seconds: 30
+
+response_prefix: ""
+max_reply_bytes: 18000
 
 codex_command: "codex"
 work_timeout_seconds: 3600
-
 default_project: "control"
 projects:
   control: "."
