@@ -12,9 +12,8 @@ send_ready_message: false
 poll_seconds: 1.0
 max_reply_chars: 1800
 
-chat_model: "gpt-5.6-terra"
-chat_reasoning_effort: "low"
-chat_max_output_tokens: 1200
+chatgpt_browser_channel: "chrome"
+chatgpt_headless: true
 chat_timeout_seconds: 180
 
 codex_command: "codex"

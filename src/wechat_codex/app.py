@@ -45,9 +45,8 @@ class BridgeApp:
             work_timeout_seconds=config.work_timeout_seconds,
         )
         self.chat_runner = ChatGPTRunner(
-            model=config.chat_model,
-            reasoning_effort=config.chat_reasoning_effort,
-            max_output_tokens=config.chat_max_output_tokens,
+            browser_channel=config.chatgpt_browser_channel,
+            headless=config.chatgpt_headless,
             timeout_seconds=config.chat_timeout_seconds,
             runtime_dir=config.runtime_dir,
         )

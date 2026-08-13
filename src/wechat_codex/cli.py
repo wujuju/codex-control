@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 from .app import BridgeApp
@@ -20,6 +20,7 @@ def _parser() -> argparse.ArgumentParser:
     sub.add_parser("start", help="开始监听微信消息")
     doctor = sub.add_parser("doctor", help="检查环境；不连接微信")
     doctor.add_argument("--connect", action="store_true", help="同时尝试连接微信和联系人")
+    sub.add_parser("chatgpt-login", help="打开浏览器并保存 ChatGPT Plus 登录状态")
     send = sub.add_parser("send", help="发送一条测试微信消息")
     send.add_argument("text", nargs="?", default="连接测试成功")
     return parser
@@ -51,11 +52,29 @@ def doctor(config: AppConfig, connect: bool) -> int:
         failed = True
         print(f"[FAIL] 找不到 Codex 命令：{config.codex_command}")
 
-    if os.environ.get("OPENAI_API_KEY"):
-        print("[OK] ChatGPT API：已设置 OPENAI_API_KEY")
+    try:
+        from playwright.sync_api import sync_playwright
+
+        with tempfile.TemporaryDirectory(prefix="wechat-codex-browser-check-") as profile:
+            with sync_playwright() as playwright:
+                context = playwright.chromium.launch_persistent_context(
+                    profile,
+                    channel=config.chatgpt_browser_channel,
+                    headless=True,
+                )
+                context.close()
+        print(f"[OK] ChatGPT Plus 浏览器：{config.chatgpt_browser_channel}")
+    except Exception as exc:
+        failed = True
+        print(f"[FAIL] 无法启动 ChatGPT 自动化浏览器：{exc}")
+
+    if config.chatgpt_profile_dir.is_dir() and any(
+        config.chatgpt_profile_dir.iterdir()
+    ):
+        print(f"[OK] ChatGPT Plus 独立浏览器资料：{config.chatgpt_profile_dir}")
     else:
         failed = True
-        print("[FAIL] ChatGPT API：未设置环境变量 OPENAI_API_KEY")
+        print("[FAIL] 尚未保存 ChatGPT Plus 登录状态，请先运行 chatgpt-login")
 
     processes = _wechat_processes()
     if processes:
@@ -110,6 +129,14 @@ def main(argv: list[str] | None = None) -> int:
         config = load_config(Path(args.config))
         if args.command == "doctor":
             return doctor(config, args.connect)
+        if args.command == "chatgpt-login":
+            from .chatgpt_runner import login_chatgpt
+
+            login_chatgpt(
+                config.chatgpt_profile_dir,
+                config.chatgpt_browser_channel,
+            )
+            return 0
         if args.command == "send":
             client = WeChatClient(
                 config.contact,

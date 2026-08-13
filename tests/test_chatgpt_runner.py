@@ -2,46 +2,37 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import time
-from types import SimpleNamespace
 import unittest
 
-from wechat_codex.chatgpt_runner import CHAT_INSTRUCTIONS, ChatGPTRunner
+from wechat_codex.chatgpt_runner import ChatGPTRunner, _is_chat_url
 
 
-class FakeConversations:
-    def __init__(self) -> None:
-        self.created: list[dict] = []
-        self.deleted: list[str] = []
+class FakeSession:
+    def __init__(self, calls: list[tuple[str | None, str]], reply_number: int) -> None:
+        self.calls = calls
+        self.reply_number = reply_number
 
-    def create(self, **kwargs):
-        self.created.append(kwargs)
-        return SimpleNamespace(id=f"conv-{len(self.created)}")
+    def __enter__(self):
+        return self
 
-    def delete(self, conversation_id: str):
-        self.deleted.append(conversation_id)
-        return SimpleNamespace(id=conversation_id, deleted=True)
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        return None
 
-
-class FakeResponses:
-    def __init__(self) -> None:
-        self.calls: list[dict] = []
-
-    def create(self, **kwargs):
-        self.calls.append(kwargs)
-        return SimpleNamespace(
-            output_text=f"回复{len(self.calls)}",
-            usage=SimpleNamespace(input_tokens=10, output_tokens=5, total_tokens=15),
+    def ask(self, conversation_url, prompt, timeout_seconds, stopped):
+        self.calls.append((conversation_url, prompt))
+        return f"回复{self.reply_number}", (
+            conversation_url or "https://chatgpt.com/c/web-conversation-1"
         )
 
 
-class FakeClient:
+class FakeSessionFactory:
     def __init__(self) -> None:
-        self.conversations = FakeConversations()
-        self.responses = FakeResponses()
-        self.close_count = 0
+        self.calls: list[tuple[str | None, str]] = []
+        self.session_count = 0
 
-    def close(self) -> None:
-        self.close_count += 1
+    def __call__(self, profile_dir, browser_channel, headless):
+        self.session_count += 1
+        return FakeSession(self.calls, self.session_count)
 
 
 def wait_until_idle(runner: ChatGPTRunner) -> None:
@@ -52,63 +43,63 @@ def wait_until_idle(runner: ChatGPTRunner) -> None:
         raise AssertionError("ChatGPT runner did not become idle")
 
 
-def make_runner(runtime_dir: Path, client: FakeClient) -> ChatGPTRunner:
+def make_runner(runtime_dir: Path, factory: FakeSessionFactory) -> ChatGPTRunner:
     return ChatGPTRunner(
-        model="gpt-5.6-terra",
-        reasoning_effort="low",
-        max_output_tokens=1200,
+        browser_channel="msedge",
+        headless=True,
         timeout_seconds=30,
         runtime_dir=runtime_dir,
-        client_factory=lambda: client,
+        session_factory=factory,
     )
 
 
 class ChatGPTRunnerTests(unittest.TestCase):
-    def test_conversation_id_survives_runner_restart(self) -> None:
+    def test_conversation_url_survives_runner_restart(self) -> None:
         with TemporaryDirectory() as directory:
             runtime_dir = Path(directory)
-            client = FakeClient()
+            factory = FakeSessionFactory()
 
-            first = make_runner(runtime_dir, client)
+            first = make_runner(runtime_dir, factory)
             self.assertTrue(first.begin_chat("friend:测试", "第一问")[0])
             wait_until_idle(first)
             self.assertEqual([event.text for event in first.drain_events()], ["回复1"])
 
-            second = make_runner(runtime_dir, client)
+            second = make_runner(runtime_dir, factory)
             self.assertTrue(second.begin_chat("friend:测试", "第二问")[0])
             wait_until_idle(second)
 
-            self.assertEqual(len(client.conversations.created), 1)
-            self.assertEqual(client.responses.calls[0]["conversation"], "conv-1")
-            self.assertEqual(client.responses.calls[1]["conversation"], "conv-1")
-            self.assertEqual(client.responses.calls[1]["model"], "gpt-5.6-terra")
-            self.assertEqual(client.responses.calls[1]["reasoning"], {"effort": "low"})
-            self.assertEqual(client.responses.calls[1]["instructions"], CHAT_INSTRUCTIONS)
-            self.assertEqual(client.responses.calls[1]["max_output_tokens"], 1200)
-
+            url = "https://chatgpt.com/c/web-conversation-1"
+            self.assertEqual(factory.calls, [(None, "第一问"), (url, "第二问")])
             saved = json.loads(
-                (runtime_dir / "chat_conversations.json").read_text(encoding="utf-8")
+                (runtime_dir / "chatgpt_web_conversations.json").read_text(
+                    encoding="utf-8"
+                )
             )
-            self.assertEqual(saved, {"friend:测试": "conv-1"})
+            self.assertEqual(saved, {"friend:测试": url})
 
-    def test_new_chat_deletes_remote_conversation_and_local_mapping(self) -> None:
+    def test_new_chat_removes_mapping_but_keeps_old_web_chat(self) -> None:
         with TemporaryDirectory() as directory:
             runtime_dir = Path(directory)
-            client = FakeClient()
-            runner = make_runner(runtime_dir, client)
+            factory = FakeSessionFactory()
+            runner = make_runner(runtime_dir, factory)
             runner.begin_chat("friend:测试", "你好")
             wait_until_idle(runner)
             runner.drain_events()
 
             self.assertTrue(runner.begin_reset("friend:测试")[0])
-            wait_until_idle(runner)
 
-            self.assertEqual(client.conversations.deleted, ["conv-1"])
             saved = json.loads(
-                (runtime_dir / "chat_conversations.json").read_text(encoding="utf-8")
+                (runtime_dir / "chatgpt_web_conversations.json").read_text(
+                    encoding="utf-8"
+                )
             )
             self.assertEqual(saved, {})
-            self.assertIn("新的上下文", runner.drain_events()[0].text)
+            self.assertIn("旧对话仍保留", runner.drain_events()[0].text)
+
+    def test_only_chatgpt_conversation_urls_are_persisted(self) -> None:
+        self.assertTrue(_is_chat_url("https://chatgpt.com/c/abc"))
+        self.assertTrue(_is_chat_url("https://chatgpt.com/g/custom/c/abc"))
+        self.assertFalse(_is_chat_url("https://example.com/c/abc"))
 
 
 if __name__ == "__main__":

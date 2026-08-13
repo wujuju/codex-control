@@ -22,9 +22,8 @@ class AppConfig:
     send_ready_message: bool
     poll_seconds: float
     max_reply_chars: int
-    chat_model: str
-    chat_reasoning_effort: str
-    chat_max_output_tokens: int
+    chatgpt_browser_channel: str
+    chatgpt_headless: bool
     codex_command: str
     chat_timeout_seconds: int
     work_timeout_seconds: int
@@ -34,6 +33,10 @@ class AppConfig:
     @property
     def runtime_dir(self) -> Path:
         return self.source.parent / ".runtime"
+
+    @property
+    def chatgpt_profile_dir(self) -> Path:
+        return self.runtime_dir / "chatgpt-plus-profile"
 
 
 def _required_text(data: dict[str, Any], key: str) -> str:
@@ -73,7 +76,6 @@ def load_config(path: str | Path) -> AppConfig:
     poll_seconds = float(raw.get("poll_seconds", 1.0))
     max_reply_chars = int(raw.get("max_reply_chars", 1800))
     chat_timeout = int(raw.get("chat_timeout_seconds", 180))
-    chat_max_output_tokens = int(raw.get("chat_max_output_tokens", 1200))
     work_timeout = int(raw.get("work_timeout_seconds", 3600))
     voice_retry_count = int(raw.get("voice_retry_count", 3))
     if poll_seconds < 0.2:
@@ -82,8 +84,6 @@ def load_config(path: str | Path) -> AppConfig:
         raise ValueError("max_reply_chars 不能小于 100")
     if chat_timeout < 10 or work_timeout < 10:
         raise ValueError("任务超时不能小于 10 秒")
-    if chat_max_output_tokens < 100:
-        raise ValueError("chat_max_output_tokens 不能小于 100")
     if not 1 <= voice_retry_count <= 5:
         raise ValueError("voice_retry_count 必须在 1 到 5 之间")
 
@@ -99,14 +99,20 @@ def load_config(path: str | Path) -> AppConfig:
     if not bot_name:
         raise ValueError("bot_name 不能为空")
 
-    chat_model = str(raw.get("chat_model", "gpt-5.6-terra")).strip()
-    if not chat_model:
-        raise ValueError("chat_model 不能为空")
-    chat_reasoning_effort = str(raw.get("chat_reasoning_effort", "low")).strip().lower()
-    if chat_reasoning_effort not in {"none", "low", "medium", "high", "xhigh", "max"}:
-        raise ValueError(
-            "chat_reasoning_effort 必须是 none、low、medium、high、xhigh 或 max"
-        )
+    chatgpt_browser_channel = str(
+        raw.get("chatgpt_browser_channel", "msedge")
+    ).strip().lower()
+    if chatgpt_browser_channel not in {
+        "msedge",
+        "msedge-beta",
+        "msedge-dev",
+        "msedge-canary",
+        "chrome",
+        "chrome-beta",
+        "chrome-dev",
+        "chrome-canary",
+    }:
+        raise ValueError("chatgpt_browser_channel 必须是受支持的 Edge 或 Chrome 通道")
 
     authorized_values = raw.get("authorized_senders", ["無惧"])
     if isinstance(authorized_values, str):
@@ -133,9 +139,8 @@ def load_config(path: str | Path) -> AppConfig:
         send_ready_message=bool(raw.get("send_ready_message", True)),
         poll_seconds=poll_seconds,
         max_reply_chars=max_reply_chars,
-        chat_model=chat_model,
-        chat_reasoning_effort=chat_reasoning_effort,
-        chat_max_output_tokens=chat_max_output_tokens,
+        chatgpt_browser_channel=chatgpt_browser_channel,
+        chatgpt_headless=bool(raw.get("chatgpt_headless", True)),
         codex_command=_required_text(raw, "codex_command")
         if "codex_command" in raw
         else "codex",

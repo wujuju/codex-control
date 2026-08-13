@@ -1,7 +1,6 @@
-openai<4,>=3.0
+playwright<2,>=1.62
 PySide6<7,>=6.8
 PyYAML<7,>=6.0
 psutil<8,>=7.0
 pywin32>=310
-socksio<2,>=1.0
 wxauto4<42,>=41.1

@@ -173,6 +173,11 @@ class WeChatClient:
         self._root: Any = None
         self._chatbox: Any = None
         self._active_chat_type = "friend"
+        self._avatar_recovery_attempted = False
+        self._session_watch_initialized = False
+        self._target_session_signature: tuple[tuple[str, str, str], ...] | None = None
+        self._target_session_unread_count: int | None = None
+        self._pending_session_message_count: int | None = None
 
     def connect(self) -> None:
         try:
@@ -184,14 +189,14 @@ class WeChatClient:
         except ImportError as exc:  # pragma: no cover - depends on Windows package install
             raise RuntimeError("未安装 wxauto4，请运行 pip install -e .") from exc
 
+        failure: Exception | None = None
+        handles: list[int] = []
         try:
             pids = {
                 process.info["pid"]
                 for process in psutil.process_iter(["name", "pid"])
                 if (process.info.get("name") or "").lower() == "weixin.exe"
             }
-            handles: list[int] = []
-
             def collect(hwnd: int, _: Any) -> None:
                 _, pid = win32process.GetWindowThreadProcessId(hwnd)
                 if pid not in pids:
@@ -200,38 +205,172 @@ class WeChatClient:
                     handles.append(hwnd)
 
             win32gui.EnumWindows(collect, None)
-            self._root = None
-            for hwnd in handles:
-                candidate = uia.ControlFromHandle(hwnd)
-                if candidate and candidate.ClassName == "mmui::MainWindow":
-                    self._root = candidate
-                    break
+            self._root = self._find_wechat_root(handles, uia)
             if self._root is None:
                 raise LookupError("未找到已登录的微信主窗口")
 
-            self._invoke_send_supported = None
-            if self.background_mode:
-                self._send_window_to_background(win32gui)
-            self._ensure_contact(uia)
-            page = self._find_control(uia, automation_id="chat_message_page")
-            if page is None:
-                raise LookupError("未找到聊天页面")
-
-            self._active_chat_type = self._resolve_chat_type(uia)
-            parent = _NativeParent(self._root, self.contact, self._active_chat_type)
-            self._chatbox = ChatBox(page, parent)
-            self._wx = self._chatbox
+            self._initialize_chatbox(uia, ChatBox, win32gui)
+            self._avatar_recovery_attempted = False
+            return
         except Exception as exc:
-            raise RuntimeError(
-                "无法连接 PC 微信。请确认微信 4.x 已登录、窗口未退出，并检查 contact 名称。"
-                f"原始错误：{type(exc).__name__}: {exc}"
-            ) from exc
+            failure = exc
 
-    def _send_window_to_background(self, win32gui: Any) -> None:
+        if (
+            handles
+            and not self._avatar_recovery_attempted
+            and self._is_event_subscriber_error(failure)
+        ):
+            self._avatar_recovery_attempted = True
+            log.warning("微信 UIA 尚未就绪，自动点击左上角头像后重试连接")
+            try:
+                recovery_hwnd = self._select_recovery_hwnd(handles, win32gui)
+                self._prime_wechat_avatar(win32gui, recovery_hwnd)
+                self._root = self._find_wechat_root(handles, uia)
+                if self._root is None:
+                    raise LookupError("点击头像后仍未找到微信主窗口")
+                self._initialize_chatbox(uia, ChatBox, win32gui)
+                self._avatar_recovery_attempted = False
+                return
+            except Exception as recovery_error:
+                failure = recovery_error
+
+        assert failure is not None
+        raise RuntimeError(
+            "无法连接 PC 微信。请确认微信 4.x 已登录、窗口未退出，并检查 contact 名称。"
+            f"原始错误：{type(failure).__name__}: {failure}"
+        ) from failure
+
+    def _initialize_chatbox(self, uia: Any, ChatBox: Any, win32gui: Any) -> None:
+        """Initialize passive session watching without forcing a chat switch."""
+        self._invoke_send_supported = None
+        if self.background_mode:
+            self._send_window_to_background(win32gui)
+        session = self._find_session_item(uia)
+        self._target_session_signature = self._session_signature(session)
+        self._target_session_unread_count = self._session_unread_count(session)
+        self._session_watch_initialized = True
+        if self._current_contact(uia) != self.contact:
+            self._chatbox = None
+            self._wx = None
+            log.info("目标会话 %s 当前未打开，等待会话列表出现新消息", self.contact)
+            return
+        self._bind_current_chatbox(uia, ChatBox)
+
+    def _bind_current_chatbox(self, uia: Any, ChatBox: Any) -> None:
+        page = self._find_control(uia, automation_id="chat_message_page")
+        if page is None:
+            raise LookupError("未找到聊天页面")
+
+        self._active_chat_type = self._resolve_chat_type(uia)
+        parent = _NativeParent(self._root, self.contact, self._active_chat_type)
+        self._chatbox = ChatBox(page, parent)
+        self._wx = self._chatbox
+
+    @staticmethod
+    def _find_wechat_root(handles: Iterable[int], uia: Any) -> Any:
+        for hwnd in handles:
+            candidate = uia.ControlFromHandle(hwnd)
+            if candidate and candidate.ClassName == "mmui::MainWindow":
+                return candidate
+        return None
+
+    @staticmethod
+    def _select_recovery_hwnd(handles: Iterable[int], win32gui: Any) -> int:
+        """Prefer the largest visible WeChat top-level window."""
+
+        def visible_client_area(hwnd: int) -> int:
+            if not win32gui.IsWindowVisible(hwnd):
+                return -1
+            try:
+                left, top, right, bottom = win32gui.GetClientRect(hwnd)
+            except Exception:
+                return -1
+            return max(0, right - left) * max(0, bottom - top)
+
+        candidates = list(handles)
+        if not candidates:
+            raise LookupError("未找到可用于头像恢复的微信窗口")
+        return int(max(candidates, key=visible_client_area))
+
+    @staticmethod
+    def _is_event_subscriber_error(exc: BaseException | None) -> bool:
+        """Match COM CONNECT_E_NOCONNECTION, including wrapped exceptions."""
+        seen: set[int] = set()
+        current = exc
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            hresult = getattr(current, "hresult", None)
+            if hresult == -2147220991:
+                return True
+            args = getattr(current, "args", ())
+            if args and args[0] == -2147220991:
+                return True
+            if "事件无法调用任何订户" in str(current):
+                return True
+            current = current.__cause__ or current.__context__
+        return False
+
+    def _prime_wechat_avatar(self, win32gui: Any, hwnd: int) -> None:
+        """Perform the real click WeChat 4.x needs to publish its UIA tree."""
+        import win32api
+        import win32con
+
+        if not win32gui.IsWindowVisible(hwnd) or win32gui.IsIconic(hwnd):
+            raise LookupError("微信主窗口不可见，无法自动点击头像")
+
+        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+        width = right - left
+        height = bottom - top
+        if width < 120 or height < 180:
+            raise LookupError("微信主窗口尺寸异常，无法定位头像")
+
+        previous_foreground = win32gui.GetForegroundWindow()
+        previous_cursor = win32api.GetCursorPos()
+        flags = win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_SHOWWINDOW
+        try:
+            win32gui.SetWindowPos(hwnd, win32con.HWND_TOP, 0, 0, 0, 0, flags)
+            win32gui.SetForegroundWindow(hwnd)
+            if win32gui.GetForegroundWindow() != hwnd:
+                raise RuntimeError("无法临时激活微信窗口，未执行头像点击")
+
+            # These controls are positioned relative to the whole WeChat
+            # window, not its client area (which begins below the title bar).
+            avatar_x, avatar_y = left + 30, top + 62
+            chat_tab_x, chat_tab_y = left + 30, top + 114
+            win32api.SetCursorPos((avatar_x, avatar_y))
+            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+            time.sleep(0.4)
+            # Return to the chat tab so the profile popover does not obstruct
+            # subsequent background reads.
+            win32api.SetCursorPos((chat_tab_x, chat_tab_y))
+            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+            win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+            time.sleep(0.3)
+        finally:
+            try:
+                win32api.SetCursorPos(previous_cursor)
+            except Exception:
+                log.debug("恢复鼠标位置失败", exc_info=True)
+            if previous_foreground and previous_foreground != hwnd:
+                try:
+                    win32gui.SetForegroundWindow(previous_foreground)
+                except Exception as exc:
+                    log.warning("头像恢复流程无法还原前台窗口：%s", exc)
+            if self.background_mode:
+                try:
+                    self._send_window_to_background(win32gui, hwnd)
+                except Exception as exc:
+                    log.warning("头像恢复流程无法将微信放回后台：%s", exc)
+
+    def _send_window_to_background(self, win32gui: Any, hwnd: int | None = None) -> None:
         """Keep WeChat behind other windows without activating or hiding it."""
         import win32con
 
-        hwnd = int(self._root.NativeWindowHandle)
+        if hwnd is None:
+            if self._root is None:
+                raise LookupError("微信主窗口尚未初始化")
+            hwnd = int(self._root.NativeWindowHandle)
         if not win32gui.IsWindowVisible(hwnd) or win32gui.IsIconic(hwnd):
             raise LookupError(
                 "微信主窗口已最小化或关闭到托盘；微信 4.1.12 在此状态下不提供消息控件，"
@@ -305,6 +444,60 @@ class WeChatClient:
                 return (control.Name or "").strip()
         return ""
 
+    def _find_session_item(self, uia: Any) -> Any:
+        return self._find_control(
+            uia,
+            automation_id=f"session_item_{self.contact}",
+        )
+
+    @staticmethod
+    def _session_signature(control: Any) -> tuple[tuple[str, str, str], ...] | None:
+        """Capture preview/time/unread child changes from a session list item."""
+        if control is None:
+            return None
+        result: list[tuple[str, str, str]] = []
+        pending: list[tuple[Any, int]] = [(control, 0)]
+        while pending:
+            current, depth = pending.pop(0)
+            try:
+                result.append(
+                    (
+                        str(getattr(current, "Name", "") or ""),
+                        str(getattr(current, "AutomationId", "") or ""),
+                        str(getattr(current, "ClassName", "") or ""),
+                    )
+                )
+                if depth < 5:
+                    pending.extend((child, depth + 1) for child in current.GetChildren())
+            except Exception:
+                continue
+        return tuple(result)
+
+    @staticmethod
+    def _session_unread_count(control: Any) -> int | None:
+        """Read a numeric unread badge when WeChat exposes one through UIA."""
+        if control is None:
+            return None
+        counts: list[int] = []
+        pending: list[tuple[Any, int]] = [(control, 0)]
+        while pending:
+            current, depth = pending.pop(0)
+            try:
+                name = str(getattr(current, "Name", "") or "").strip()
+                class_name = str(getattr(current, "ClassName", "") or "").lower()
+                match = re.search(r"(\d+)\s*条?新消息", name)
+                if match:
+                    counts.append(int(match.group(1)))
+                elif name.isdigit() and current is not control and (
+                    "badge" in class_name or "unread" in class_name
+                ):
+                    counts.append(int(name))
+                if depth < 5:
+                    pending.extend((child, depth + 1) for child in current.GetChildren())
+            except Exception:
+                continue
+        return max(counts) if counts else None
+
     def _resolve_chat_type(self, uia: Any) -> str:
         if self.chat_type != "auto":
             return self.chat_type
@@ -317,10 +510,7 @@ class WeChatClient:
         if self._current_contact(uia) == self.contact:
             return
 
-        session = self._find_control(
-            uia,
-            automation_id=f"session_item_{self.contact}",
-        )
+        session = self._find_session_item(uia)
         if session is not None:
             self._select_without_focus(session)
             time.sleep(0.5)
@@ -338,20 +528,28 @@ class WeChatClient:
         if value is None:
             raise LookupError("微信搜索框不可写")
         value.SetValue(self.contact)
-        time.sleep(1)
-        result = self._find_control(
-            uia,
-            name=self.contact,
-            control_type="ListItemControl",
-            prefix_name=True,
-        )
-        if result is not None:
-            self._select_without_focus(result)
-        else:
-            value.SetValue("")
-            raise LookupError(f"微信搜索结果中没有联系人 {self.contact!r}")
-        time.sleep(0.8)
-        value.SetValue("")
+        try:
+            time.sleep(1)
+            result = self._find_control(
+                uia,
+                name=self.contact,
+                control_type="ListItemControl",
+                prefix_name=True,
+            )
+            if result is not None:
+                invoke = result.GetInvokePattern()
+                if invoke is not None:
+                    invoke.Invoke()
+                else:
+                    self._select_without_focus(result)
+            else:
+                raise LookupError(f"微信搜索结果中没有联系人 {self.contact!r}")
+            time.sleep(0.8)
+        finally:
+            try:
+                value.SetValue("")
+            except Exception:
+                log.debug("清理微信搜索框失败", exc_info=True)
         if self._current_contact(uia) != self.contact:
             raise LookupError(f"未能切换到联系人 {self.contact!r}")
 
@@ -372,15 +570,54 @@ class WeChatClient:
         from wxauto4.ui.chatbox import ChatBox
 
         self._ensure_contact(uia)
-        page = self._find_control(uia, automation_id="chat_message_page")
-        if page is None:
-            raise LookupError("未找到聊天页面")
-        self._active_chat_type = self._resolve_chat_type(uia)
-        self._chatbox = ChatBox(
-            page,
-            _NativeParent(self._root, self.contact, self._active_chat_type),
+        self._bind_current_chatbox(uia, ChatBox)
+        self._target_session_signature = self._session_signature(
+            self._find_session_item(uia)
         )
-        self._wx = self._chatbox
+        self._target_session_unread_count = self._session_unread_count(
+            self._find_session_item(uia)
+        )
+        self._session_watch_initialized = True
+
+    def _activate_target_for_new_message(self, uia: Any, ChatBox: Any) -> bool:
+        """Switch only when the target session's visible metadata changed."""
+        if self._current_contact(uia) == self.contact:
+            if self._wx is None:
+                self._bind_current_chatbox(uia, ChatBox)
+            return True
+
+        session = self._find_session_item(uia)
+        signature = self._session_signature(session)
+        unread_count = self._session_unread_count(session)
+        if not self._session_watch_initialized:
+            self._target_session_signature = signature
+            self._target_session_unread_count = unread_count
+            self._session_watch_initialized = True
+            return False
+        if session is None or signature == self._target_session_signature:
+            return False
+
+        log.info("检测到目标会话 %s 更新，切换后读取新消息", self.contact)
+        if unread_count is not None and self._target_session_unread_count is not None:
+            self._pending_session_message_count = max(
+                1, unread_count - self._target_session_unread_count
+            )
+        elif unread_count is not None:
+            self._pending_session_message_count = max(1, unread_count)
+        else:
+            self._pending_session_message_count = 1
+        self._select_without_focus(session)
+        time.sleep(0.5)
+        if self._current_contact(uia) != self.contact:
+            raise LookupError(f"检测到新消息，但未能切换到联系人 {self.contact!r}")
+        self._bind_current_chatbox(uia, ChatBox)
+        self._target_session_signature = self._session_signature(
+            self._find_session_item(uia)
+        )
+        self._target_session_unread_count = self._session_unread_count(
+            self._find_session_item(uia)
+        )
+        return True
 
     def _remember(self, key: str) -> None:
         if key in self._seen:
@@ -391,12 +628,27 @@ class WeChatClient:
             self._seen.discard(self._seen_order.popleft())
 
     def _all_messages(self) -> Iterable[Any]:
-        if self._wx is None:
-            raise RuntimeError("微信客户端尚未连接")
-        self._refresh_target()
+        from wxauto4.uia import uiautomation as uia
+        from wxauto4.ui.chatbox import ChatBox
+
+        if not self._activate_target_for_new_message(uia, ChatBox):
+            return []
         if not self.background_mode:
-            return self._chatbox.get_msgs()
-        return self._native_messages()
+            messages = list(self._chatbox.get_msgs())
+        else:
+            messages = self._native_messages()
+        if self._pending_session_message_count is not None:
+            new_count = self._pending_session_message_count
+            for raw in messages[: max(0, len(messages) - new_count)]:
+                self._remember(_message_key(raw))
+            self._pending_session_message_count = None
+        self._target_session_signature = self._session_signature(
+            self._find_session_item(uia)
+        )
+        self._target_session_unread_count = self._session_unread_count(
+            self._find_session_item(uia)
+        )
+        return messages
 
     def _native_messages(self) -> list[Any]:
         """Read visible message items without wxauto's focus-stealing scan.
@@ -521,8 +773,6 @@ class WeChatClient:
             return None
 
     def send(self, text: str) -> None:
-        if self._wx is None:
-            raise RuntimeError("微信客户端尚未连接")
         self._refresh_target()
         payload_limit = max(100, self.max_reply_chars - len(self.response_prefix))
         chunks = split_text(text, payload_limit)
@@ -530,6 +780,14 @@ class WeChatClient:
         for index, chunk in enumerate(chunks, start=1):
             part = f"({index}/{total}) " if total > 1 else ""
             self._send_background(self.response_prefix + part + chunk)
+        from wxauto4.uia import uiautomation as uia
+
+        self._target_session_signature = self._session_signature(
+            self._find_session_item(uia)
+        )
+        self._target_session_unread_count = self._session_unread_count(
+            self._find_session_item(uia)
+        )
 
     def _send_background(self, payload: str) -> None:
         """Prefer a focus-free UIA send, with a focus-restoring fallback."""

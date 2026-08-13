@@ -122,6 +122,139 @@ class WeChatClientTests(unittest.TestCase):
         WeChatClient._select_without_focus(Control())
         self.assertEqual(calls, ["select"])
 
+    def test_detects_wechat_event_subscriber_com_error(self) -> None:
+        direct = Exception(-2147220991, "事件无法调用任何订户")
+        self.assertTrue(WeChatClient._is_event_subscriber_error(direct))
+        self.assertFalse(
+            WeChatClient._is_event_subscriber_error(Exception("普通连接错误"))
+        )
+
+    def test_selects_largest_visible_window_for_early_recovery(self) -> None:
+        fake_gui = SimpleNamespace(
+            IsWindowVisible=lambda hwnd: hwnd != 300,
+            GetClientRect=lambda hwnd: {
+                100: (0, 0, 320, 240),
+                200: (0, 0, 880, 640),
+                300: (0, 0, 1920, 1080),
+            }[hwnd],
+        )
+        self.assertEqual(
+            WeChatClient._select_recovery_hwnd([100, 200, 300], fake_gui), 200
+        )
+
+    def test_avatar_recovery_restores_cursor_foreground_and_background(self) -> None:
+        calls: list[object] = []
+        foreground = [200]
+
+        client = WeChatClient("张三", True, False, True, 3, "[助手] ", 1800)
+        client._root = SimpleNamespace(NativeWindowHandle=100)
+        client._send_window_to_background = (
+            lambda _gui, _hwnd=None: calls.append("background")
+        )
+
+        def set_foreground(hwnd: int) -> None:
+            foreground[0] = hwnd
+            calls.append(("foreground", hwnd))
+
+        fake_gui = SimpleNamespace(
+            IsWindowVisible=lambda _hwnd: True,
+            IsIconic=lambda _hwnd: False,
+            GetWindowRect=lambda _hwnd: (400, 300, 1280, 940),
+            GetForegroundWindow=lambda: foreground[0],
+            SetWindowPos=lambda *args: calls.append(("top", args[0])),
+            SetForegroundWindow=set_foreground,
+        )
+        fake_api = SimpleNamespace(
+            GetCursorPos=lambda: (900, 700),
+            SetCursorPos=lambda point: calls.append(("cursor", point)),
+            mouse_event=lambda flag, *_args: calls.append(("mouse", flag)),
+        )
+        fake_con = SimpleNamespace(
+            SWP_NOMOVE=1,
+            SWP_NOSIZE=2,
+            SWP_SHOWWINDOW=4,
+            HWND_TOP=0,
+            MOUSEEVENTF_LEFTDOWN=8,
+            MOUSEEVENTF_LEFTUP=16,
+        )
+
+        with patch.dict(
+            "sys.modules",
+            {"win32api": fake_api, "win32con": fake_con},
+        ), patch("wechat_codex.wechat_client.time.sleep"):
+            client._prime_wechat_avatar(fake_gui, 100)
+
+        self.assertIn(("cursor", (430, 362)), calls)
+        self.assertIn(("cursor", (430, 414)), calls)
+        self.assertEqual(calls.count(("mouse", 8)), 2)
+        self.assertEqual(calls.count(("mouse", 16)), 2)
+        self.assertIn(("cursor", (900, 700)), calls)
+        self.assertIn(("foreground", 200), calls)
+        self.assertEqual(calls[-1], "background")
+
+    def test_session_watcher_switches_only_after_preview_changes(self) -> None:
+        current_contact = ["微信团队"]
+
+        class Node:
+            AutomationId = "session_item_無惧"
+            ClassName = "mmui::SessionItemView"
+
+            def __init__(self, name: str, children: list[object] | None = None) -> None:
+                self.Name = name
+                self._children = children or []
+
+            def GetChildren(self) -> list[object]:
+                return self._children
+
+        preview = Node("昨天的消息")
+        session = Node("無惧", [preview])
+        client = WeChatClient("無惧", True, False, True, 3, "[助手] ", 1800)
+        client._session_watch_initialized = True
+        client._target_session_signature = client._session_signature(session)
+        client._current_contact = lambda _uia: current_contact[0]
+        client._find_session_item = lambda _uia: session
+        selected: list[object] = []
+
+        def select(control: object) -> None:
+            selected.append(control)
+            current_contact[0] = "無惧"
+
+        client._select_without_focus = select
+        client._bind_current_chatbox = lambda _uia, _chatbox: setattr(
+            client, "_wx", object()
+        )
+
+        self.assertFalse(client._activate_target_for_new_message(object(), object()))
+        self.assertEqual(selected, [])
+
+        preview.Name = "刚收到的新消息"
+        with patch("wechat_codex.wechat_client.time.sleep"):
+            self.assertTrue(
+                client._activate_target_for_new_message(object(), object())
+            )
+        self.assertEqual(selected, [session])
+
+    def test_passive_activation_marks_history_and_keeps_only_new_tail(self) -> None:
+        client = WeChatClient("無惧", True, False, True, 3, "[助手] ", 1800)
+        old = SimpleNamespace(id="old")
+        new = SimpleNamespace(id="new")
+        client._pending_session_message_count = 1
+        client._activate_target_for_new_message = lambda _uia, _chatbox: True
+        client._native_messages = lambda: [old, new]
+        client._find_session_item = lambda _uia: None
+
+        with patch.dict(
+            "sys.modules",
+            {
+                "wxauto4.ui.chatbox": SimpleNamespace(ChatBox=object),
+            },
+        ):
+            messages = list(client._all_messages())
+
+        self.assertEqual(messages, [old, new])
+        self.assertIn("id:old", client._seen)
+        self.assertNotIn("id:new", client._seen)
+
     def test_background_send_prefers_invoke_without_setting_focus(self) -> None:
         from wxauto4.uia import uiautomation  # noqa: F401 - load before Win32 fakes
 
