@@ -25,6 +25,9 @@ class ConfigTests(unittest.TestCase):
             self.assertTrue(config.background_mode)
             self.assertTrue(config.voice_recognition)
             self.assertEqual(config.voice_retry_count, 3)
+            self.assertEqual(config.chat_model, "gpt-5.6-terra")
+            self.assertEqual(config.chat_reasoning_effort, "low")
+            self.assertEqual(config.chat_max_output_tokens, 1200)
             self.assertEqual(config.projects["demo"], (root / "repo").resolve())
 
 

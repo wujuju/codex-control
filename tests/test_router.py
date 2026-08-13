@@ -24,8 +24,8 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(route_message("状态").kind, RouteKind.STATUS)
         self.assertEqual(route_message("停止").kind, RouteKind.STOP)
         self.assertEqual(route_message("继续：补充测试").kind, RouteKind.CONTINUE)
+        self.assertEqual(route_message("新对话").kind, RouteKind.NEW_CHAT)
 
 
 if __name__ == "__main__":
     unittest.main()
-

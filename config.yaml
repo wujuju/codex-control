@@ -17,8 +17,12 @@ send_ready_message: false
 poll_seconds: 1.0
 max_reply_chars: 1800
 
-codex_command: "codex"
+chat_model: "gpt-5.6-terra"
+chat_reasoning_effort: "low"
+chat_max_output_tokens: 1200
 chat_timeout_seconds: 180
+
+codex_command: "codex"
 work_timeout_seconds: 3600
 
 default_project: "control"

@@ -72,12 +72,10 @@ class CodexRunner:
         self,
         codex_command: str,
         runtime_dir: Path,
-        chat_timeout_seconds: int,
         work_timeout_seconds: int,
     ) -> None:
         self.codex_command = codex_command
         self.runtime_dir = runtime_dir
-        self.chat_timeout_seconds = chat_timeout_seconds
         self.work_timeout_seconds = work_timeout_seconds
         self.events: queue.Queue[RunnerEvent] = queue.Queue()
         self._state = RunnerState()
@@ -86,15 +84,12 @@ class CodexRunner:
         self._last_work_path: Path | None = None
         self._lock = threading.RLock()
 
-        (self.runtime_dir / "chat").mkdir(parents=True, exist_ok=True)
+        self.runtime_dir.mkdir(parents=True, exist_ok=True)
 
-    def begin_chat(self, prompt: str) -> tuple[bool, str]:
-        chat_prompt = (
-            "你是微信里的中文聊天助手。只回答用户问题，不读取本地文件，不执行命令，不修改任何内容。"
-            "回答适合微信阅读，简洁直接。\n\n用户消息：\n" + prompt
-        )
-        args = self.build_chat_args(chat_prompt)
-        return self._begin(args, "chat", None, self.runtime_dir / "chat", self.chat_timeout_seconds)
+    @property
+    def active(self) -> bool:
+        with self._lock:
+            return self._state.active
 
     def begin_work(self, project: str, project_path: Path, prompt: str) -> tuple[bool, str]:
         if not project_path.is_dir():
@@ -123,20 +118,6 @@ class CodexRunner:
         )
         args = self.build_continue_args(thread_id, continue_prompt)
         return self._begin(args, "continue", project, project_path, self.work_timeout_seconds)
-
-    def build_chat_args(self, prompt: str) -> list[str]:
-        return [
-            self.codex_command,
-            "exec",
-            "--json",
-            "--ephemeral",
-            "--skip-git-repo-check",
-            "--sandbox",
-            "read-only",
-            "-C",
-            str(self.runtime_dir / "chat"),
-            prompt,
-        ]
 
     def build_work_args(self, project_path: Path, prompt: str) -> list[str]:
         return [
@@ -179,8 +160,7 @@ class CodexRunner:
             daemon=True,
         )
         worker.start()
-        label = "聊天请求" if kind == "chat" else f"Codex 任务（{project}）"
-        return True, f"已开始{label}"
+        return True, f"已开始 Codex 任务（{project}）"
 
     def _run(self, args: list[str], cwd: Path, timeout: int) -> None:
         flags = 0

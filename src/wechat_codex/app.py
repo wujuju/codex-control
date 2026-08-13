@@ -5,6 +5,7 @@ import queue
 import threading
 from collections.abc import Callable
 
+from .chatgpt_runner import ChatGPTRunner
 from .codex_runner import CodexRunner
 from .config import AppConfig
 from .router import RouteKind, help_text, route_message
@@ -41,8 +42,14 @@ class BridgeApp:
         self.runner = CodexRunner(
             codex_command=config.codex_command,
             runtime_dir=config.runtime_dir,
-            chat_timeout_seconds=config.chat_timeout_seconds,
             work_timeout_seconds=config.work_timeout_seconds,
+        )
+        self.chat_runner = ChatGPTRunner(
+            model=config.chat_model,
+            reasoning_effort=config.chat_reasoning_effort,
+            max_output_tokens=config.chat_max_output_tokens,
+            timeout_seconds=config.chat_timeout_seconds,
+            runtime_dir=config.runtime_dir,
         )
         self._announced = False
 
@@ -72,11 +79,13 @@ class BridgeApp:
                     self._emit_state("reconnecting", f"连接失败，正在重试：{exc}")
                     self._stop_event.wait(5)
         finally:
+            self.chat_runner.stop()
             self.runner.stop()
             self._emit_state("stopped", "已停止")
 
     def stop(self) -> None:
         self._stop_event.set()
+        self.chat_runner.stop()
         self.runner.stop()
 
     def enqueue_message(self, text: str) -> None:
@@ -116,6 +125,8 @@ class BridgeApp:
 
                 for event in self.runner.drain_events():
                     self._send(event.text)
+                for event in self.chat_runner.drain_events():
+                    self._send(event.text)
 
                 for message in self.wechat.poll():
                     log.info(
@@ -154,17 +165,34 @@ class BridgeApp:
             )
             return
         if route.kind == RouteKind.STATUS:
-            self._send(self.runner.status())
+            status = self.chat_runner.status() if self.chat_runner.active else self.runner.status()
+            self._send(status)
             return
         if route.kind == RouteKind.STOP:
-            self._send(self.runner.stop())
+            result = self.chat_runner.stop() if self.chat_runner.active else self.runner.stop()
+            self._send(result)
+            return
+        session_key = self._chat_session_key(message)
+        if route.kind == RouteKind.NEW_CHAT:
+            if self.runner.active:
+                self._send("Codex 任务正在执行，请发送“状态”或“停止”")
+                return
+            ok, response = self.chat_runner.begin_reset(session_key)
+            if not ok:
+                self._send(response)
             return
         if route.kind == RouteKind.CONTINUE:
+            if self.chat_runner.active:
+                self._send("ChatGPT 请求正在执行，请发送“状态”或“停止”")
+                return
             ok, response = self.runner.begin_continue(route.prompt)
             if not ok:
                 self._send(response)
             return
         if route.kind == RouteKind.WORK:
+            if self.chat_runner.active:
+                self._send("ChatGPT 请求正在执行，请发送“状态”或“停止”")
+                return
             project = route.project or self.config.default_project
             project_path = self.config.projects.get(project)
             if project_path is None:
@@ -177,6 +205,15 @@ class BridgeApp:
                 self._send(response)
             return
 
-        ok, response = self.runner.begin_chat(route.prompt)
+        if self.runner.active:
+            self._send("Codex 任务正在执行，请发送“状态”或“停止”")
+            return
+        ok, response = self.chat_runner.begin_chat(session_key, route.prompt)
         if not ok:
             self._send(response)
+
+    def _chat_session_key(self, message: IncomingMessage) -> str:
+        conversation = message.conversation or self.config.contact
+        if message.chat_type == "group":
+            return f"group:{conversation}:{message.sender}"
+        return f"friend:{conversation}"

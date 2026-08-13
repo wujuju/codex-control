@@ -1,15 +1,17 @@
-# PC 微信控制 Codex
+# PC 微信接入 ChatGPT 与 Codex
 
-一个纯本地 Windows 小工具：读取已登录的 PC 微信消息，普通消息交给 Codex 做只读聊天，只有带“干活”前缀的消息才允许 Codex 修改预配置项目。
+一个 Windows 小工具：读取已登录的 PC 微信消息，普通消息交给 OpenAI ChatGPT API，只有带“干活”前缀的消息才交给本机 Codex 修改预配置项目。
 
-桌面端使用 PySide6 + QML：左侧显示私聊/群聊会话，右侧显示收到的消息、Codex 回复和手动发送区。窗口可正常最小化，最小化后微信监听与 Codex 任务继续运行。
+桌面端使用 PySide6 + QML：左侧显示私聊/群聊会话，右侧显示收到的消息、ChatGPT/Codex 回复和手动发送区。窗口可正常最小化，最小化后微信监听与请求继续运行。
 
 ## 当前能力
 
 - 固定监听一个联系人、群聊或“文件传输助手”
 - 私聊直接回复；群聊只有明确 `@ChatGpt机器人` 才回复
 - 只有白名单中的“無惧”可以执行干活、继续、状态和停止命令
-- 普通中文聊天
+- 普通中文聊天使用 Responses API + Conversations API，程序重启后继续上下文
+- 私聊按会话保存上下文；群聊按“群名 + 成员”隔离上下文
+- `新对话` 删除当前 ChatGPT 远端对话并清除本地映射
 - `干活：任务` 修改默认项目
 - `干活 control：任务` 修改指定项目
 - `继续：要求` 继续最近一次干活会话
@@ -25,6 +27,7 @@
 - Python 3.10～3.13
 - PC 微信 4.x，已登录
 - 已安装并登录 Codex CLI
+- OpenAI API Key，且 API 账户已启用计费或有可用额度
 
 ## 安装
 
@@ -32,6 +35,18 @@
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e .
 ```
+
+将 API Key 放在环境变量中，不要写入 `config.yaml`：
+
+```powershell
+# 当前 PowerShell 窗口临时生效
+$env:OPENAI_API_KEY = "你的 API Key"
+
+# 写入当前 Windows 用户环境；重新打开终端或重启桥接器后生效
+[Environment]::SetEnvironmentVariable("OPENAI_API_KEY", "你的 API Key", "User")
+```
+
+ChatGPT 网页版/客户端订阅与 OpenAI API 额度相互独立。本项目的方案 B 使用 API，不能直接复用 ChatGPT 登录态。
 
 编辑 `config.yaml`：
 
@@ -43,6 +58,9 @@ authorized_senders: ["無惧"]
 background_mode: true
 voice_recognition: true
 voice_retry_count: 3
+chat_model: "gpt-5.6-terra"
+chat_reasoning_effort: "low"
+chat_max_output_tokens: 1200
 default_project: "control"
 projects:
   control: "."
@@ -97,6 +115,7 @@ projects:
 干活：检查项目并运行测试
 干活 control：给 README 增加安装说明并验证
 继续：再补一个测试
+新对话
 状态
 停止
 帮助
@@ -104,11 +123,13 @@ projects:
 
 监听普通联系人时请设置 `allow_self_messages: false`，只处理对方发来的消息。使用“文件传输助手”时可改成 `true`；程序发出的内容带 `[Codex助手]` 前缀并会被忽略，不会自我回复。
 
-监听群聊时，把 `contact` 改为群名并设置 `chat_type: group`。群消息必须包含 `@ChatGpt机器人`，程序会先去掉该 @ 再进行聊天或命令解析。普通聊天对群成员开放，但 `干活`、`继续`、`状态`、`停止` 只接受 `authorized_senders` 中的发送者；当前仅允许“無惧”。为保持完全后台，程序不会动态切换并扫描其他会话，因此每个运行实例监听一个已配置会话。
+监听群聊时，把 `contact` 改为群名并设置 `chat_type: group`。群消息必须包含 `@ChatGpt机器人`，程序会先去掉该 @ 再进行聊天或命令解析。每个群成员有独立的 ChatGPT 对话。普通聊天对群成员开放，但 `干活`、`继续`、`状态`、`停止` 只接受 `authorized_senders` 中的发送者；当前仅允许“無惧”。为保持完全后台，程序不会动态切换并扫描其他会话，因此每个运行实例监听一个已配置会话。
 
 ## 安全边界
 
-- 普通聊天使用 `read-only` 沙箱和临时 Codex 会话。
+- 普通聊天发送到 OpenAI API，不运行本地命令，也不授予模型本地文件工具。
+- Conversations API 的远端对话会持续保存；本地只在 `.runtime/chat_conversations.json` 保存会话键和对话 ID，不保存 API Key。
+- 发送 `新对话` 会删除当前远端对话；直接删除本地映射文件不会删除 OpenAI 侧的数据。
 - 干活使用 `workspace-write`，只在配置的项目里运行。
 - 系统提示明确禁止 Git 提交、推送、部署及破坏性操作。
 - 不使用微信 Hook、不读取微信数据库，只通过 Windows UI Automation 操作窗口。

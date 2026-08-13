@@ -12,6 +12,7 @@ class RouteKind(str, Enum):
     STATUS = "status"
     STOP = "stop"
     HELP = "help"
+    NEW_CHAT = "new_chat"
 
 
 @dataclass(frozen=True)
@@ -37,6 +38,8 @@ def route_message(text: str) -> Route:
         return Route(RouteKind.STOP)
     if lowered in {"帮助", "/help", "?", "？"}:
         return Route(RouteKind.HELP)
+    if lowered in {"新对话", "/new"}:
+        return Route(RouteKind.NEW_CHAT)
 
     match = _WORK.match(cleaned)
     if match:
@@ -56,8 +59,8 @@ def help_text(projects: list[str], default_project: str) -> str:
         f"干活：任务：让 Codex 修改默认项目 {default_project}\n"
         "干活 项目名：任务：修改指定项目\n"
         "继续：要求：继续上次干活会话\n"
+        "新对话：清除当前 ChatGPT 对话并重新开始\n"
         "状态：查看任务\n"
         "停止：终止当前任务\n"
         f"可用项目：{project_text}"
     )
-

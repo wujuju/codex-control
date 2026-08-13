@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -12,7 +13,7 @@ from .wechat_client import WeChatClient
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="PC 微信到本地 Codex 的轻量桥接器")
+    parser = argparse.ArgumentParser(description="PC 微信到 ChatGPT 和本地 Codex 的轻量桥接器")
     parser.add_argument("--config", default="config.yaml", help="配置文件路径")
     parser.add_argument("--verbose", action="store_true", help="显示调试日志")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -49,6 +50,12 @@ def doctor(config: AppConfig, connect: bool) -> int:
     else:
         failed = True
         print(f"[FAIL] 找不到 Codex 命令：{config.codex_command}")
+
+    if os.environ.get("OPENAI_API_KEY"):
+        print("[OK] ChatGPT API：已设置 OPENAI_API_KEY")
+    else:
+        failed = True
+        print("[FAIL] ChatGPT API：未设置环境变量 OPENAI_API_KEY")
 
     processes = _wechat_processes()
     if processes:
