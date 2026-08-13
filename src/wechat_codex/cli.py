@@ -68,7 +68,10 @@ def doctor(config: AppConfig, connect: bool) -> int:
     if connect:
         client = WeChatClient(
             config.contact,
+            config.background_mode,
             config.allow_self_messages,
+            config.voice_recognition,
+            config.voice_retry_count,
             config.response_prefix,
             config.max_reply_chars,
         )
@@ -101,7 +104,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "send":
             client = WeChatClient(
                 config.contact,
+                config.background_mode,
                 config.allow_self_messages,
+                config.voice_recognition,
+                config.voice_retry_count,
                 config.response_prefix,
                 config.max_reply_chars,
             )

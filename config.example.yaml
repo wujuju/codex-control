@@ -1,5 +1,8 @@
 contact: "文件传输助手"
+background_mode: true
 allow_self_messages: true
+voice_recognition: true
+voice_retry_count: 3
 response_prefix: "[Codex助手] "
 send_ready_message: true
 poll_seconds: 1.0

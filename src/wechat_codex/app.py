@@ -17,7 +17,10 @@ class BridgeApp:
         self.config = config
         self.wechat = WeChatClient(
             contact=config.contact,
+            background_mode=config.background_mode,
             allow_self_messages=config.allow_self_messages,
+            voice_recognition=config.voice_recognition,
+            voice_retry_count=config.voice_retry_count,
             response_prefix=config.response_prefix,
             max_reply_chars=config.max_reply_chars,
         )
@@ -40,7 +43,8 @@ class BridgeApp:
                     baseline_count,
                 )
                 if self.config.send_ready_message and not self._announced:
-                    self.wechat.send("已上线。发送“帮助”查看命令。")
+                    voice = "，支持自动识别语音" if self.config.voice_recognition else ""
+                    self.wechat.send(f"已上线{voice}。发送“帮助”查看命令。")
                     self._announced = True
                 self._listen()
             except KeyboardInterrupt:

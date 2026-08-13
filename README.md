@@ -13,6 +13,7 @@
 - `停止` 终止任务
 - 启动时忽略已有历史消息，回复自动防循环
 - 登录连接成功后自动发送一条“已上线”消息
+- 自动调用微信“语音转文字”，识别结果按普通消息继续处理
 
 ## 环境
 
@@ -32,6 +33,9 @@ python -m venv .venv
 
 ```yaml
 contact: "無惧"
+background_mode: true
+voice_recognition: true
+voice_retry_count: 3
 default_project: "control"
 projects:
   control: "."
@@ -91,5 +95,13 @@ projects:
 - 干活使用 `workspace-write`，只在配置的项目里运行。
 - 系统提示明确禁止 Git 提交、推送、部署及破坏性操作。
 - 不使用微信 Hook、不读取微信数据库，只通过 Windows UI Automation 操作窗口。
+
+## 后台执行说明
+
+`background_mode: true` 时，程序不激活微信窗口、不移动鼠标、不发送全局模拟按键，也不使用剪贴板；文本通过 UI Automation 的 `ValuePattern` 写入，再通过只发给微信窗口的 Win32 消息提交。桥接器自身以隐藏进程运行。
+
+微信 4.1.12 在窗口最小化或关闭到托盘后会卸载消息控件，因此微信主窗口需要保持“已打开、未最小化”。程序会把微信放到其他窗口后面，并且不会主动切到前台。
+
+收到语音时，程序调用微信客户端自带的语音转文字。识别后的内容会直接进入聊天/命令路由，因此语音说“干活：运行测试”与发送同样的文字效果一致。识别连续失败 `voice_retry_count` 次后会提示改发文字。
 
 这类 UI 自动化依赖微信窗口结构。微信大版本更新后若连接失败，先运行 `doctor --connect` 查看错误，并升级 `wxauto4`。

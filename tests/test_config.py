@@ -19,9 +19,11 @@ class ConfigTests(unittest.TestCase):
             config = load_config(config_file)
 
             self.assertEqual(config.contact, "测试")
+            self.assertTrue(config.background_mode)
+            self.assertTrue(config.voice_recognition)
+            self.assertEqual(config.voice_retry_count, 3)
             self.assertEqual(config.projects["demo"], (root / "repo").resolve())
 
 
 if __name__ == "__main__":
     unittest.main()
-

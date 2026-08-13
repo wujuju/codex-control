@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Iterable
+
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -26,18 +30,31 @@ def _message_key(message: Any) -> str:
     return "fallback:" + hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()
 
 
+def _message_attr(message: Any) -> str:
+    attr = str(getattr(message, "attr", "")).lower()
+    if attr:
+        return attr
+    class_name = type(message).__name__.lower()
+    if "friend" in class_name:
+        return "friend"
+    if "self" in class_name:
+        return "self"
+    return ""
+
+
+def is_voice_message(message: Any) -> bool:
+    message_type = str(getattr(message, "type", "")).lower()
+    class_name = type(message).__name__.lower()
+    return message_type == "voice" or "voicemessage" in class_name
+
+
 def normalize_message(message: Any) -> IncomingMessage | None:
     content = getattr(message, "content", None)
     if not isinstance(content, str) or not content.strip():
         return None
 
-    attr = str(getattr(message, "attr", "")).lower()
+    attr = _message_attr(message)
     class_name = type(message).__name__.lower()
-    if not attr:
-        if "friend" in class_name:
-            attr = "friend"
-        elif "self" in class_name:
-            attr = "self"
 
     message_type = str(getattr(message, "type", "")).lower()
     is_text = message_type in {"text", "quote"} or any(
@@ -49,6 +66,26 @@ def normalize_message(message: Any) -> IncomingMessage | None:
     return IncomingMessage(
         key=_message_key(message),
         content=content.strip(),
+        sender=str(getattr(message, "sender", "")),
+        attr=attr,
+    )
+
+
+def normalize_voice_message(
+    message: Any,
+    recognized_text: str,
+    *,
+    key: str | None = None,
+) -> IncomingMessage | None:
+    if not is_voice_message(message):
+        return None
+    attr = _message_attr(message)
+    content = recognized_text.strip()
+    if attr not in {"friend", "self"} or not content:
+        return None
+    return IncomingMessage(
+        key=key or _message_key(message),
+        content=content,
         sender=str(getattr(message, "sender", "")),
         attr=attr,
     )
@@ -76,18 +113,25 @@ class WeChatClient:
     def __init__(
         self,
         contact: str,
+        background_mode: bool,
         allow_self_messages: bool,
+        voice_recognition: bool,
+        voice_retry_count: int,
         response_prefix: str,
         max_reply_chars: int,
     ) -> None:
         self.contact = contact
+        self.background_mode = background_mode
         self.allow_self_messages = allow_self_messages
+        self.voice_recognition = voice_recognition
+        self.voice_retry_count = voice_retry_count
         self.response_prefix = response_prefix
         self.max_reply_chars = max_reply_chars
         self._wx: Any = None
         self._seen_order: deque[str] = deque()
         self._seen: set[str] = set()
         self._seen_limit = 1000
+        self._voice_failures: dict[str, tuple[int, float]] = {}
         self._root: Any = None
         self._chatbox: Any = None
 
@@ -111,7 +155,7 @@ class WeChatClient:
 
             def collect(hwnd: int, _: Any) -> None:
                 _, pid = win32process.GetWindowThreadProcessId(hwnd)
-                if pid not in pids or not win32gui.IsWindowVisible(hwnd):
+                if pid not in pids:
                     return
                 if "QWindowIcon" in win32gui.GetClassName(hwnd):
                     handles.append(hwnd)
@@ -126,7 +170,8 @@ class WeChatClient:
             if self._root is None:
                 raise LookupError("未找到已登录的微信主窗口")
 
-            self._root.SetActive()
+            if self.background_mode:
+                self._send_window_to_background(win32gui)
             self._ensure_contact(uia)
             page = self._find_control(uia, automation_id="chat_message_page")
             if page is None:
@@ -140,6 +185,29 @@ class WeChatClient:
                 "无法连接 PC 微信。请确认微信 4.x 已登录、窗口未退出，并检查 contact 名称。"
                 f"原始错误：{type(exc).__name__}: {exc}"
             ) from exc
+
+    def _send_window_to_background(self, win32gui: Any) -> None:
+        """Keep WeChat behind other windows without activating or hiding it."""
+        import win32con
+
+        hwnd = int(self._root.NativeWindowHandle)
+        if not win32gui.IsWindowVisible(hwnd) or win32gui.IsIconic(hwnd):
+            raise LookupError(
+                "微信主窗口已最小化或关闭到托盘；微信 4.1.12 在此状态下不提供消息控件，"
+                "请打开主窗口，程序不会抢占焦点"
+            )
+        win32gui.SetWindowPos(
+            hwnd,
+            win32con.HWND_BOTTOM,
+            0,
+            0,
+            0,
+            0,
+            win32con.SWP_NOMOVE
+            | win32con.SWP_NOSIZE
+            | win32con.SWP_NOACTIVATE
+            | win32con.SWP_NOOWNERZORDER,
+        )
 
     def _walk_roots(self, uia: Any) -> Iterable[Any]:
         if self._root is not None:
@@ -205,7 +273,7 @@ class WeChatClient:
             automation_id=f"session_item_{self.contact}",
         )
         if session is not None:
-            session.Click()
+            self._select_without_focus(session)
             time.sleep(0.5)
             if self._current_contact(uia) == self.contact:
                 return
@@ -229,14 +297,26 @@ class WeChatClient:
             prefix_name=True,
         )
         if result is not None:
-            result.Click()
+            self._select_without_focus(result)
         else:
-            search.Click()
-            uia.SendKeys("{ENTER}")
+            value.SetValue("")
+            raise LookupError(f"微信搜索结果中没有联系人 {self.contact!r}")
         time.sleep(0.8)
         value.SetValue("")
         if self._current_contact(uia) != self.contact:
             raise LookupError(f"未能切换到联系人 {self.contact!r}")
+
+    @staticmethod
+    def _select_without_focus(control: Any) -> None:
+        selection = control.GetSelectionItemPattern()
+        if selection is not None:
+            selection.Select()
+            return
+        invoke = control.GetInvokePattern()
+        if invoke is not None:
+            invoke.Invoke()
+            return
+        raise LookupError("目标微信控件不支持后台选择")
 
     def _refresh_target(self) -> None:
         from wxauto4.uia import uiautomation as uia
@@ -275,16 +355,65 @@ class WeChatClient:
     def poll(self) -> list[IncomingMessage]:
         incoming: list[IncomingMessage] = []
         for raw in self._all_messages():
+            raw_key = _message_key(raw)
+            if raw_key in self._seen:
+                continue
             message = normalize_message(raw)
-            if not message or message.key in self._seen:
+            if message is None and is_voice_message(raw):
+                message = self._recognize_voice(raw, raw_key)
+            if not message:
                 continue
             self._remember(message.key)
+            self._voice_failures.pop(message.key, None)
             if message.content.startswith(self.response_prefix):
                 continue
             if message.attr == "self" and not self.allow_self_messages:
                 continue
             incoming.append(message)
         return incoming
+
+    def _recognize_voice(self, raw: Any, key: str) -> IncomingMessage | None:
+        attr = _message_attr(raw)
+        if attr not in {"friend", "self"}:
+            self._remember(key)
+            return None
+        if attr == "self" and not self.allow_self_messages:
+            self._remember(key)
+            return None
+        if not self.voice_recognition:
+            self._remember(key)
+            return None
+
+        attempts, retry_after = self._voice_failures.get(key, (0, 0.0))
+        if time.monotonic() < retry_after:
+            return None
+        try:
+            converter = getattr(raw, "to_text", None)
+            if not callable(converter):
+                raise RuntimeError("当前微信语音消息不支持转文字")
+            recognized = converter()
+            if not isinstance(recognized, str) or not recognized.strip():
+                raise RuntimeError("微信没有返回识别文本")
+            message = normalize_voice_message(raw, recognized, key=key)
+            if message:
+                log.info("语音识别成功（%s）：%s", message.sender, message.content)
+            return message
+        except Exception as exc:
+            attempts += 1
+            if attempts >= self.voice_retry_count:
+                self._remember(key)
+                self._voice_failures.pop(key, None)
+                log.warning("语音识别最终失败：%s", exc)
+                self.send("收到一条语音，但自动识别失败，请改发文字。")
+            else:
+                self._voice_failures[key] = (attempts, time.monotonic() + 3.0)
+                log.warning(
+                    "语音识别失败（%d/%d），稍后重试：%s",
+                    attempts,
+                    self.voice_retry_count,
+                    exc,
+                )
+            return None
 
     def send(self, text: str) -> None:
         if self._wx is None:
@@ -295,9 +424,50 @@ class WeChatClient:
         total = len(chunks)
         for index, chunk in enumerate(chunks, start=1):
             part = f"({index}/{total}) " if total > 1 else ""
-            response = self._chatbox.send_msg(self.response_prefix + part + chunk)
-            if response is not None and hasattr(response, "is_success") and not response.is_success:
-                raise RuntimeError(f"微信发送失败：{response}")
+            self._send_background(self.response_prefix + part + chunk)
+
+    def _send_background(self, payload: str) -> None:
+        """Send without clipboard, mouse movement, simulated keys, or focus changes."""
+        from wxauto4.uia import uiautomation as uia
+
+        edit = self._find_control(uia, automation_id="chat_input_field")
+        if edit is None:
+            raise LookupError("微信聊天输入控件不可用；请保持微信主窗口打开且不要最小化")
+
+        value = edit.GetValuePattern()
+        if value is None:
+            raise LookupError("当前微信版本不支持后台输入")
+        if value.Value.strip():
+            raise RuntimeError("目标聊天输入框存在未发送草稿，为避免覆盖已暂停发送")
+
+        value.SetValue(payload)
+        try:
+            # WeChat 4.1.12 advertises InvokePattern on the send button but its
+            # provider returns success without sending when the window is not
+            # foreground. Give the edit logical focus inside WeChat, then post
+            # Enter directly to WeChat's HWND. This does not synthesize a
+            # system-wide key event and does not activate the window.
+            import win32api
+            import win32con
+
+            edit.SetFocus()
+            hwnd = int(self._root.NativeWindowHandle)
+            win32api.SendMessage(hwnd, win32con.WM_KEYDOWN, win32con.VK_RETURN, 0)
+            win32api.SendMessage(hwnd, win32con.WM_KEYUP, win32con.VK_RETURN, 0)
+        except Exception:
+            # Avoid leaving an automation-generated draft after a failed send.
+            if value.Value == payload:
+                value.SetValue("")
+            raise
+
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if not value.Value.strip():
+                return
+            time.sleep(0.1)
+        if value.Value == payload:
+            value.SetValue("")
+        raise RuntimeError("微信后台发送未完成，已清理输入框")
 
 
 class _NativeParent:

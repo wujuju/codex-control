@@ -11,7 +11,10 @@ import yaml
 class AppConfig:
     source: Path
     contact: str
+    background_mode: bool
     allow_self_messages: bool
+    voice_recognition: bool
+    voice_retry_count: int
     response_prefix: str
     send_ready_message: bool
     poll_seconds: float
@@ -65,12 +68,15 @@ def load_config(path: str | Path) -> AppConfig:
     max_reply_chars = int(raw.get("max_reply_chars", 1800))
     chat_timeout = int(raw.get("chat_timeout_seconds", 180))
     work_timeout = int(raw.get("work_timeout_seconds", 3600))
+    voice_retry_count = int(raw.get("voice_retry_count", 3))
     if poll_seconds < 0.2:
         raise ValueError("poll_seconds 不能小于 0.2")
     if max_reply_chars < 100:
         raise ValueError("max_reply_chars 不能小于 100")
     if chat_timeout < 10 or work_timeout < 10:
         raise ValueError("任务超时不能小于 10 秒")
+    if not 1 <= voice_retry_count <= 5:
+        raise ValueError("voice_retry_count 必须在 1 到 5 之间")
 
     response_prefix = str(raw.get("response_prefix", "[Codex助手] "))
     if not response_prefix:
@@ -79,7 +85,10 @@ def load_config(path: str | Path) -> AppConfig:
     return AppConfig(
         source=source,
         contact=_required_text(raw, "contact"),
+        background_mode=bool(raw.get("background_mode", True)),
         allow_self_messages=bool(raw.get("allow_self_messages", True)),
+        voice_recognition=bool(raw.get("voice_recognition", True)),
+        voice_retry_count=voice_retry_count,
         response_prefix=response_prefix,
         send_ready_message=bool(raw.get("send_ready_message", True)),
         poll_seconds=poll_seconds,
