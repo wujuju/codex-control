@@ -1,4 +1,6 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from wechat_codex.wechat_client import (
     WeChatClient,
@@ -119,6 +121,99 @@ class WeChatClientTests(unittest.TestCase):
 
         WeChatClient._select_without_focus(Control())
         self.assertEqual(calls, ["select"])
+
+    def test_background_send_prefers_invoke_without_setting_focus(self) -> None:
+        from wxauto4.uia import uiautomation  # noqa: F401 - load before Win32 fakes
+
+        class Value:
+            Value = ""
+
+            def SetValue(self, text: str) -> None:
+                self.Value = text
+
+        value = Value()
+        focus_calls: list[str] = []
+
+        class Edit:
+            def GetValuePattern(self):
+                return value
+
+            def SetFocus(self) -> None:
+                focus_calls.append("focus")
+
+        class Invoke:
+            def Invoke(self, waitTime: float = 0.5) -> bool:
+                value.Value = ""
+                return True
+
+        class Button:
+            def GetInvokePattern(self):
+                return Invoke()
+
+        client = WeChatClient("张三", True, False, True, 3, "[助手] ", 1800)
+        client._root = SimpleNamespace(NativeWindowHandle=100)
+        client._find_control = lambda _uia, **criteria: (
+            Edit() if criteria.get("automation_id") == "chat_input_field" else Button()
+        )
+        client._send_window_to_background = lambda _gui: None
+
+        fake_gui = SimpleNamespace(GetForegroundWindow=lambda: 200)
+        with patch.dict("sys.modules", {"win32gui": fake_gui}):
+            client._send_background("后台消息")
+
+        self.assertEqual(focus_calls, [])
+        self.assertTrue(client._invoke_send_supported)
+
+    def test_background_send_fallback_restores_foreground(self) -> None:
+        from wxauto4.uia import uiautomation  # noqa: F401 - load before Win32 fakes
+
+        class Value:
+            Value = ""
+
+            def SetValue(self, text: str) -> None:
+                self.Value = text
+
+        value = Value()
+        calls: list[object] = []
+        foreground = [200]
+
+        class Edit:
+            def GetValuePattern(self):
+                return value
+
+            def SetFocus(self) -> None:
+                calls.append("focus")
+                foreground[0] = 100
+
+        client = WeChatClient("张三", True, False, True, 3, "[助手] ", 1800)
+        client._root = SimpleNamespace(NativeWindowHandle=100)
+        client._find_control = lambda _uia, **_criteria: Edit()
+        client._try_invoke_send = lambda _uia, _value: False
+        client._send_window_to_background = lambda _gui: calls.append("background")
+
+        def send_message(_hwnd: int, message: int, _key: int, _flags: int) -> None:
+            calls.append(("send", message))
+            value.Value = ""
+
+        def set_foreground(hwnd: int) -> None:
+            calls.append(("restore", hwnd))
+            foreground[0] = hwnd
+
+        fake_api = SimpleNamespace(SendMessage=send_message)
+        fake_con = SimpleNamespace(WM_KEYDOWN=1, WM_KEYUP=2, VK_RETURN=13)
+        fake_gui = SimpleNamespace(
+            GetForegroundWindow=lambda: foreground[0],
+            SetForegroundWindow=set_foreground,
+        )
+        with patch.dict(
+            "sys.modules",
+            {"win32api": fake_api, "win32con": fake_con, "win32gui": fake_gui},
+        ):
+            client._send_background("回退消息")
+
+        self.assertEqual(calls[0], "focus")
+        self.assertIn(("restore", 200), calls)
+        self.assertEqual(calls[-1], "background")
 
 
 if __name__ == "__main__":

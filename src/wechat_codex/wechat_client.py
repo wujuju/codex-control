@@ -169,6 +169,7 @@ class WeChatClient:
         self._seen: set[str] = set()
         self._seen_limit = 1000
         self._voice_failures: dict[str, tuple[int, float]] = {}
+        self._invoke_send_supported: bool | None = None
         self._root: Any = None
         self._chatbox: Any = None
         self._active_chat_type = "friend"
@@ -208,6 +209,7 @@ class WeChatClient:
             if self._root is None:
                 raise LookupError("未找到已登录的微信主窗口")
 
+            self._invoke_send_supported = None
             if self.background_mode:
                 self._send_window_to_background(win32gui)
             self._ensure_contact(uia)
@@ -530,8 +532,9 @@ class WeChatClient:
             self._send_background(self.response_prefix + part + chunk)
 
     def _send_background(self, payload: str) -> None:
-        """Send without clipboard, mouse movement, simulated keys, or focus changes."""
+        """Prefer a focus-free UIA send, with a focus-restoring fallback."""
         from wxauto4.uia import uiautomation as uia
+        import win32gui
 
         edit = self._find_control(uia, automation_id="chat_input_field")
         if edit is None:
@@ -543,13 +546,22 @@ class WeChatClient:
         if value.Value.strip():
             raise RuntimeError("目标聊天输入框存在未发送草稿，为避免覆盖已暂停发送")
 
-        value.SetValue(payload)
+        previous_foreground = (
+            win32gui.GetForegroundWindow() if self.background_mode else 0
+        )
         try:
+            value.SetValue(payload)
+            if self._try_invoke_send(uia, value):
+                return
+
+            if value.Value != payload:
+                raise RuntimeError("微信输入框内容在发送期间发生变化，已暂停发送")
+
             # WeChat 4.1.12 advertises InvokePattern on the send button but its
             # provider returns success without sending when the window is not
-            # foreground. Give the edit logical focus inside WeChat, then post
-            # Enter directly to WeChat's HWND. This does not synthesize a
-            # system-wide key event and does not activate the window.
+            # foreground. Fall back to briefly focusing the edit and sending
+            # Enter directly to WeChat's HWND. The original foreground window
+            # is restored in ``finally`` below.
             import win32api
             import win32con
 
@@ -557,20 +569,77 @@ class WeChatClient:
             hwnd = int(self._root.NativeWindowHandle)
             win32api.SendMessage(hwnd, win32con.WM_KEYDOWN, win32con.VK_RETURN, 0)
             win32api.SendMessage(hwnd, win32con.WM_KEYUP, win32con.VK_RETURN, 0)
-        except Exception:
-            # Avoid leaving an automation-generated draft after a failed send.
+            if self._wait_for_draft_clear(value, 3.0):
+                return
+            raise RuntimeError("微信后台发送未完成")
+        except Exception as exc:
+            # Avoid leaving an automation-generated draft after a failed send,
+            # but never erase text that changed after we wrote the payload.
             if value.Value == payload:
                 value.SetValue("")
+                if isinstance(exc, RuntimeError) and str(exc) == "微信后台发送未完成":
+                    raise RuntimeError("微信后台发送未完成，已清理输入框") from exc
             raise
+        finally:
+            self._restore_foreground_after_send(win32gui, previous_foreground)
 
-        deadline = time.monotonic() + 3
+    @staticmethod
+    def _wait_for_draft_clear(value: Any, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if not value.Value.strip():
-                return
+                return True
             time.sleep(0.1)
-        if value.Value == payload:
-            value.SetValue("")
-        raise RuntimeError("微信后台发送未完成，已清理输入框")
+        return not value.Value.strip()
+
+    def _try_invoke_send(self, uia: Any, value: Any) -> bool:
+        if self._invoke_send_supported is False:
+            return False
+
+        button = self._find_control(
+            uia,
+            name="发送",
+            control_type="ButtonControl",
+        )
+        if button is None:
+            return False
+        invoke = button.GetInvokePattern()
+        if invoke is None:
+            return False
+
+        try:
+            invoke.Invoke(waitTime=0)
+        except Exception as exc:
+            log.debug("微信发送按钮 InvokePattern 调用失败：%s", exc)
+
+        sent = self._wait_for_draft_clear(value, 1.0)
+        self._invoke_send_supported = sent
+        if not sent:
+            log.info("微信后台 InvokePattern 未完成发送，本次及后续发送改用聚焦回退")
+        return sent
+
+    def _restore_foreground_after_send(
+        self,
+        win32gui: Any,
+        previous_foreground: int,
+    ) -> None:
+        if not self.background_mode or not previous_foreground or self._root is None:
+            return
+
+        wechat_hwnd = int(self._root.NativeWindowHandle)
+        if previous_foreground == wechat_hwnd:
+            return
+
+        try:
+            if win32gui.GetForegroundWindow() == wechat_hwnd:
+                win32gui.SetForegroundWindow(previous_foreground)
+        except Exception as exc:
+            log.warning("恢复原前台窗口失败：%s", exc)
+
+        try:
+            self._send_window_to_background(win32gui)
+        except Exception as exc:
+            log.warning("将微信放回后台失败：%s", exc)
 
 
 class _NativeParent:
