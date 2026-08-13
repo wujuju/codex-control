@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -20,7 +21,11 @@ class IncomingMessage:
 
 
 def _message_key(message: Any) -> str:
-    for name in ("hash", "id", "hash_text"):
+    # ``hash`` and ``hash_text`` include the rendered message text. WeChat
+    # mutates both after a voice message has been transcribed, while ``id``
+    # remains tied to the same UI item. Prefer it so one voice cannot be
+    # processed twice merely because its transcript appeared.
+    for name in ("id", "hash", "hash_text"):
         value = getattr(message, name, None)
         if value not in (None, ""):
             return f"{name}:{value}"
@@ -46,6 +51,22 @@ def is_voice_message(message: Any) -> bool:
     message_type = str(getattr(message, "type", "")).lower()
     class_name = type(message).__name__.lower()
     return message_type == "voice" or "voicemessage" in class_name
+
+
+_VOICE_LABEL = re.compile(
+    r"^\s*(?:\[?语音\]?)\s*\d+(?:\.\d+)?\s*(?:[\"”″']\s*)?秒\s*"
+)
+
+
+def extract_voice_transcript(content: str) -> str:
+    """Return text appended by WeChat's native auto-transcription setting."""
+    match = _VOICE_LABEL.match(content)
+    if match is None:
+        return ""
+    transcript = content[match.end() :].strip()
+    if transcript in {"转文字失败", "语音转文字失败"}:
+        return ""
+    return transcript
 
 
 def normalize_message(message: Any) -> IncomingMessage | None:
@@ -341,14 +362,51 @@ class WeChatClient:
         if self._wx is None:
             raise RuntimeError("微信客户端尚未连接")
         self._refresh_target()
-        return self._chatbox.get_msgs()
+        if not self.background_mode:
+            return self._chatbox.get_msgs()
+        return self._native_messages()
+
+    def _native_messages(self) -> list[Any]:
+        """Read visible message items without wxauto's focus-stealing scan.
+
+        wxauto4's ``ChatBox.get_msgs()`` activates WeChat on every call under
+        WeChat 4.1.12. Constructing its individual message wrappers from the
+        already exposed UIA list items does not, and still gives us stable
+        message IDs plus the native voice transcript.
+        """
+        from wxauto4.msgs.friend import (
+            FriendQuoteMessage,
+            FriendTextMessage,
+            FriendVoiceMessage,
+        )
+        from wxauto4.uia import uiautomation as uia
+
+        message_list = self._find_control(uia, automation_id="chat_message_list")
+        if message_list is None:
+            raise LookupError("找不到微信消息列表；请保持微信主窗口打开且不要最小化")
+
+        wrappers = {
+            "mmui::ChatTextItemView": FriendTextMessage,
+            "mmui::ChatQuoteItemView": FriendQuoteMessage,
+            "mmui::ChatVoiceItemView": FriendVoiceMessage,
+        }
+        messages: list[Any] = []
+        for control in message_list.GetChildren():
+            wrapper = wrappers.get(control.ClassName)
+            if wrapper is None:
+                continue
+            try:
+                messages.append(wrapper(control, self._chatbox))
+            except Exception as exc:
+                log.debug("跳过无法解析的微信消息控件 %s：%s", control.ClassName, exc)
+        return messages
 
     def baseline(self) -> int:
         count = 0
         for raw in self._all_messages():
             message = normalize_message(raw)
-            if message:
-                self._remember(message.key)
+            if message or is_voice_message(raw):
+                self._remember(_message_key(raw))
                 count += 1
         return count
 
@@ -388,12 +446,13 @@ class WeChatClient:
         if time.monotonic() < retry_after:
             return None
         try:
-            converter = getattr(raw, "to_text", None)
-            if not callable(converter):
-                raise RuntimeError("当前微信语音消息不支持转文字")
-            recognized = converter()
+            recognized = extract_voice_transcript(str(getattr(raw, "content", "")))
+            if not recognized and not self.background_mode:
+                converter = getattr(raw, "to_text", None)
+                if callable(converter):
+                    recognized = converter()
             if not isinstance(recognized, str) or not recognized.strip():
-                raise RuntimeError("微信没有返回识别文本")
+                raise RuntimeError("等待微信原生语音转写文本")
             message = normalize_voice_message(raw, recognized, key=key)
             if message:
                 log.info("语音识别成功（%s）：%s", message.sender, message.content)
@@ -404,7 +463,6 @@ class WeChatClient:
                 self._remember(key)
                 self._voice_failures.pop(key, None)
                 log.warning("语音识别最终失败：%s", exc)
-                self.send("收到一条语音，但自动识别失败，请改发文字。")
             else:
                 self._voice_failures[key] = (attempts, time.monotonic() + 3.0)
                 log.warning(

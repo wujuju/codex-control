@@ -90,7 +90,8 @@ class BridgeApp:
             return
         if route.kind == RouteKind.CONTINUE:
             ok, response = self.runner.begin_continue(route.prompt)
-            self.wechat.send(response)
+            if not ok:
+                self.wechat.send(response)
             return
         if route.kind == RouteKind.WORK:
             project = route.project or self.config.default_project
@@ -101,8 +102,10 @@ class BridgeApp:
                 )
                 return
             ok, response = self.runner.begin_work(project, project_path, route.prompt)
-            self.wechat.send(response)
+            if not ok:
+                self.wechat.send(response)
             return
 
         ok, response = self.runner.begin_chat(route.prompt)
-        self.wechat.send(response)
+        if not ok:
+            self.wechat.send(response)

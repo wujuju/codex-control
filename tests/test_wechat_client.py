@@ -2,6 +2,7 @@ import unittest
 
 from wechat_codex.wechat_client import (
     WeChatClient,
+    extract_voice_transcript,
     is_voice_message,
     normalize_message,
     normalize_voice_message,
@@ -21,11 +22,12 @@ class FakeVoiceMessage:
     attr = "friend"
     type = "voice"
     sender = "张三"
-    content = "[语音]"
+    content = '语音9"秒语音内容'
+    id = "stable-voice-id"
     hash = "voice-1"
 
     def to_text(self) -> str:
-        return "语音内容"
+        raise AssertionError("background mode must not call to_text")
 
 
 class WeChatClientTests(unittest.TestCase):
@@ -44,7 +46,7 @@ class WeChatClientTests(unittest.TestCase):
         self.assertTrue(is_voice_message(raw))
         message = normalize_voice_message(raw, " 干活：运行测试 ")
         self.assertIsNotNone(message)
-        self.assertEqual(message.key, "hash:voice-1")
+        self.assertEqual(message.key, "id:stable-voice-id")
         self.assertEqual(message.content, "干活：运行测试")
         self.assertEqual(message.attr, "friend")
 
@@ -53,6 +55,17 @@ class WeChatClientTests(unittest.TestCase):
         message = client._recognize_voice(FakeVoiceMessage(), "hash:voice-1")
         self.assertIsNotNone(message)
         self.assertEqual(message.content, "语音内容")
+
+    def test_extracts_only_native_voice_transcript(self) -> None:
+        self.assertEqual(extract_voice_transcript('语音12"秒 今天星期几？'), "今天星期几？")
+        self.assertEqual(extract_voice_transcript('语音12"秒'), "")
+
+    def test_message_key_prefers_stable_id(self) -> None:
+        raw = FakeVoiceMessage()
+        first = normalize_voice_message(raw, "第一次")
+        raw.hash = "voice-changed-after-transcription"
+        second = normalize_voice_message(raw, "第二次")
+        self.assertEqual(first.key, second.key)
 
     def test_background_selection_prefers_selection_pattern(self) -> None:
         calls: list[str] = []

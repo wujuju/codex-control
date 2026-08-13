@@ -8,7 +8,7 @@ allow_self_messages: false
 voice_recognition: true
 voice_retry_count: 3
 response_prefix: "[Codex助手] "
-send_ready_message: true
+send_ready_message: false
 poll_seconds: 1.0
 max_reply_chars: 1800
 
