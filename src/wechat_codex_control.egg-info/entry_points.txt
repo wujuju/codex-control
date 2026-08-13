@@ -1,0 +1,2 @@
+[console_scripts]
+wechat-codex = wechat_codex.cli:main

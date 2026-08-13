@@ -1,0 +1,4 @@
+PyYAML>=6.0,<7
+psutil>=7.0,<8
+pywin32>=310
+wxauto4>=41.1,<42

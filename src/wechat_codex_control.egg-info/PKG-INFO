@@ -1,0 +1,7 @@
+Metadata-Version: 2.4
+Name: wechat-codex-control
+Version: 0.1.0
+Summary: Control local Codex from the Windows WeChat desktop client
+Requires-Python: <3.14,>=3.10
+Requires-Dist: PyYAML<7,>=6.0
+Requires-Dist: wxauto4<42,>=41.1

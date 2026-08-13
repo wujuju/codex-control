@@ -1,0 +1,18 @@
+# 要监听的微信联系人或群名。默认用“文件传输助手”，方便直接从手机给自己发指令。
+contact: "無惧"
+
+# 文件传输助手里的手机消息通常会被识别为自己发送，因此默认允许处理 self 消息。
+# 程序自己的回复都带 response_prefix，会被自动忽略，不会形成循环。
+allow_self_messages: false
+response_prefix: "[Codex助手] "
+send_ready_message: true
+poll_seconds: 1.0
+max_reply_chars: 1800
+
+codex_command: "codex"
+chat_timeout_seconds: 180
+work_timeout_seconds: 3600
+
+default_project: "control"
+projects:
+  control: "."
