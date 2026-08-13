@@ -11,6 +11,9 @@ import yaml
 class AppConfig:
     source: Path
     contact: str
+    chat_type: str
+    bot_name: str
+    authorized_senders: frozenset[str]
     background_mode: bool
     allow_self_messages: bool
     voice_recognition: bool
@@ -82,9 +85,31 @@ def load_config(path: str | Path) -> AppConfig:
     if not response_prefix:
         raise ValueError("response_prefix 不能为空，否则可能形成自动回复循环")
 
+    chat_type = str(raw.get("chat_type", "friend")).strip().lower()
+    if chat_type not in {"friend", "group", "auto"}:
+        raise ValueError("chat_type 必须是 friend、group 或 auto")
+
+    bot_name = str(raw.get("bot_name", "ChatGpt机器人")).strip()
+    if not bot_name:
+        raise ValueError("bot_name 不能为空")
+
+    authorized_values = raw.get("authorized_senders", ["無惧"])
+    if isinstance(authorized_values, str):
+        authorized_values = [authorized_values]
+    if not isinstance(authorized_values, list):
+        raise ValueError("authorized_senders 必须是名称列表")
+    authorized_senders = frozenset(
+        str(value).strip() for value in authorized_values if str(value).strip()
+    )
+    if not authorized_senders:
+        raise ValueError("authorized_senders 至少需要一个名称")
+
     return AppConfig(
         source=source,
         contact=_required_text(raw, "contact"),
+        chat_type=chat_type,
+        bot_name=bot_name,
+        authorized_senders=authorized_senders,
         background_mode=bool(raw.get("background_mode", True)),
         allow_self_messages=bool(raw.get("allow_self_messages", True)),
         voice_recognition=bool(raw.get("voice_recognition", True)),

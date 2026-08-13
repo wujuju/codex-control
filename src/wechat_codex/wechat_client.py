@@ -5,7 +5,7 @@ import logging
 import re
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Iterable
 
 
@@ -18,6 +18,8 @@ class IncomingMessage:
     content: str
     sender: str
     attr: str
+    conversation: str = ""
+    chat_type: str = "friend"
 
 
 def _message_key(message: Any) -> str:
@@ -67,6 +69,16 @@ def extract_voice_transcript(content: str) -> str:
     if transcript in {"转文字失败", "语音转文字失败"}:
         return ""
     return transcript
+
+
+def strip_required_group_mention(content: str, bot_name: str) -> str | None:
+    """Remove one explicit bot mention, or reject a group message without it."""
+    pattern = re.compile(rf"@\s*{re.escape(bot_name)}", re.IGNORECASE)
+    match = pattern.search(content)
+    if match is None:
+        return None
+    cleaned = (content[: match.start()] + content[match.end() :]).strip()
+    return cleaned.lstrip("\u2005\u2006\u2009 ,，:：")
 
 
 def normalize_message(message: Any) -> IncomingMessage | None:
@@ -140,6 +152,8 @@ class WeChatClient:
         voice_retry_count: int,
         response_prefix: str,
         max_reply_chars: int,
+        chat_type: str = "friend",
+        bot_name: str = "ChatGpt机器人",
     ) -> None:
         self.contact = contact
         self.background_mode = background_mode
@@ -148,6 +162,8 @@ class WeChatClient:
         self.voice_retry_count = voice_retry_count
         self.response_prefix = response_prefix
         self.max_reply_chars = max_reply_chars
+        self.chat_type = chat_type
+        self.bot_name = bot_name
         self._wx: Any = None
         self._seen_order: deque[str] = deque()
         self._seen: set[str] = set()
@@ -155,6 +171,7 @@ class WeChatClient:
         self._voice_failures: dict[str, tuple[int, float]] = {}
         self._root: Any = None
         self._chatbox: Any = None
+        self._active_chat_type = "friend"
 
     def connect(self) -> None:
         try:
@@ -198,7 +215,8 @@ class WeChatClient:
             if page is None:
                 raise LookupError("未找到聊天页面")
 
-            parent = _NativeParent(self._root, self.contact)
+            self._active_chat_type = self._resolve_chat_type(uia)
+            parent = _NativeParent(self._root, self.contact, self._active_chat_type)
             self._chatbox = ChatBox(page, parent)
             self._wx = self._chatbox
         except Exception as exc:
@@ -285,6 +303,14 @@ class WeChatClient:
                 return (control.Name or "").strip()
         return ""
 
+    def _resolve_chat_type(self, uia: Any) -> str:
+        if self.chat_type != "auto":
+            return self.chat_type
+        header = self._current_contact(uia)
+        if re.search(r"[（(]\s*\d+\s*[)）]\s*$", header):
+            return "group"
+        return "friend"
+
     def _ensure_contact(self, uia: Any) -> None:
         if self._current_contact(uia) == self.contact:
             return
@@ -347,7 +373,11 @@ class WeChatClient:
         page = self._find_control(uia, automation_id="chat_message_page")
         if page is None:
             raise LookupError("未找到聊天页面")
-        self._chatbox = ChatBox(page, _NativeParent(self._root, self.contact))
+        self._active_chat_type = self._resolve_chat_type(uia)
+        self._chatbox = ChatBox(
+            page,
+            _NativeParent(self._root, self.contact, self._active_chat_type),
+        )
         self._wx = self._chatbox
 
     def _remember(self, key: str) -> None:
@@ -427,6 +457,21 @@ class WeChatClient:
                 continue
             if message.attr == "self" and not self.allow_self_messages:
                 continue
+            sender = message.sender
+            content = message.content
+            if self._active_chat_type == "group":
+                content = strip_required_group_mention(content, self.bot_name)
+                if content is None or not content:
+                    continue
+            elif sender in {"", "friend"}:
+                sender = self.contact
+            message = replace(
+                message,
+                content=content,
+                sender=sender,
+                conversation=self.contact,
+                chat_type=self._active_chat_type,
+            )
             incoming.append(message)
         return incoming
 
@@ -539,14 +584,15 @@ class _NativeParent:
     parent = None
     chat_type = "friend"
 
-    def __init__(self, control: Any, contact: str) -> None:
+    def __init__(self, control: Any, contact: str, chat_type: str = "friend") -> None:
         self.control = control
         self.root = self
         self.nickname = contact
         self._contact = contact
+        self.chat_type = chat_type
 
     def _lang(self, text: str) -> str:
         return text
 
     def chat_info(self) -> dict[str, str]:
-        return {"chat_type": "friend", "chat_name": self._contact}
+        return {"chat_type": self.chat_type, "chat_name": self._contact}

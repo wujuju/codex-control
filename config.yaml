@@ -1,5 +1,10 @@
 # 要监听的微信联系人或群名。默认用“文件传输助手”，方便直接从手机给自己发指令。
 contact: "無惧"
+# 当前监听对象类型。监听群聊时改为 group，并把 contact 改为群名。
+chat_type: "friend"
+bot_name: "ChatGpt机器人"
+authorized_senders:
+  - "無惧"
 background_mode: true
 
 # 文件传输助手里的手机消息通常会被识别为自己发送，因此默认允许处理 self 消息。

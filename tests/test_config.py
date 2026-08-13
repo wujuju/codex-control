@@ -19,6 +19,9 @@ class ConfigTests(unittest.TestCase):
             config = load_config(config_file)
 
             self.assertEqual(config.contact, "测试")
+            self.assertEqual(config.chat_type, "friend")
+            self.assertEqual(config.bot_name, "ChatGpt机器人")
+            self.assertEqual(config.authorized_senders, frozenset({"無惧"}))
             self.assertTrue(config.background_mode)
             self.assertTrue(config.voice_recognition)
             self.assertEqual(config.voice_retry_count, 3)

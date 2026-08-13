@@ -74,6 +74,8 @@ def doctor(config: AppConfig, connect: bool) -> int:
             config.voice_retry_count,
             config.response_prefix,
             config.max_reply_chars,
+            config.chat_type,
+            config.bot_name,
         )
         try:
             client.connect()
@@ -110,6 +112,8 @@ def main(argv: list[str] | None = None) -> int:
                 config.voice_retry_count,
                 config.response_prefix,
                 config.max_reply_chars,
+                config.chat_type,
+                config.bot_name,
             )
             client.connect()
             client.send(args.text)

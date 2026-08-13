@@ -7,6 +7,7 @@ from wechat_codex.wechat_client import (
     normalize_message,
     normalize_voice_message,
     split_text,
+    strip_required_group_mention,
 )
 
 
@@ -66,6 +67,41 @@ class WeChatClientTests(unittest.TestCase):
         raw.hash = "voice-changed-after-transcription"
         second = normalize_voice_message(raw, "第二次")
         self.assertEqual(first.key, second.key)
+
+    def test_group_requires_bot_mention(self) -> None:
+        self.assertIsNone(strip_required_group_mention("大家好", "ChatGpt机器人"))
+        self.assertEqual(
+            strip_required_group_mention(
+                "@ChatGpt机器人\u2005 帮我解释 rebase", "ChatGpt机器人"
+            ),
+            "帮我解释 rebase",
+        )
+
+    def test_group_poll_ignores_unmentioned_message(self) -> None:
+        raw = FakeMessage()
+        raw.content = "大家好"
+        raw.sender = "無惧"
+        client = WeChatClient(
+            "测试群", True, False, True, 3, "[助手] ", 1800, "group", "ChatGpt机器人"
+        )
+        client._active_chat_type = "group"
+        client._all_messages = lambda: [raw]
+        self.assertEqual(client.poll(), [])
+
+    def test_group_poll_strips_mention_and_keeps_sender(self) -> None:
+        raw = FakeMessage()
+        raw.content = "@ChatGpt机器人\u2005 干活：运行测试"
+        raw.sender = "無惧"
+        client = WeChatClient(
+            "测试群", True, False, True, 3, "[助手] ", 1800, "group", "ChatGpt机器人"
+        )
+        client._active_chat_type = "group"
+        client._all_messages = lambda: [raw]
+        messages = client.poll()
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].content, "干活：运行测试")
+        self.assertEqual(messages[0].sender, "無惧")
+        self.assertEqual(messages[0].chat_type, "group")
 
     def test_background_selection_prefers_selection_pattern(self) -> None:
         calls: list[str] = []

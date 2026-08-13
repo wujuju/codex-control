@@ -6,7 +6,7 @@ import time
 from .codex_runner import CodexRunner
 from .config import AppConfig
 from .router import RouteKind, help_text, route_message
-from .wechat_client import WeChatClient
+from .wechat_client import IncomingMessage, WeChatClient
 
 
 log = logging.getLogger(__name__)
@@ -23,6 +23,8 @@ class BridgeApp:
             voice_retry_count=config.voice_retry_count,
             response_prefix=config.response_prefix,
             max_reply_chars=config.max_reply_chars,
+            chat_type=config.chat_type,
+            bot_name=config.bot_name,
         )
         self.runner = CodexRunner(
             codex_command=config.codex_command,
@@ -63,8 +65,14 @@ class BridgeApp:
                     self.wechat.send(event.text)
 
                 for message in self.wechat.poll():
-                    log.info("收到消息（%s/%s）：%s", message.attr, message.sender, message.content)
-                    self._handle(message.content)
+                    log.info(
+                        "收到消息（%s/%s/%s）：%s",
+                        message.chat_type,
+                        message.attr,
+                        message.sender,
+                        message.content,
+                    )
+                    self._handle(message)
                 consecutive_errors = 0
             except KeyboardInterrupt:
                 raise
@@ -75,8 +83,17 @@ class BridgeApp:
                     raise RuntimeError("微信连续 5 次访问失败，准备重新连接")
             time.sleep(self.config.poll_seconds)
 
-    def _handle(self, content: str) -> None:
-        route = route_message(content)
+    def _handle(self, message: IncomingMessage) -> None:
+        route = route_message(message.content)
+        if route.kind in {
+            RouteKind.WORK,
+            RouteKind.CONTINUE,
+            RouteKind.STATUS,
+            RouteKind.STOP,
+        } and message.sender not in self.config.authorized_senders:
+            log.warning("拒绝未授权的 Codex 操作请求，发送者：%s", message.sender)
+            self.wechat.send("无权限执行 Codex 操作")
+            return
         if route.kind == RouteKind.HELP:
             self.wechat.send(
                 help_text(list(self.config.projects), self.config.default_project)

@@ -5,6 +5,8 @@
 ## 当前能力
 
 - 固定监听一个联系人、群聊或“文件传输助手”
+- 私聊直接回复；群聊只有明确 `@ChatGpt机器人` 才回复
+- 只有白名单中的“無惧”可以执行干活、继续、状态和停止命令
 - 普通中文聊天
 - `干活：任务` 修改默认项目
 - `干活 control：任务` 修改指定项目
@@ -33,6 +35,9 @@ python -m venv .venv
 
 ```yaml
 contact: "無惧"
+chat_type: "friend" # 监听群聊时改为 group
+bot_name: "ChatGpt机器人"
+authorized_senders: ["無惧"]
 background_mode: true
 voice_recognition: true
 voice_retry_count: 3
@@ -88,6 +93,8 @@ projects:
 ```
 
 监听普通联系人时请设置 `allow_self_messages: false`，只处理对方发来的消息。使用“文件传输助手”时可改成 `true`；程序发出的内容带 `[Codex助手]` 前缀并会被忽略，不会自我回复。
+
+监听群聊时，把 `contact` 改为群名并设置 `chat_type: group`。群消息必须包含 `@ChatGpt机器人`，程序会先去掉该 @ 再进行聊天或命令解析。普通聊天对群成员开放，但 `干活`、`继续`、`状态`、`停止` 只接受 `authorized_senders` 中的发送者；当前仅允许“無惧”。为保持完全后台，程序不会动态切换并扫描其他会话，因此每个运行实例监听一个已配置会话。
 
 ## 安全边界
 
