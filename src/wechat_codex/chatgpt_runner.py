@@ -38,17 +38,21 @@ FILE_INPUT_SELECTOR = 'input[type="file"]'
 ASSISTANT_SELECTOR = '[data-message-author-role="assistant"]'
 ASSISTANT_FALLBACK_SELECTOR = 'article[data-turn="assistant"]'
 GENERATED_IMAGE_SELECTOR = (
-    'main [data-testid^="conversation-turn-"] img, '
     'main img[alt^="Generated image" i], '
     'main img[alt*="生成"], '
     'main img[src*="/backend-api/estuary/content"], '
-    'main img[src*="oaiusercontent.com"]'
+    'main img[src*="oaiusercontent.com"], '
+    'main [data-testid*="generated-image" i] img, '
+    'main [data-testid*="image-generation" i] img'
 )
 MAX_REPLY_IMAGE_BYTES = 20 * 1024 * 1024
+MIN_REPLY_IMAGE_NATURAL_SIZE = 128
+MIN_REPLY_IMAGE_DISPLAY_SIZE = 64
 IMAGE_METADATA_SCRIPT = """img => {
     const box = img.getBoundingClientRect();
     const style = getComputedStyle(img);
     const source = img.currentSrc || img.src || '';
+    const alt = (img.getAttribute('alt') || '').trim();
     const turn = img.closest('[data-testid^="conversation-turn-"]');
     const turnId = turn ? (turn.getAttribute('data-testid') || '') : '';
     const userTurn = Boolean(
@@ -56,22 +60,41 @@ IMAGE_METADATA_SCRIPT = """img => {
     );
     let mediaId = '';
     let mediaKey = '';
+    let generated = Boolean(
+        /^Generated image/i.test(alt) || alt.includes('生成') ||
+        img.closest(
+            '[data-testid*="generated-image" i], '
+            + '[data-testid*="image-generation" i]'
+        )
+    );
     try {
         const parsed = new URL(source, location.href);
         mediaId = parsed.searchParams.get('id') || '';
         mediaKey = mediaId
             ? `file:${mediaId}`
             : `url:${parsed.hostname}${parsed.pathname}`;
+        const hostname = parsed.hostname.toLowerCase();
+        generated = generated ||
+            hostname === 'oaiusercontent.com' ||
+            hostname.endsWith('.oaiusercontent.com') ||
+            parsed.pathname.includes('/backend-api/estuary/content');
     } catch (_) {}
     return {
         source,
+        alt,
         mediaId,
         mediaKey: mediaKey || (source ? `source:${source.slice(0, 256)}` : ''),
         turnId,
         userTurn,
+        generated,
+        naturalWidth: img.naturalWidth,
+        naturalHeight: img.naturalHeight,
+        renderedWidth: box.width,
+        renderedHeight: box.height,
         usable: Boolean(
             source && img.naturalWidth >= 128 && img.naturalHeight >= 128 &&
-            box.width > 0 && box.height > 0 && style.visibility !== 'hidden' &&
+            box.width >= 64 && box.height >= 64 && generated &&
+            style.visibility !== 'hidden' &&
             style.display !== 'none'
         )
     };
@@ -117,6 +140,27 @@ def _file_sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _is_usable_generated_image(metadata: Any) -> bool:
+    """Reject citation icons and other inline images from assistant replies."""
+    if not isinstance(metadata, dict):
+        return False
+    try:
+        return bool(
+            metadata.get("usable")
+            and metadata.get("generated")
+            and float(metadata.get("naturalWidth") or 0)
+            >= MIN_REPLY_IMAGE_NATURAL_SIZE
+            and float(metadata.get("naturalHeight") or 0)
+            >= MIN_REPLY_IMAGE_NATURAL_SIZE
+            and float(metadata.get("renderedWidth") or 0)
+            >= MIN_REPLY_IMAGE_DISPLAY_SIZE
+            and float(metadata.get("renderedHeight") or 0)
+            >= MIN_REPLY_IMAGE_DISPLAY_SIZE
+        )
+    except (TypeError, ValueError):
+        return False
 
 
 @dataclass(frozen=True)
@@ -813,7 +857,9 @@ class PlaywrightChatSession:
             return sum(
                 1
                 for index in range(images.count())
-                if images.nth(index).evaluate(IMAGE_METADATA_SCRIPT).get("usable")
+                if _is_usable_generated_image(
+                    images.nth(index).evaluate(IMAGE_METADATA_SCRIPT)
+                )
             )
         except Exception:
             return 0
@@ -858,7 +904,7 @@ class PlaywrightChatSession:
             for index in range(images.count()):
                 metadata = images.nth(index).evaluate(IMAGE_METADATA_SCRIPT)
                 if (
-                    (metadata.get("usable") or not usable_only)
+                    (_is_usable_generated_image(metadata) or not usable_only)
                     and (not metadata.get("userTurn") or not exclude_user)
                 ):
                     if metadata.get("mediaKey"):
@@ -883,7 +929,7 @@ class PlaywrightChatSession:
                 turn_id = str(metadata.get("turnId") or "")
                 media_key = str(metadata.get("mediaKey") or "")
                 if (
-                    metadata.get("usable")
+                    _is_usable_generated_image(metadata)
                     and not metadata.get("userTurn")
                     and media_key
                     and PlaywrightChatSession._is_current_turn(turn_id, baseline)
@@ -963,7 +1009,7 @@ class PlaywrightChatSession:
             metadata = image.evaluate(IMAGE_METADATA_SCRIPT)
         except Exception:
             return False
-        if not metadata.get("usable") or metadata.get("userTurn"):
+        if not _is_usable_generated_image(metadata) or metadata.get("userTurn"):
             return False
         source = str(metadata.get("source") or "")
         turn_id = str(metadata.get("turnId") or "")

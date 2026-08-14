@@ -12,6 +12,7 @@ from wechat_codex.chatgpt_runner import (
     LOGIN_SELECTOR,
     PlaywrightChatSession,
     STOP_SELECTOR,
+    _is_usable_generated_image,
     _is_chat_url,
     _persistent_context_options,
     _read_account_state,
@@ -223,6 +224,38 @@ def make_runner(runtime_dir: Path, factory: FakeSessionFactory) -> ChatGPTRunner
 
 
 class ChatGPTRunnerTests(unittest.TestCase):
+    def test_citation_icon_is_not_treated_as_generated_reply_image(self) -> None:
+        citation_icon = {
+            # Simulate a proxy URL that otherwise looks like an OpenAI image.
+            "usable": True,
+            "generated": True,
+            "naturalWidth": 128,
+            "naturalHeight": 128,
+            "renderedWidth": 12,
+            "renderedHeight": 13,
+        }
+        large_non_generated_image = {
+            **citation_icon,
+            "generated": False,
+            "renderedWidth": 256,
+            "renderedHeight": 256,
+        }
+
+        self.assertFalse(_is_usable_generated_image(citation_icon))
+        self.assertFalse(_is_usable_generated_image(large_non_generated_image))
+
+    def test_visible_openai_generated_image_is_accepted(self) -> None:
+        generated_image = {
+            "usable": True,
+            "generated": True,
+            "naturalWidth": 1024,
+            "naturalHeight": 1024,
+            "renderedWidth": 512,
+            "renderedHeight": 512,
+        }
+
+        self.assertTrue(_is_usable_generated_image(generated_image))
+
     def test_reply_image_paths_are_exposed_on_chat_event(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
