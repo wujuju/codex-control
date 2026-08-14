@@ -16,7 +16,7 @@ from .codex_runner import CodexRunner
 from .config import AppConfig
 from .ilink_api import ILinkError
 from .ilink_client import ILinkClient, IncomingMessage, ReplyTarget
-from .router import RouteKind, help_text, route_message
+from .router import RouteKind, help_text, route_message, suggest_command
 
 
 log = logging.getLogger(__name__)
@@ -304,7 +304,7 @@ class BridgeApp:
         self._handle(message, target, session_key)
 
     def _acknowledge(self, message: IncomingMessage, target: ReplyTarget) -> None:
-        if not self.config.send_received_ack:
+        if not self.config.send_received_ack or message.content.lstrip().startswith("/"):
             return
         try:
             self._send(self.config.received_ack_text, target)
@@ -334,6 +334,15 @@ class BridgeApp:
         if route.kind in codex_commands and not self._can_run_codex(message.sender_id):
             log.warning("拒绝未授权的 Codex 请求：%s", message.sender_id)
             self._send("无权限执行 Codex 操作", target)
+            return
+        if route.kind == RouteKind.UNKNOWN_COMMAND:
+            suggestion = suggest_command(route.prompt)
+            suggestion_text = f"\n你是否想使用：{suggestion}" if suggestion else ""
+            self._send(
+                f"命令不存在：{route.prompt}{suggestion_text}"
+                "\n发送 /帮助 查看全部命令。",
+                target,
+            )
             return
         if route.kind == RouteKind.HELP:
             self._send(help_text(list(self.config.projects), self.config.default_project), target)

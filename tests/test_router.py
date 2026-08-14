@@ -1,6 +1,6 @@
 import unittest
 
-from wechat_codex.router import RouteKind, help_text, route_message
+from wechat_codex.router import RouteKind, help_text, route_message, suggest_command
 
 
 class RouterTests(unittest.TestCase):
@@ -79,11 +79,27 @@ class RouterTests(unittest.TestCase):
                 self.assertEqual(route_message(text).kind, RouteKind.CHAT)
 
     def test_prefixed_commands_must_match_the_whole_message(self) -> None:
-        self.assertEqual(route_message("/状态 请快点").kind, RouteKind.CHAT)
+        self.assertEqual(
+            route_message("/状态 请快点").kind,
+            RouteKind.UNKNOWN_COMMAND,
+        )
         self.assertEqual(route_message("请执行 /重试").kind, RouteKind.CHAT)
+
+    def test_unknown_slash_message_never_falls_back_to_chat(self) -> None:
+        route = route_message("/归档")
+
+        self.assertEqual(route.kind, RouteKind.UNKNOWN_COMMAND)
+        self.assertEqual(route.prompt, "/归档")
+        self.assertEqual(suggest_command("/归档"), "/归档对话")
+
+    def test_similar_unknown_command_gets_a_suggestion(self) -> None:
+        self.assertEqual(suggest_command("/归挡对话"), "/归档对话")
+        self.assertEqual(suggest_command("/完全不存在的命令"), None)
 
     def test_help_lists_second_stage_commands(self) -> None:
         text = help_text(["control", "demo"], "control")
+        for heading in ("【ChatGPT 对话命令】", "【Codex 开发命令】", "【通用与维护命令】"):
+            self.assertIn(heading, text)
         for command in (
             "/帮助",
             "/对话列表",

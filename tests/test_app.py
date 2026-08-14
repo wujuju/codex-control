@@ -169,6 +169,27 @@ class BridgeAppTests(unittest.TestCase):
             app._reply_targets["ilink:bot-1:owner-id"], ReplyTarget("owner-id", "ctx-1")
         )
 
+    def test_slash_commands_skip_ack_and_unknown_command_skips_chatgpt(self) -> None:
+        app = self.make_app()
+
+        app._process_incoming(message(content="/归档"))
+
+        self.assertEqual(len(app.wechat.sent), 1)
+        self.assertIn("命令不存在：/归档", app.wechat.sent[0][0])
+        self.assertIn("你是否想使用：/归档对话", app.wechat.sent[0][0])
+        self.assertNotIn("已收到", app.wechat.sent[0][0])
+        self.assertEqual(app.chat_runner.chat_calls, [])
+
+    def test_known_slash_command_returns_result_without_ack(self) -> None:
+        app = self.make_app()
+
+        app._process_incoming(message(content="/状态"))
+
+        self.assertEqual(
+            app.wechat.sent,
+            [("Codex 当前空闲", ReplyTarget("owner-id", "ctx-1"))],
+        )
+
     def test_non_owner_is_ignored_when_allowlist_is_empty(self) -> None:
         app = self.make_app()
 
