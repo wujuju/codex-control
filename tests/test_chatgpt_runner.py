@@ -23,11 +23,17 @@ class FakeSession:
         self,
         calls: list[tuple[str | None, str, str | None]],
         image_calls: list[tuple[Path, ...]],
+        archive_calls: list[str],
+        rename_calls: list[tuple[str, str]],
+        export_calls: list[tuple[str, str]],
         reply_number: int,
         reply_images: tuple[Path, ...],
     ) -> None:
         self.calls = calls
         self.image_calls = image_calls
+        self.archive_calls = archive_calls
+        self.rename_calls = rename_calls
+        self.export_calls = export_calls
         self.reply_number = reply_number
         self.reply_images = reply_images
 
@@ -52,11 +58,24 @@ class FakeSession:
             conversation_url or "https://chatgpt.com/c/web-conversation-1"
         ), self.reply_images
 
+    def archive(self, conversation_url, timeout_seconds):
+        self.archive_calls.append(conversation_url)
+
+    def rename(self, conversation_url, title, timeout_seconds):
+        self.rename_calls.append((conversation_url, title))
+
+    def export_markdown(self, conversation_url, title, timeout_seconds):
+        self.export_calls.append((conversation_url, title))
+        return f"# {title}\n\n## 用户\n\n测试\n"
+
 
 class FakeSessionFactory:
     def __init__(self) -> None:
         self.calls: list[tuple[str | None, str, str | None]] = []
         self.image_calls: list[tuple[Path, ...]] = []
+        self.archive_calls: list[str] = []
+        self.rename_calls: list[tuple[str, str]] = []
+        self.export_calls: list[tuple[str, str]] = []
         self.session_count = 0
         self.reply_images: tuple[Path, ...] = ()
 
@@ -65,6 +84,9 @@ class FakeSessionFactory:
         return FakeSession(
             self.calls,
             self.image_calls,
+            self.archive_calls,
+            self.rename_calls,
+            self.export_calls,
             self.session_count,
             self.reply_images,
         )
@@ -407,6 +429,196 @@ class ChatGPTRunnerTests(unittest.TestCase):
                     (url, "第二问", "微信無惧"),
                 ],
             )
+
+    def test_archive_runs_in_browser_and_removes_mapping(self) -> None:
+        with TemporaryDirectory() as directory:
+            runtime_dir = Path(directory)
+            factory = FakeSessionFactory()
+            runner = make_runner(runtime_dir, factory)
+            runner.begin_chat("friend:测试", "第一问")
+            wait_until_idle(runner)
+            runner.drain_events()
+
+            self.assertTrue(runner.begin_archive("friend:测试")[0])
+            wait_until_idle(runner)
+            events = runner.drain_events()
+            runner.close()
+
+            url = "https://chatgpt.com/c/web-conversation-1"
+            self.assertEqual(factory.archive_calls, [url])
+            self.assertIn("已归档", events[0].text)
+            saved = json.loads(
+                (runtime_dir / "chatgpt_web_conversations.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(saved, {})
+
+    def test_rename_persists_title_for_future_chat(self) -> None:
+        with TemporaryDirectory() as directory:
+            runtime_dir = Path(directory)
+            factory = FakeSessionFactory()
+            runner = make_runner(runtime_dir, factory)
+            runner.begin_chat("friend:测试", "第一问", conversation_title="默认标题")
+            wait_until_idle(runner)
+            runner.drain_events()
+
+            self.assertTrue(runner.begin_rename("friend:测试", "发布方案")[0])
+            wait_until_idle(runner)
+            self.assertIn("发布方案", runner.drain_events()[0].text)
+            self.assertIn(
+                "标题：发布方案",
+                runner.conversation_info("friend:测试", "默认标题"),
+            )
+            self.assertTrue(
+                runner.begin_chat(
+                    "friend:测试",
+                    "第二问",
+                    conversation_title="默认标题",
+                )[0]
+            )
+            wait_until_idle(runner)
+            runner.close()
+
+            url = "https://chatgpt.com/c/web-conversation-1"
+            self.assertEqual(factory.rename_calls, [(url, "发布方案")])
+            self.assertEqual(factory.calls[-1], (url, "第二问", "发布方案"))
+            saved = json.loads(
+                (runtime_dir / "chatgpt_conversation_titles.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(saved, {"friend:测试": "发布方案"})
+
+    def test_retry_reuses_conversation_and_records_last_reply(self) -> None:
+        with TemporaryDirectory() as directory:
+            factory = FakeSessionFactory()
+            runner = make_runner(Path(directory), factory)
+            runner.begin_chat("friend:测试", "生成图片")
+            wait_until_idle(runner)
+            runner.drain_events()
+
+            self.assertTrue(runner.begin_retry("friend:测试")[0])
+            wait_until_idle(runner)
+            events = runner.drain_events()
+            last_reply = runner.last_reply("friend:测试")
+            runner.close()
+
+            self.assertIn("重新处理我上一条消息", factory.calls[-1][1])
+            self.assertEqual(
+                factory.calls[-1][0],
+                "https://chatgpt.com/c/web-conversation-1",
+            )
+            self.assertEqual(last_reply, events[0])
+
+    def test_history_list_and_switch_are_isolated_by_session(self) -> None:
+        with TemporaryDirectory() as directory:
+            runtime_dir = Path(directory)
+            history = {
+                "friend:甲": [
+                    {
+                        "url": "https://chatgpt.com/c/newer",
+                        "title": "较新对话",
+                        "updated_at": 200,
+                        "archived": False,
+                    },
+                    {
+                        "url": "https://chatgpt.com/c/older",
+                        "title": "较早对话",
+                        "updated_at": 100,
+                        "archived": True,
+                    },
+                ],
+                "friend:乙": [{
+                    "url": "https://chatgpt.com/c/private",
+                    "title": "其他用户对话",
+                    "updated_at": 300,
+                    "archived": False,
+                }],
+            }
+            (runtime_dir / "chatgpt_conversation_history.json").write_text(
+                json.dumps(history, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            runner = make_runner(runtime_dir, FakeSessionFactory())
+
+            listing = runner.conversation_list("friend:甲", "默认标题")
+            ok, response = runner.switch_conversation(
+                "friend:甲",
+                2,
+                "默认标题",
+            )
+            runner.close()
+
+            self.assertIn("1. 较新对话", listing)
+            self.assertIn("2. 较早对话", listing)
+            self.assertNotIn("其他用户对话", listing)
+            self.assertTrue(ok)
+            self.assertIn("较早对话", response)
+            saved = json.loads(
+                (runtime_dir / "chatgpt_web_conversations.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(saved["friend:甲"], "https://chatgpt.com/c/older")
+
+    def test_export_creates_markdown_file_event(self) -> None:
+        with TemporaryDirectory() as directory:
+            runtime_dir = Path(directory)
+            factory = FakeSessionFactory()
+            runner = make_runner(runtime_dir, factory)
+            runner.begin_chat("friend:测试", "第一问", conversation_title="测试对话")
+            wait_until_idle(runner)
+            runner.drain_events()
+
+            self.assertTrue(runner.begin_export("friend:测试", "测试对话")[0])
+            wait_until_idle(runner)
+            event = runner.drain_events()[0]
+            runner.close()
+
+            self.assertEqual(
+                factory.export_calls,
+                [("https://chatgpt.com/c/web-conversation-1", "测试对话")],
+            )
+            self.assertEqual(len(event.file_paths), 1)
+            export = Path(event.file_paths[0])
+            self.assertTrue(export.is_file())
+            self.assertIn("# 测试对话", export.read_text(encoding="utf-8"))
+
+    def test_summary_keeps_history_and_opens_new_conversation(self) -> None:
+        with TemporaryDirectory() as directory:
+            runtime_dir = Path(directory)
+            factory = FakeSessionFactory()
+            runner = make_runner(runtime_dir, factory)
+            runner.begin_chat("friend:测试", "第一问", conversation_title="测试对话")
+            wait_until_idle(runner)
+            runner.drain_events()
+
+            self.assertTrue(runner.begin_summary("friend:测试")[0])
+            wait_until_idle(runner)
+            event = runner.drain_events()[0]
+            info = runner.conversation_info("friend:测试", "默认标题")
+            listing = runner.conversation_list("friend:测试", "默认标题")
+            runner.close()
+
+            self.assertIn("对话总结", event.text)
+            self.assertIn("已开启新对话", event.text)
+            self.assertIn("当前是新的", info)
+            self.assertIn("测试对话", listing)
+            self.assertIn("总结我们当前整个对话", factory.calls[-1][1])
+
+    def test_idle_browser_can_restart(self) -> None:
+        with TemporaryDirectory() as directory:
+            factory = FakeSessionFactory()
+            runner = make_runner(Path(directory), factory)
+            runner.start()
+
+            ok, response = runner.restart()
+            runner.close()
+
+            self.assertTrue(ok)
+            self.assertIn("已重启", response)
+            self.assertEqual(factory.session_count, 2)
 
     def test_only_chatgpt_conversation_urls_are_persisted(self) -> None:
         self.assertTrue(_is_chat_url("https://chatgpt.com/c/abc"))

@@ -22,6 +22,13 @@ class FakeAPI:
             "mid_size": len(payload),
         }
 
+    def upload_file(self, payload, to_user_id, file_name):
+        return {
+            "media": {"encrypt_query_param": f"file-{to_user_id}"},
+            "file_name": file_name,
+            "len": str(len(payload)),
+        }
+
 
 class ILinkClientTests(unittest.TestCase):
     def test_image_message_is_persisted_and_materialized(self) -> None:
@@ -153,6 +160,25 @@ class ILinkClientTests(unittest.TestCase):
             self.assertEqual(
                 message["item_list"][0]["image_item"]["media"]["encrypt_query_param"],
                 "cdn-user-a",
+            )
+
+    def test_send_file_uploads_and_sends_type_four_item(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            file_path = root / "conversation.md"
+            file_path.write_text("# 对话", encoding="utf-8")
+            client = self.make_client(root)
+            api = FakeAPI()
+            client._api = api
+
+            client.send_file(file_path, ReplyTarget("user-a", "ctx-file"))
+
+            message = api.messages[0]
+            self.assertEqual(message["context_token"], "ctx-file")
+            self.assertEqual(message["item_list"][0]["type"], 4)
+            self.assertEqual(
+                message["item_list"][0]["file_item"]["file_name"],
+                "conversation.md",
             )
 
     def test_default_target_cannot_be_redirected_by_last_seen_user(self) -> None:

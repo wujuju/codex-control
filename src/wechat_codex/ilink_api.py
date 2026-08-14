@@ -25,6 +25,7 @@ STALE_TOKEN_ERRCODE = -14
 DEFAULT_CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c"
 MAX_INBOUND_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_OUTBOUND_IMAGE_BYTES = 20 * 1024 * 1024
+MAX_OUTBOUND_FILE_BYTES = 20 * 1024 * 1024
 
 
 class ILinkError(RuntimeError):
@@ -310,6 +311,75 @@ class ILinkAPI:
                 "encrypt_type": 1,
             },
             "mid_size": len(encrypted),
+        }
+
+    def upload_file(
+        self,
+        payload: bytes,
+        to_user_id: str,
+        file_name: str,
+    ) -> dict[str, Any]:
+        """Encrypt and upload a generic file, returning an iLink FileItem."""
+        if not payload:
+            raise ILinkProtocolError("待发送的文件内容为空")
+        if len(payload) > MAX_OUTBOUND_FILE_BYTES:
+            raise ILinkProtocolError("待发送的文件超过 20 MB 限制")
+        if not to_user_id.strip():
+            raise ILinkProtocolError("文件消息缺少接收用户")
+        cleaned_name = "".join(
+            character for character in file_name.strip() if ord(character) >= 32
+        )[:120]
+        if not cleaned_name:
+            raise ILinkProtocolError("文件消息缺少文件名")
+
+        file_key = secrets.token_hex(16)
+        aes_key = secrets.token_bytes(16)
+        encrypted = AES.new(aes_key, AES.MODE_ECB).encrypt(
+            pad(payload, AES.block_size)
+        )
+        plain_md5 = hashlib.md5(payload).hexdigest()
+        response = self._client.post(
+            self._url("ilink/bot/getuploadurl"),
+            headers=self._headers(),
+            json={
+                "filekey": file_key,
+                "media_type": 3,
+                "to_user_id": to_user_id,
+                "rawsize": len(payload),
+                "rawfilemd5": plain_md5,
+                "filesize": len(encrypted),
+                "no_need_thumb": True,
+                "aeskey": aes_key.hex(),
+                "base_info": self.base_info(),
+            },
+            timeout=httpx.Timeout(15.0, connect=10.0),
+        )
+        upload_info = self._decode(response, "获取微信文件上传地址")
+        self._check_api_result(upload_info, "获取微信文件上传地址")
+        upload_param = str(upload_info.get("upload_param") or "").strip()
+        full_url = str(upload_info.get("upload_full_url") or "").strip()
+        if full_url:
+            upload_url = _validate_weixin_download_url(full_url)
+        elif upload_param:
+            upload_url = (
+                f"{DEFAULT_CDN_BASE_URL}/upload?encrypted_query_param="
+                f"{quote(upload_param, safe='')}&filekey={quote(file_key, safe='')}"
+            )
+        else:
+            raise ILinkProtocolError("微信文件上传地址缺少 CDN 参数")
+
+        download_param = self._upload_cdn(upload_url, encrypted)
+        return {
+            "media": {
+                "encrypt_query_param": download_param,
+                "aes_key": base64.b64encode(
+                    aes_key.hex().encode("ascii")
+                ).decode("ascii"),
+                "encrypt_type": 1,
+            },
+            "file_name": cleaned_name,
+            "md5": plain_md5,
+            "len": str(len(payload)),
         }
 
     def _upload_cdn(self, url: str, encrypted: bytes) -> str:

@@ -166,9 +166,20 @@ class ILinkClient:
     def user_id(self) -> str:
         return self._credentials.user_id if self._credentials else ""
 
+    @property
+    def connected(self) -> bool:
+        return (
+            self._api is not None
+            and self._worker is not None
+            and self._worker.is_alive()
+            and self._worker_error is None
+        )
+
     def connect(self) -> None:
         if self._worker is not None and self._worker.is_alive():
-            return
+            if self._api is not None:
+                return
+            raise ILinkError("原微信 iLink 长轮询仍在停止，请稍后重试")
         credentials = load_credentials(self.credentials_path)
         if credentials is None:
             raise ILinkAuthenticationError(
@@ -195,7 +206,7 @@ class ILinkClient:
         )
         self._worker.start()
 
-    def close(self) -> None:
+    def close(self, timeout_seconds: float = 2) -> bool:
         self._stop_event.set()
         api = self._api
         if api is not None:
@@ -206,9 +217,14 @@ class ILinkClient:
             api.close()
         worker = self._worker
         if worker is not None and worker.is_alive():
-            worker.join(timeout=2)
-        self._worker = None
+            worker.join(timeout=timeout_seconds)
+        stopped = worker is None or not worker.is_alive()
+        if stopped:
+            self._worker = None
+        else:
+            log.warning("等待 iLink 长轮询线程停止超时")
         self._api = None
+        return stopped
 
     def poll(self) -> list[IncomingMessage]:
         result: list[IncomingMessage] = []
@@ -315,6 +331,39 @@ class ILinkClient:
                 "item_list": [{"type": 2, "image_item": image_item}],
             }
         )
+
+    def send_file(
+        self,
+        file_path: str | Path,
+        target: ReplyTarget | None = None,
+    ) -> None:
+        api = self._api
+        if api is None:
+            self.connect()
+            api = self._api
+        assert api is not None
+        resolved = target or self.default_target()
+        path = Path(file_path).expanduser().resolve()
+        if not path.is_file():
+            raise ILinkProtocolError(f"待发送的文件不存在：{path}")
+        file_item = api.upload_file(path.read_bytes(), resolved.user_id, path.name)
+        api.send_message(
+            {
+                "from_user_id": "",
+                "to_user_id": resolved.user_id,
+                "client_id": f"wechat-codex:{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}",
+                "message_type": 2,
+                "message_state": 2,
+                "context_token": resolved.context_token or None,
+                "item_list": [{"type": 4, "file_item": file_item}],
+            }
+        )
+
+    def reconnect(self) -> None:
+        """Close the current API/poller and establish a fresh connection."""
+        if not self.close(timeout_seconds=10):
+            raise ILinkError("等待原微信 iLink 长轮询停止超时，未启动重复连接")
+        self.connect()
 
     def materialize_image(self, message: IncomingMessage) -> IncomingMessage:
         if message.image_path or message.image_item is None:

@@ -70,6 +70,38 @@ class ILinkAPITests(unittest.TestCase):
         self.assertEqual(result, plaintext)
         self.assertIn("encrypted_query_param=encrypted%2B%2F%3D", captured["url"])
 
+    def test_upload_file_uses_file_media_type_and_file_item_metadata(self) -> None:
+        plaintext = "# 导出的对话\n".encode()
+        captured = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/getuploadurl"):
+                captured["metadata"] = json.loads(request.content)
+                return httpx.Response(200, json={"ret": 0, "upload_param": "file-upload"})
+            captured["ciphertext"] = request.content
+            return httpx.Response(200, headers={"x-encrypted-param": "file-download"})
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        api = ILinkAPI("https://ilinkai.weixin.qq.com", "secret", client=client)
+
+        file_item = api.upload_file(plaintext, "user-a", "conversation.md")
+
+        metadata = captured["metadata"]
+        aes_key = bytes.fromhex(metadata["aeskey"])
+        decrypted = unpad(
+            AES.new(aes_key, AES.MODE_ECB).decrypt(captured["ciphertext"]),
+            AES.block_size,
+        )
+        self.assertEqual(decrypted, plaintext)
+        self.assertEqual(metadata["media_type"], 3)
+        self.assertTrue(metadata["no_need_thumb"])
+        self.assertEqual(file_item["file_name"], "conversation.md")
+        self.assertEqual(file_item["len"], str(len(plaintext)))
+        self.assertEqual(
+            file_item["media"]["encrypt_query_param"],
+            "file-download",
+        )
+
     def test_get_updates_sends_required_headers_and_base_info(self) -> None:
         captured = {}
 

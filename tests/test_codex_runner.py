@@ -1,5 +1,7 @@
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import time
 import unittest
 
 from wechat_codex.codex_runner import CodexRunner, parse_jsonl
@@ -23,6 +25,42 @@ class CodexRunnerTests(unittest.TestCase):
             args = runner.build_work_args(Path(directory), "任务")
         self.assertIn("workspace-write", args)
         self.assertIn("--json", args)
+
+    def test_recent_tasks_persist_results_and_are_session_isolated(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            (project / ".git").mkdir(parents=True)
+            runner = CodexRunner(
+                "wechat-codex-command-that-does-not-exist",
+                root,
+                30,
+            )
+
+            self.assertTrue(
+                runner.begin_work(
+                    "demo",
+                    project,
+                    "运行测试",
+                    "friend:甲",
+                )[0]
+            )
+            deadline = time.monotonic() + 2
+            while runner.active and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+            own = runner.recent_tasks("friend:甲")
+            other = runner.recent_tasks("friend:乙")
+            saved = json.loads(
+                (root / "codex_task_history.json").read_text(encoding="utf-8")
+            )
+
+            self.assertFalse(runner.active)
+            self.assertIn("运行测试", own)
+            self.assertIn("[失败]", own)
+            self.assertEqual(other, "当前没有保存的 Codex 任务")
+            self.assertEqual(saved[0]["session_key"], "friend:甲")
+            self.assertEqual(saved[0]["status"], "失败")
 
 
 if __name__ == "__main__":

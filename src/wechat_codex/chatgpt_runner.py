@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 import logging
 import os
@@ -12,6 +13,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -36,6 +38,7 @@ FILE_INPUT_SELECTOR = 'input[type="file"]'
 ASSISTANT_SELECTOR = '[data-message-author-role="assistant"]'
 ASSISTANT_FALLBACK_SELECTOR = 'article[data-turn="assistant"]'
 GENERATED_IMAGE_SELECTOR = (
+    'main [data-testid^="conversation-turn-"] img, '
     'main img[alt^="Generated image" i], '
     'main img[alt*="生成"], '
     'main img[src*="/backend-api/estuary/content"], '
@@ -47,11 +50,24 @@ IMAGE_METADATA_SCRIPT = """img => {
     const style = getComputedStyle(img);
     const source = img.currentSrc || img.src || '';
     const turn = img.closest('[data-testid^="conversation-turn-"]');
+    const turnId = turn ? (turn.getAttribute('data-testid') || '') : '';
     const userTurn = Boolean(
         turn && turn.querySelector('[data-message-author-role="user"]')
     );
+    let mediaId = '';
+    let mediaKey = '';
+    try {
+        const parsed = new URL(source, location.href);
+        mediaId = parsed.searchParams.get('id') || '';
+        mediaKey = mediaId
+            ? `file:${mediaId}`
+            : `url:${parsed.hostname}${parsed.pathname}`;
+    } catch (_) {}
     return {
         source,
+        mediaId,
+        mediaKey: mediaKey || (source ? `source:${source.slice(0, 256)}` : ''),
+        turnId,
         userTurn,
         usable: Boolean(
             source && img.naturalWidth >= 128 && img.naturalHeight >= 128 &&
@@ -60,6 +76,46 @@ IMAGE_METADATA_SCRIPT = """img => {
         )
     };
 }"""
+EXPORT_TURNS_SCRIPT = """() => Array.from(
+    document.querySelectorAll('main [data-message-author-role]')
+).map(node => ({
+    role: node.getAttribute('data-message-author-role') || '',
+    text: (node.innerText || '').trim(),
+    images: node.querySelectorAll('img').length
+})).filter(item => item.role && (item.text || item.images))"""
+IMAGE_REQUEST = re.compile(
+    r"(?:"
+    r"(?:生成|画|绘制|设计|制作|创建|重做|重画|换).{0,16}(?:图片|图像|图|头像|照片)"
+    r"|(?:图片|图像|图|头像|照片).{0,16}(?:生成|画|绘制|设计|制作|创建|重做|重画|换)"
+    r"|(?:generate|draw|design|create|redesign).{0,32}(?:image|picture|photo|avatar)"
+    r")",
+    re.IGNORECASE,
+)
+IMAGE_EDIT_FOLLOWUP = re.compile(
+    r"(?:"
+    r"(?:修改|改成|改下|换|调成|调整|加上|添加|去掉|删除|重新|再来)"
+    r".{0,24}(?:图片|图像|照片|头像|衣服|头发|发型|背景|眼镜|胡子|胡渣|"
+    r"年龄|年纪|颜色|风格|嘴唇)"
+    r"|(?:图片|图像|照片|头像|衣服|头发|发型|背景|眼镜|胡子|胡渣|年龄|"
+    r"年纪|颜色|风格|嘴唇).{0,24}(?:修改|改|换|调|加|去|删|重新|再来)"
+    r"|(?:modify|change|edit|adjust|redesign).{0,32}"
+    r"(?:image|picture|photo|avatar|clothes|hair|background|glasses|beard)"
+    r")",
+    re.IGNORECASE,
+)
+IMAGE_PROGRESS_TEXT = re.compile(
+    r"(?:Creating|Generating|Editing)\s+(?:an?\s+)?image|"
+    r"(?:正在|仍在)(?:创建|生成|编辑|修改|设计).{0,12}(?:图片|图像|图)|"
+    r"(?:图片|图像).{0,8}(?:生成中|编辑中|处理中)",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class _ImageBaseline:
+    prior_turn_ids: frozenset[str] = frozenset()
+    max_turn_number: int = -1
+    media_keys: frozenset[str] = frozenset()
 
 
 def _persistent_context_options(
@@ -169,6 +225,22 @@ class BrowserSession(Protocol):
         image_paths: tuple[Path, ...],
     ) -> tuple[str, str, tuple[Path, ...]]: ...
 
+    def archive(self, conversation_url: str, timeout_seconds: int) -> None: ...
+
+    def rename(
+        self,
+        conversation_url: str,
+        title: str,
+        timeout_seconds: int,
+    ) -> None: ...
+
+    def export_markdown(
+        self,
+        conversation_url: str,
+        title: str,
+        timeout_seconds: int,
+    ) -> str: ...
+
 
 SessionFactory = Callable[[Path, str, bool, str | None], BrowserSession]
 
@@ -178,6 +250,7 @@ class ChatEvent:
     text: str
     session_key: str | None = None
     image_paths: tuple[str, ...] = ()
+    file_paths: tuple[str, ...] = ()
 
 
 @dataclass
@@ -186,6 +259,7 @@ class ChatState:
     session_key: str | None = None
     started_at: float | None = None
     stop_requested: bool = False
+    operation: str = "聊天"
 
 
 @dataclass(frozen=True)
@@ -201,6 +275,22 @@ class _ChatJob:
     conversation_url: str | None
     conversation_title: str | None
     image_paths: tuple[Path, ...]
+
+
+class _ControlKind(str, Enum):
+    ARCHIVE = "archive"
+    RENAME = "rename"
+    RETRY = "retry"
+    EXPORT = "export"
+    SUMMARIZE = "summarize"
+
+
+@dataclass(frozen=True)
+class _ControlJob:
+    session_key: str
+    kind: _ControlKind
+    conversation_url: str
+    value: str = ""
 
 
 def _read_account_state(page: Any) -> _AccountState:
@@ -260,6 +350,8 @@ class PlaywrightChatSession:
         self._playwright: Any = None
         self._context: Any = None
         self._page: Any = None
+        self._captured_media_keys: set[str] = set()
+        self._saved_image_hashes: set[str] | None = None
 
     def __enter__(self) -> PlaywrightChatSession:
         from playwright.sync_api import sync_playwright
@@ -337,7 +429,21 @@ class PlaywrightChatSession:
         previous_count = assistant_messages.count()
         if image_paths:
             self._upload_images(page, image_paths)
-        baseline_image_sources = self._generated_image_sources(page)
+        image_baseline = self._image_baseline(
+            page,
+            usable_only=False,
+            exclude_user=False,
+        )
+        expect_image = bool(
+            IMAGE_REQUEST.search(prompt) or IMAGE_EDIT_FOLLOWUP.search(prompt)
+        )
+        log.info(
+            "等待 ChatGPT 回复：图片模式=%s，轮次边界=%d，已存在轮次=%d，历史图片=%d",
+            expect_image,
+            image_baseline.max_turn_number,
+            len(image_baseline.prior_turn_ids),
+            len(image_baseline.media_keys),
+        )
         composer.fill(prompt)
         send_button = page.locator(SEND_SELECTOR).first
         send_button.wait_for(state="visible", timeout=30_000)
@@ -349,13 +455,12 @@ class PlaywrightChatSession:
             previous_count,
             timeout_seconds,
             stopped,
-            baseline_image_sources,
+            image_baseline,
+            expect_image=expect_image,
         )
-        reply = assistant_messages.nth(assistant_messages.count() - 1)
         image_paths = self._save_reply_images(
             page,
-            reply,
-            baseline_image_sources,
+            image_baseline,
         )
         conversation_url = self._wait_for_conversation_url(page)
         if conversation_title:
@@ -368,6 +473,76 @@ class PlaywrightChatSession:
                     exc,
                 )
         return text, conversation_url, image_paths
+
+    def archive(self, conversation_url: str, timeout_seconds: int) -> None:
+        page = self._page
+        if page is None:
+            raise RuntimeError("ChatGPT 浏览器尚未启动")
+        self._navigate(page, conversation_url, timeout_seconds)
+        self._wait_for_composer(page)
+        self._open_conversation_menu(page, conversation_url)
+        archive_pattern = re.compile(
+            r"^(?:Archive|Archive chat|归档|归档对话)$",
+            re.IGNORECASE,
+        )
+        archive_item = page.get_by_role("menuitem", name=archive_pattern)
+        if archive_item.count() == 0:
+            archive_item = page.get_by_text(archive_pattern)
+        if archive_item.count() == 0:
+            raise RuntimeError("找不到 ChatGPT 对话归档菜单")
+        archive_item.last.click()
+        page.wait_for_timeout(750)
+
+    def rename(
+        self,
+        conversation_url: str,
+        title: str,
+        timeout_seconds: int,
+    ) -> None:
+        page = self._page
+        if page is None:
+            raise RuntimeError("ChatGPT 浏览器尚未启动")
+        self._navigate(page, conversation_url, timeout_seconds)
+        self._wait_for_composer(page)
+        self._rename_conversation(page, conversation_url, title)
+
+    def export_markdown(
+        self,
+        conversation_url: str,
+        title: str,
+        timeout_seconds: int,
+    ) -> str:
+        page = self._page
+        if page is None:
+            raise RuntimeError("ChatGPT 浏览器尚未启动")
+        self._navigate(page, conversation_url, timeout_seconds)
+        self._wait_for_composer(page)
+        turns = page.evaluate(EXPORT_TURNS_SCRIPT)
+        if not isinstance(turns, list) or not turns:
+            raise RuntimeError("当前 ChatGPT 对话没有可导出的内容")
+
+        sections = [
+            f"# {title}",
+            "",
+            f"- 导出时间：{time.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"- ChatGPT 地址：{conversation_url}",
+            "",
+        ]
+        role_names = {"user": "用户", "assistant": "ChatGPT"}
+        for raw in turns:
+            if not isinstance(raw, dict):
+                continue
+            role = role_names.get(str(raw.get("role") or ""), "系统")
+            body = str(raw.get("text") or "").strip()
+            image_count = int(raw.get("images") or 0)
+            if image_count:
+                image_note = f"[图片 {image_count} 张]"
+                body = f"{body}\n\n{image_note}" if body else image_note
+            if body:
+                sections.extend((f"## {role}", "", body, ""))
+        if len(sections) <= 5:
+            raise RuntimeError("当前 ChatGPT 对话没有可导出的文字或图片")
+        return "\n".join(sections).rstrip() + "\n"
 
     @staticmethod
     def _upload_images(page: Any, image_paths: tuple[Path, ...]) -> None:
@@ -389,59 +564,21 @@ class PlaywrightChatSession:
     @staticmethod
     def _rename_conversation(page: Any, conversation_url: str, title: str) -> None:
         """Rename the current web conversation through ChatGPT's visible UI."""
-        from urllib.parse import urlparse
-
         cleaned = " ".join(title.split()).strip()[:80]
         if not cleaned:
             return
-        path = urlparse(conversation_url).path
-        if not path:
-            raise RuntimeError("无法从对话地址确定侧边栏项目")
-
-        anchor = page.locator(f'a[href="{path}"]')
-        if anchor.count() == 0:
-            sidebar_button = page.locator(
-                'button[data-testid="open-sidebar-button"], '
-                'button[aria-label*="sidebar" i], '
-                'button[aria-label*="边栏"]'
-            ).first
-            if sidebar_button.count() and sidebar_button.is_visible(timeout=500):
-                sidebar_button.click()
-                page.wait_for_timeout(300)
-                anchor = page.locator(f'a[href="{path}"]')
-        deadline = time.monotonic() + 5
-        while anchor.count() == 0 and time.monotonic() < deadline:
-            page.wait_for_timeout(250)
-            anchor = page.locator(f'a[href="{path}"]')
-        if anchor.count() == 0:
-            raise RuntimeError("侧边栏中找不到当前 ChatGPT 对话")
-
-        anchor = anchor.first
+        anchor, row = PlaywrightChatSession._open_conversation_menu(
+            page,
+            conversation_url,
+            open_menu=False,
+        )
         try:
             current_text = " ".join(anchor.inner_text(timeout=1_000).split())
         except Exception:
             current_text = ""
         if current_text == cleaned:
             return
-
-        anchor.hover()
-        row = anchor.locator(
-            "xpath=ancestor::*[self::li or @data-testid][1]"
-        )
-        if row.count() == 0:
-            row = anchor.locator("xpath=..")
-        options = row.locator(
-            'button[aria-label*="option" i], '
-            'button[aria-label*="more" i], '
-            'button[aria-label*="选项"], '
-            'button[aria-label*="更多"], '
-            'button[data-testid*="menu"]'
-        )
-        if options.count() == 0:
-            options = row.locator("button")
-        if options.count() == 0:
-            raise RuntimeError("找不到 ChatGPT 对话选项按钮")
-        options.last.click()
+        PlaywrightChatSession._click_conversation_menu(anchor, row)
 
         rename_pattern = re.compile(r"^(?:Rename|重命名|重新命名)$", re.IGNORECASE)
         rename_item = page.get_by_role("menuitem", name=rename_pattern)
@@ -465,6 +602,60 @@ class PlaywrightChatSession:
         editor.wait_for(state="visible", timeout=3_000)
         editor.fill(cleaned)
         editor.press("Enter")
+
+    @staticmethod
+    def _open_conversation_menu(
+        page: Any,
+        conversation_url: str,
+        *,
+        open_menu: bool = True,
+    ) -> tuple[Any, Any]:
+        from urllib.parse import urlparse
+
+        path = urlparse(conversation_url).path
+        if not path:
+            raise RuntimeError("无法从对话地址确定侧边栏项目")
+        anchor = page.locator(f'a[href="{path}"]')
+        if anchor.count() == 0:
+            sidebar_button = page.locator(
+                'button[data-testid="open-sidebar-button"], '
+                'button[aria-label*="sidebar" i], '
+                'button[aria-label*="边栏"]'
+            ).first
+            if sidebar_button.count() and sidebar_button.is_visible(timeout=500):
+                sidebar_button.click()
+                page.wait_for_timeout(300)
+                anchor = page.locator(f'a[href="{path}"]')
+        deadline = time.monotonic() + 5
+        while anchor.count() == 0 and time.monotonic() < deadline:
+            page.wait_for_timeout(250)
+            anchor = page.locator(f'a[href="{path}"]')
+        if anchor.count() == 0:
+            raise RuntimeError("侧边栏中找不到当前 ChatGPT 对话")
+        anchor = anchor.first
+        anchor.hover()
+        row = anchor.locator("xpath=ancestor::*[self::li or @data-testid][1]")
+        if row.count() == 0:
+            row = anchor.locator("xpath=..")
+        if open_menu:
+            PlaywrightChatSession._click_conversation_menu(anchor, row)
+        return anchor, row
+
+    @staticmethod
+    def _click_conversation_menu(anchor: Any, row: Any) -> None:
+        anchor.hover()
+        options = row.locator(
+            'button[aria-label*="option" i], '
+            'button[aria-label*="more" i], '
+            'button[aria-label*="选项"], '
+            'button[aria-label*="更多"], '
+            'button[data-testid*="menu"]'
+        )
+        if options.count() == 0:
+            options = row.locator("button")
+        if options.count() == 0:
+            raise RuntimeError("找不到 ChatGPT 对话选项按钮")
+        options.last.click()
 
     @staticmethod
     def _navigate(page: Any, url: str, timeout_seconds: int) -> None:
@@ -534,23 +725,26 @@ class PlaywrightChatSession:
         previous_count: int,
         timeout_seconds: int,
         stopped: Callable[[], bool],
-        baseline_image_sources: frozenset[str] = frozenset(),
+        image_baseline: _ImageBaseline = _ImageBaseline(),
+        *,
+        expect_image: bool = False,
     ) -> str:
         deadline = time.monotonic() + timeout_seconds
         last_text = ""
-        last_image_count = 0
+        last_media_keys: frozenset[str] = frozenset()
         unchanged_since: float | None = None
+        image_tool_seen = expect_image
 
         while time.monotonic() < deadline:
             if stopped():
                 raise ChatStopped("ChatGPT 请求已停止")
 
             count = assistant_messages.count()
-            new_image_sources = (
-                PlaywrightChatSession._generated_image_sources(page)
-                - baseline_image_sources
+            new_media_keys = PlaywrightChatSession._new_generated_media_keys(
+                page,
+                image_baseline,
             )
-            image_count = len(new_image_sources)
+            image_count = len(new_media_keys)
             current = ""
             if count > previous_count:
                 reply = assistant_messages.nth(count - 1)
@@ -563,23 +757,28 @@ class PlaywrightChatSession:
                     PlaywrightChatSession._visible_reply_image_count(reply),
                 )
             if current or image_count:
-                if current != last_text or image_count != last_image_count:
+                if current != last_text or new_media_keys != last_media_keys:
                     last_text = current
-                    last_image_count = image_count
+                    last_media_keys = new_media_keys
                     unchanged_since = time.monotonic()
                 elif unchanged_since is not None:
                     generating = page.locator(STOP_SELECTOR).first.is_visible(
                         timeout=500
                     )
+                    image_progress = PlaywrightChatSession._image_progress_visible(page)
+                    image_tool_seen = image_tool_seen or image_progress
+                    settle_seconds = 8.0 if image_tool_seen or image_count else 1.5
                     if (
                         not generating
-                        and time.monotonic() - unchanged_since >= 1.5
+                        and not image_progress
+                        and time.monotonic() - unchanged_since >= settle_seconds
+                        and (not image_tool_seen or image_count > 0)
                     ):
                         return current
 
             page.wait_for_timeout(250)
 
-        if last_text or last_image_count:
+        if last_text or last_media_keys:
             raise TimeoutError("ChatGPT 回复仍在生成，等待超时")
         raise TimeoutError("等待 ChatGPT 回复超时")
 
@@ -596,57 +795,118 @@ class PlaywrightChatSession:
             return 0
 
     @staticmethod
-    def _generated_image_sources(page: Any) -> frozenset[str]:
+    def _image_progress_visible(page: Any) -> bool:
         try:
+            turns = page.locator('main [data-testid^="conversation-turn-"]')
+            start = max(0, turns.count() - 2)
+            for index in range(start, turns.count()):
+                text = turns.nth(index).inner_text(timeout=500)
+                if IMAGE_PROGRESS_TEXT.search(text):
+                    return True
+            return False
+        except Exception:
+            return False
+
+    @staticmethod
+    def _image_baseline(
+        page: Any,
+        *,
+        usable_only: bool = True,
+        exclude_user: bool = True,
+    ) -> _ImageBaseline:
+        try:
+            turns = page.locator('main [data-testid^="conversation-turn-"]')
+            prior_turn_ids: set[str] = set()
+            max_turn_number = -1
+            for index in range(turns.count()):
+                turn_id = str(
+                    turns.nth(index).get_attribute("data-testid") or ""
+                )
+                if not turn_id:
+                    continue
+                prior_turn_ids.add(turn_id)
+                match = re.search(r"(\d+)$", turn_id)
+                if match:
+                    max_turn_number = max(max_turn_number, int(match.group(1)))
+
             images = page.locator(GENERATED_IMAGE_SELECTOR)
-            sources: set[str] = set()
+            media_keys: set[str] = set()
             for index in range(images.count()):
                 metadata = images.nth(index).evaluate(IMAGE_METADATA_SCRIPT)
                 if (
+                    (metadata.get("usable") or not usable_only)
+                    and (not metadata.get("userTurn") or not exclude_user)
+                ):
+                    if metadata.get("mediaKey"):
+                        media_keys.add(str(metadata["mediaKey"]))
+            return _ImageBaseline(
+                frozenset(prior_turn_ids),
+                max_turn_number,
+                frozenset(media_keys),
+            )
+        except Exception:
+            return _ImageBaseline()
+
+    @staticmethod
+    def _new_generated_media_keys(
+        page: Any,
+        baseline: _ImageBaseline,
+    ) -> frozenset[str]:
+        try:
+            images = page.locator(GENERATED_IMAGE_SELECTOR)
+            media_keys: set[str] = set()
+            for index in range(images.count()):
+                metadata = images.nth(index).evaluate(IMAGE_METADATA_SCRIPT)
+                turn_id = str(metadata.get("turnId") or "")
+                media_key = str(metadata.get("mediaKey") or "")
+                if (
                     metadata.get("usable")
                     and not metadata.get("userTurn")
-                    and metadata.get("source")
+                    and media_key
+                    and PlaywrightChatSession._is_current_turn(turn_id, baseline)
+                    and media_key not in baseline.media_keys
                 ):
-                    sources.add(str(metadata["source"]))
-            return frozenset(sources)
+                    media_keys.add(media_key)
+            return frozenset(media_keys)
         except Exception:
             return frozenset()
+
+    @staticmethod
+    def _is_current_turn(turn_id: str, baseline: _ImageBaseline) -> bool:
+        if not turn_id or turn_id in baseline.prior_turn_ids:
+            return False
+        match = re.search(r"(\d+)$", turn_id)
+        if match and int(match.group(1)) <= baseline.max_turn_number:
+            return False
+        return True
 
     def _save_reply_images(
         self,
         page: Any,
-        reply: Any,
-        baseline_sources: frozenset[str],
+        baseline: _ImageBaseline,
     ) -> tuple[Path, ...]:
         output_dir = self.profile_dir.parent / "chatgpt-images"
+        self._load_saved_image_hashes(output_dir)
         saved: list[Path] = []
-        seen_sources: set[str] = set()
-        image_groups: list[Any] = []
+        seen_images: set[str] = set()
         try:
-            image_groups.append(reply.locator("img"))
+            images = page.locator(GENERATED_IMAGE_SELECTOR)
         except Exception:
-            pass
-        try:
-            image_groups.append(page.locator(GENERATED_IMAGE_SELECTOR))
-        except Exception:
-            pass
+            return ()
 
-        candidates = sum(group.count() for group in image_groups)
-        for images in image_groups:
-            for index in range(images.count()):
-                image = images.nth(index)
-                if self._save_reply_image(
-                    image,
-                    output_dir,
-                    baseline_sources,
-                    seen_sources,
-                    saved,
-                ):
-                    continue
+        candidates = images.count()
+        for index in range(candidates):
+            self._save_reply_image(
+                images.nth(index),
+                output_dir,
+                baseline,
+                seen_images,
+                saved,
+            )
         log.info(
-            "ChatGPT 回复图片扫描完成：候选=%d，基线=%d，已保存=%d",
+            "ChatGPT 当前轮次图片扫描完成：整页候选=%d，轮次边界=%d，已保存=%d",
             candidates,
-            len(baseline_sources),
+            baseline.max_turn_number,
             len(saved),
         )
         return tuple(saved)
@@ -655,8 +915,8 @@ class PlaywrightChatSession:
         self,
         image: Any,
         output_dir: Path,
-        baseline_sources: frozenset[str],
-        seen_sources: set[str],
+        baseline: _ImageBaseline,
+        seen_images: set[str],
         saved: list[Path],
     ) -> bool:
         try:
@@ -666,9 +926,18 @@ class PlaywrightChatSession:
         if not metadata.get("usable") or metadata.get("userTurn"):
             return False
         source = str(metadata.get("source") or "")
-        if not source or source in baseline_sources or source in seen_sources:
+        turn_id = str(metadata.get("turnId") or "")
+        media_key = str(metadata.get("mediaKey") or "")
+        if (
+            not source
+            or not media_key
+            or not self._is_current_turn(turn_id, baseline)
+            or media_key in baseline.media_keys
+            or media_key in self._captured_media_keys
+            or media_key in seen_images
+        ):
             return False
-        seen_sources.add(source)
+        seen_images.add(media_key)
         output_dir.mkdir(parents=True, exist_ok=True)
         destination = output_dir / f"{uuid.uuid4().hex}.png"
         try:
@@ -702,8 +971,30 @@ class PlaywrightChatSession:
             except Exception:
                 log.warning("保存 ChatGPT 回复图片失败", exc_info=True)
                 return False
+        digest = hashlib.sha256(destination.read_bytes()).hexdigest()
+        assert self._saved_image_hashes is not None
+        self._captured_media_keys.add(media_key)
+        if digest in self._saved_image_hashes:
+            destination.unlink(missing_ok=True)
+            log.info("忽略与历史缓存内容相同的 ChatGPT 图片：%s", media_key)
+            return False
+        self._saved_image_hashes.add(digest)
         saved.append(destination.resolve())
         return True
+
+    def _load_saved_image_hashes(self, output_dir: Path) -> None:
+        if self._saved_image_hashes is not None:
+            return
+        hashes: set[str] = set()
+        if output_dir.is_dir():
+            for path in output_dir.iterdir():
+                if not path.is_file():
+                    continue
+                try:
+                    hashes.add(hashlib.sha256(path.read_bytes()).hexdigest())
+                except OSError:
+                    log.warning("读取 ChatGPT 历史图片缓存失败：%s", path)
+        self._saved_image_hashes = hashes
 
     @staticmethod
     def _decode_image_data_url(value: Any) -> tuple[bytes, str]:
@@ -762,19 +1053,31 @@ class ChatGPTRunner:
         self._session_factory = session_factory or PlaywrightChatSession
         self._state = ChatState()
         self._lock = threading.RLock()
-        self._jobs: queue.Queue[_ChatJob | None] = queue.Queue()
+        self._jobs: queue.Queue[_ChatJob | _ControlJob | None] = queue.Queue()
         self._worker: threading.Thread | None = None
         self._worker_ready = threading.Event()
         self._startup_error: Exception | None = None
         self._closing = False
         self._conversation_file = runtime_dir / "chatgpt_web_conversations.json"
+        self._title_file = runtime_dir / "chatgpt_conversation_titles.json"
+        self._history_file = runtime_dir / "chatgpt_conversation_history.json"
+        self._export_dir = runtime_dir / "chatgpt-exports"
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
         self._conversations = self._load_conversations()
+        self._titles = self._load_titles()
+        self._history = self._load_history()
+        self._last_replies: dict[str, ChatEvent] = {}
+        self._seed_history_from_current()
 
     @property
     def active(self) -> bool:
         with self._lock:
             return self._state.active
+
+    @property
+    def browser_running(self) -> bool:
+        with self._lock:
+            return self._worker is not None and self._worker.is_alive()
 
     def start(self) -> None:
         """Start one dedicated browser and keep it alive for this runner."""
@@ -818,12 +1121,14 @@ class ChatGPTRunner:
 
         with self._lock:
             if self._state.active:
-                return False, "已有 ChatGPT 请求在执行，请发送“状态”或“停止”"
+                return False, "已有 ChatGPT 请求在执行，请发送 /状态 或 /停止"
             conversation_url = self._conversations.get(session_key)
+            effective_title = self._titles.get(session_key, conversation_title)
             self._state = ChatState(
                 active=True,
                 session_key=session_key,
                 started_at=time.time(),
+                operation="聊天",
             )
 
         self._jobs.put(
@@ -831,7 +1136,7 @@ class ChatGPTRunner:
                 session_key=session_key,
                 prompt=prompt,
                 conversation_url=conversation_url,
-                conversation_title=conversation_title,
+                conversation_title=effective_title,
                 image_paths=resolved_images,
             )
         )
@@ -840,10 +1145,11 @@ class ChatGPTRunner:
     def begin_reset(self, session_key: str) -> tuple[bool, str]:
         with self._lock:
             if self._state.active:
-                return False, "已有 ChatGPT 请求在执行，请发送“状态”或“停止”"
+                return False, "已有 ChatGPT 请求在执行，请发送 /状态 或 /停止"
             if session_key not in self._conversations:
                 return False, "当前已经是新的 ChatGPT 对话"
         self._remove_conversation(session_key)
+        self._remove_title(session_key)
         self.events.put(
             ChatEvent(
                 "已切换到新的 ChatGPT 对话；旧对话仍保留在你的 ChatGPT 历史中",
@@ -851,6 +1157,154 @@ class ChatGPTRunner:
             )
         )
         return True, "已切换到新的 ChatGPT 对话"
+
+    def begin_archive(self, session_key: str) -> tuple[bool, str]:
+        return self._begin_control(session_key, _ControlKind.ARCHIVE, "", "归档对话")
+
+    def begin_rename(self, session_key: str, title: str) -> tuple[bool, str]:
+        cleaned = " ".join(title.split()).strip()[:80]
+        if not cleaned:
+            return False, "对话标题不能为空"
+        return self._begin_control(
+            session_key,
+            _ControlKind.RENAME,
+            cleaned,
+            "重命名对话",
+        )
+
+    def begin_retry(self, session_key: str) -> tuple[bool, str]:
+        return self._begin_control(session_key, _ControlKind.RETRY, "", "重试")
+
+    def begin_export(
+        self,
+        session_key: str,
+        default_title: str,
+    ) -> tuple[bool, str]:
+        with self._lock:
+            title = self._titles.get(session_key, default_title)
+        return self._begin_control(
+            session_key,
+            _ControlKind.EXPORT,
+            title,
+            "导出对话",
+        )
+
+    def begin_summary(self, session_key: str) -> tuple[bool, str]:
+        return self._begin_control(
+            session_key,
+            _ControlKind.SUMMARIZE,
+            "",
+            "总结对话",
+        )
+
+    def _begin_control(
+        self,
+        session_key: str,
+        kind: _ControlKind,
+        value: str,
+        operation: str,
+    ) -> tuple[bool, str]:
+        try:
+            self.start()
+        except RuntimeError as exc:
+            return False, str(exc)
+        with self._lock:
+            if self._state.active:
+                return False, "已有 ChatGPT 请求在执行，请发送 /状态 或 /停止"
+            conversation_url = self._conversations.get(session_key)
+            if not conversation_url:
+                return False, "当前还没有可操作的 ChatGPT 对话"
+            self._state = ChatState(
+                active=True,
+                session_key=session_key,
+                started_at=time.time(),
+                operation=operation,
+            )
+        self._jobs.put(_ControlJob(session_key, kind, conversation_url, value))
+        return True, f"已开始{operation}"
+
+    def conversation_info(self, session_key: str, default_title: str) -> str:
+        with self._lock:
+            url = self._conversations.get(session_key)
+            title = self._titles.get(session_key, default_title)
+        if not url:
+            return "当前是新的 ChatGPT 对话，尚未发送第一条消息"
+        return f"当前 ChatGPT 对话\n标题：{title}\n地址：{url}"
+
+    def conversation_list(
+        self,
+        session_key: str,
+        default_title: str,
+        limit: int = 10,
+    ) -> str:
+        with self._lock:
+            records = [dict(record) for record in self._history.get(session_key, [])]
+            current_url = self._conversations.get(session_key)
+        if not records:
+            return "当前没有保存的 ChatGPT 对话"
+        lines = ["最近保存的 ChatGPT 对话："]
+        for index, record in enumerate(records[:limit], start=1):
+            title = str(record.get("title") or default_title)
+            updated_at = float(record.get("updated_at") or 0)
+            updated = (
+                time.strftime("%m-%d %H:%M", time.localtime(updated_at))
+                if updated_at
+                else "时间未知"
+            )
+            flags: list[str] = []
+            if str(record.get("url") or "") == current_url:
+                flags.append("当前")
+            if record.get("archived"):
+                flags.append("已归档")
+            suffix = f" [{' / '.join(flags)}]" if flags else ""
+            lines.append(f"{index}. {title}（{updated}）{suffix}")
+        lines.append("发送 /切换对话：编号 以恢复历史对话")
+        return "\n".join(lines)
+
+    def switch_conversation(
+        self,
+        session_key: str,
+        number: int,
+        default_title: str,
+    ) -> tuple[bool, str]:
+        with self._lock:
+            if self._state.active:
+                return False, "已有 ChatGPT 请求在执行，请发送 /状态 或 /停止"
+            records = self._history.get(session_key, [])
+            if number < 1 or number > len(records):
+                return False, f"对话编号无效；当前共有 {len(records)} 个保存的对话"
+            record = dict(records[number - 1])
+            url = str(record.get("url") or "")
+            title = str(record.get("title") or default_title)
+            if not _is_chat_url(url):
+                return False, "保存的 ChatGPT 对话地址无效"
+            self._conversations[session_key] = url
+            self._titles[session_key] = title
+            conversations = dict(self._conversations)
+            titles = dict(self._titles)
+        self._save_conversations(conversations)
+        self._save_titles(titles)
+        self._remember_conversation(session_key, url, title)
+        return True, f"已切换到对话：{title}"
+
+    def last_reply(self, session_key: str) -> ChatEvent | None:
+        with self._lock:
+            event = self._last_replies.get(session_key)
+        if event is None:
+            return None
+        paths = tuple(path for path in event.image_paths if Path(path).is_file())
+        files = tuple(path for path in event.file_paths if Path(path).is_file())
+        return ChatEvent(event.text, event.session_key, paths, files)
+
+    def protected_image_paths(self) -> frozenset[Path]:
+        with self._lock:
+            events = tuple(self._last_replies.values())
+        return frozenset(
+            Path(path).resolve()
+            for event in events
+            for path in event.image_paths
+            if Path(path).is_file()
+        )
 
     def _browser_loop(self) -> None:
         try:
@@ -865,7 +1319,10 @@ class ChatGPTRunner:
                     job = self._jobs.get()
                     if job is None:
                         return
-                    self._run_chat(session, job)
+                    if isinstance(job, _ControlJob):
+                        self._run_control(session, job)
+                    else:
+                        self._run_chat(session, job)
         except Exception as exc:
             if not self._worker_ready.is_set():
                 self._startup_error = exc
@@ -897,18 +1354,139 @@ class ChatGPTRunner:
             if self._stopped():
                 self.events.put(ChatEvent("ChatGPT 请求已停止", job.session_key))
                 return
-            self._set_conversation(job.session_key, new_url)
-            self.events.put(ChatEvent(
+            self._set_conversation(
+                job.session_key,
+                new_url,
+                job.conversation_title,
+            )
+            event = ChatEvent(
                 text,
                 job.session_key,
                 tuple(str(path) for path in image_paths),
-            ))
+            )
+            with self._lock:
+                self._last_replies[job.session_key] = event
+            self.events.put(event)
         except ChatStopped:
             self.events.put(ChatEvent("ChatGPT 请求已停止", job.session_key))
         except Exception as exc:
             detail = str(exc).strip() or type(exc).__name__
             self.events.put(ChatEvent(
                 f"ChatGPT Plus 网页请求失败：{detail[-1000:]}", job.session_key
+            ))
+        finally:
+            self._finish()
+
+    def _run_control(self, session: BrowserSession, job: _ControlJob) -> None:
+        try:
+            if job.kind == _ControlKind.ARCHIVE:
+                session.archive(job.conversation_url, self.timeout_seconds)
+                with self._lock:
+                    title = self._titles.get(job.session_key, "")
+                self._remember_conversation(
+                    job.session_key,
+                    job.conversation_url,
+                    title,
+                    archived=True,
+                )
+                self._remove_conversation(job.session_key)
+                self._remove_title(job.session_key)
+                self.events.put(ChatEvent(
+                    "当前 ChatGPT 对话已归档，下一条消息将创建新对话",
+                    job.session_key,
+                ))
+            elif job.kind == _ControlKind.RENAME:
+                session.rename(job.conversation_url, job.value, self.timeout_seconds)
+                self._set_title(job.session_key, job.value)
+                self.events.put(ChatEvent(
+                    f"当前 ChatGPT 对话已重命名为：{job.value}",
+                    job.session_key,
+                ))
+            elif job.kind == _ControlKind.RETRY:
+                prompt = (
+                    "请重新处理我上一条消息并给出新的回答。"
+                    "如果上一条消息要求生成或修改图片，请重新生成图片，"
+                    "不要复用之前的图片。"
+                )
+                title = self._titles.get(job.session_key)
+                text, new_url, image_paths = session.ask(
+                    job.conversation_url,
+                    prompt,
+                    title,
+                    self.timeout_seconds,
+                    self._stopped,
+                    (),
+                )
+                if self._stopped():
+                    self.events.put(ChatEvent("ChatGPT 请求已停止", job.session_key))
+                    return
+                self._set_conversation(job.session_key, new_url, title)
+                event = ChatEvent(
+                    text,
+                    job.session_key,
+                    tuple(str(path) for path in image_paths),
+                )
+                with self._lock:
+                    self._last_replies[job.session_key] = event
+                self.events.put(event)
+            elif job.kind == _ControlKind.EXPORT:
+                markdown = session.export_markdown(
+                    job.conversation_url,
+                    job.value or "ChatGPT 对话",
+                    self.timeout_seconds,
+                )
+                self._export_dir.mkdir(parents=True, exist_ok=True)
+                safe_title = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", job.value)
+                safe_title = safe_title.strip(" ._")[:60] or "ChatGPT对话"
+                destination = self._export_dir / (
+                    f"{safe_title}-{time.strftime('%Y%m%d-%H%M%S')}-"
+                    f"{uuid.uuid4().hex[:6]}.md"
+                )
+                temporary = destination.with_suffix(".md.tmp")
+                temporary.write_text(markdown, encoding="utf-8")
+                os.replace(temporary, destination)
+                self.events.put(ChatEvent(
+                    f"对话已导出：{destination.name}",
+                    job.session_key,
+                    file_paths=(str(destination.resolve()),),
+                ))
+            elif job.kind == _ControlKind.SUMMARIZE:
+                prompt = (
+                    "请总结我们当前整个对话的上下文，包含主要目标、关键结论、"
+                    "已经完成的事项、未完成事项和后续建议。使用中文，结构清晰，"
+                    "确保这份总结脱离原对话也能独立理解。"
+                )
+                with self._lock:
+                    title = self._titles.get(job.session_key)
+                text, new_url, image_paths = session.ask(
+                    job.conversation_url,
+                    prompt,
+                    title,
+                    self.timeout_seconds,
+                    self._stopped,
+                    (),
+                )
+                if self._stopped():
+                    self.events.put(ChatEvent("ChatGPT 请求已停止", job.session_key))
+                    return
+                self._set_conversation(job.session_key, new_url, title)
+                event = ChatEvent(
+                    f"对话总结\n\n{text}\n\n已开启新对话，下一条普通消息将使用新上下文。",
+                    job.session_key,
+                    tuple(str(path) for path in image_paths),
+                )
+                with self._lock:
+                    self._last_replies[job.session_key] = event
+                self._remove_conversation(job.session_key)
+                self._remove_title(job.session_key)
+                self.events.put(event)
+        except ChatStopped:
+            self.events.put(ChatEvent("ChatGPT 请求已停止", job.session_key))
+        except Exception as exc:
+            detail = str(exc).strip() or type(exc).__name__
+            self.events.put(ChatEvent(
+                f"ChatGPT {self._state.operation}失败：{detail[-1000:]}",
+                job.session_key,
             ))
         finally:
             self._finish()
@@ -929,13 +1507,141 @@ class ChatGPTRunner:
             log.warning("忽略无法读取的 ChatGPT 网页会话映射 %s：%s", self._conversation_file, exc)
             return {}
 
-    def _set_conversation(self, session_key: str, url: str) -> None:
+    def _load_titles(self) -> dict[str, str]:
+        if not self._title_file.is_file():
+            return {}
+        try:
+            raw = json.loads(self._title_file.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                raise ValueError("顶层不是 JSON 对象")
+            return {
+                str(key): str(value).strip()[:80]
+                for key, value in raw.items()
+                if str(key) and str(value).strip()
+            }
+        except Exception as exc:
+            log.warning("忽略无法读取的 ChatGPT 对话标题映射 %s：%s", self._title_file, exc)
+            return {}
+
+    def _load_history(self) -> dict[str, list[dict[str, Any]]]:
+        if not self._history_file.is_file():
+            return {}
+        try:
+            raw = json.loads(self._history_file.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                raise ValueError("顶层不是 JSON 对象")
+            result: dict[str, list[dict[str, Any]]] = {}
+            for raw_key, raw_records in raw.items():
+                key = str(raw_key)
+                if not key or not isinstance(raw_records, list):
+                    continue
+                records: list[dict[str, Any]] = []
+                seen_urls: set[str] = set()
+                for raw_record in raw_records:
+                    if not isinstance(raw_record, dict):
+                        continue
+                    url = str(raw_record.get("url") or "")
+                    if not _is_chat_url(url) or url in seen_urls:
+                        continue
+                    seen_urls.add(url)
+                    records.append({
+                        "url": url,
+                        "title": str(raw_record.get("title") or "")[:80],
+                        "updated_at": float(raw_record.get("updated_at") or 0),
+                        "archived": bool(raw_record.get("archived", False)),
+                    })
+                records.sort(
+                    key=lambda record: float(record.get("updated_at") or 0),
+                    reverse=True,
+                )
+                if records:
+                    result[key] = records[:50]
+            return result
+        except Exception as exc:
+            log.warning("忽略无法读取的 ChatGPT 对话历史 %s：%s", self._history_file, exc)
+            return {}
+
+    def _seed_history_from_current(self) -> None:
+        changed = False
+        timestamp = time.time()
+        for session_key, url in self._conversations.items():
+            records = self._history.setdefault(session_key, [])
+            if any(str(record.get("url") or "") == url for record in records):
+                continue
+            records.insert(0, {
+                "url": url,
+                "title": self._titles.get(session_key, ""),
+                "updated_at": timestamp,
+                "archived": False,
+            })
+            changed = True
+        if changed:
+            self._save_history(self._history)
+
+    def _remember_conversation(
+        self,
+        session_key: str,
+        url: str,
+        title: str | None,
+        *,
+        archived: bool | None = None,
+    ) -> None:
+        if not _is_chat_url(url):
+            return
+        with self._lock:
+            records = [dict(record) for record in self._history.get(session_key, [])]
+            previous = next(
+                (record for record in records if str(record.get("url") or "") == url),
+                None,
+            )
+            records = [
+                record
+                for record in records
+                if str(record.get("url") or "") != url
+            ]
+            effective_title = (
+                str(title or "").strip()[:80]
+                or str((previous or {}).get("title") or "")[:80]
+            )
+            effective_archived = (
+                bool((previous or {}).get("archived", False))
+                if archived is None
+                else archived
+            )
+            records.insert(0, {
+                "url": url,
+                "title": effective_title,
+                "updated_at": time.time(),
+                "archived": effective_archived,
+            })
+            self._history[session_key] = records[:50]
+            snapshot = {
+                key: [dict(record) for record in values]
+                for key, values in self._history.items()
+            }
+        self._save_history(snapshot)
+
+    def _save_history(self, history: dict[str, list[dict[str, Any]]]) -> None:
+        temporary = self._history_file.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps(history, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, self._history_file)
+
+    def _set_conversation(
+        self,
+        session_key: str,
+        url: str,
+        title: str | None = None,
+    ) -> None:
         if not _is_chat_url(url):
             raise ValueError(f"无效的 ChatGPT 对话地址：{url}")
         with self._lock:
             self._conversations[session_key] = url
             snapshot = dict(self._conversations)
         self._save_conversations(snapshot)
+        self._remember_conversation(session_key, url, title, archived=False)
 
     def _remove_conversation(self, session_key: str) -> None:
         with self._lock:
@@ -950,6 +1656,29 @@ class ChatGPTRunner:
             encoding="utf-8",
         )
         os.replace(temporary, self._conversation_file)
+
+    def _set_title(self, session_key: str, title: str) -> None:
+        with self._lock:
+            self._titles[session_key] = title
+            url = self._conversations.get(session_key)
+            snapshot = dict(self._titles)
+        self._save_titles(snapshot)
+        if url:
+            self._remember_conversation(session_key, url, title)
+
+    def _remove_title(self, session_key: str) -> None:
+        with self._lock:
+            self._titles.pop(session_key, None)
+            snapshot = dict(self._titles)
+        self._save_titles(snapshot)
+
+    def _save_titles(self, titles: dict[str, str]) -> None:
+        temporary = self._title_file.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps(titles, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, self._title_file)
 
     def _stopped(self) -> bool:
         with self._lock:
@@ -966,6 +1695,19 @@ class ChatGPTRunner:
                 return "当前没有执行中的 ChatGPT 请求"
             self._state.stop_requested = True
         return "正在停止 ChatGPT 请求"
+
+    def restart(self) -> tuple[bool, str]:
+        with self._lock:
+            if self._state.active:
+                return False, "ChatGPT 请求正在执行，请先发送 /停止"
+        self.close()
+        with self._lock:
+            self._closing = False
+        try:
+            self.start()
+        except RuntimeError as exc:
+            return False, f"ChatGPT 浏览器重启失败：{exc}"
+        return True, "ChatGPT 隐藏浏览器已重启"
 
     def close(self, timeout_seconds: float = 10) -> None:
         """Stop pending work and close the dedicated browser process."""
@@ -987,7 +1729,7 @@ class ChatGPTRunner:
             if not state.active:
                 return "ChatGPT Plus 网页当前空闲"
             elapsed = int(time.time() - (state.started_at or time.time()))
-            return f"正在执行 ChatGPT Plus 网页聊天，已运行 {elapsed} 秒"
+            return f"正在执行 ChatGPT {state.operation}，已运行 {elapsed} 秒"
 
     def drain_events(self) -> list[ChatEvent]:
         result: list[ChatEvent] = []

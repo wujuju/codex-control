@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import json
 import logging
+import os
 import queue
+import re
 import threading
+import time
 from collections.abc import Callable
+from pathlib import Path
 
 from .chatgpt_runner import ChatGPTRunner
 from .codex_runner import CodexRunner
@@ -14,6 +19,12 @@ from .router import RouteKind, help_text, route_message
 
 
 log = logging.getLogger(__name__)
+
+_LOG_SECRET = re.compile(
+    r"(?i)(authorization|bearer|token|context_token|aes[_-]?key|"
+    r"encrypt_query_param)(\s*[=:]\s*|\s+)([^\s,;]+)"
+)
+_WECHAT_ID = re.compile(r"[A-Za-z0-9_.-]+@im\.(?:wechat|bot)", re.IGNORECASE)
 
 
 class BridgeApp:
@@ -30,6 +41,8 @@ class BridgeApp:
         self._stop_event = threading.Event()
         self._manual_messages: queue.Queue[str] = queue.Queue()
         self._reply_targets: dict[str, ReplyTarget] = {}
+        self._project_selection_file = config.runtime_dir / "selected_projects.json"
+        self._selected_projects = self._load_selected_projects()
         self.wechat = ILinkClient(
             credentials_path=config.ilink_credentials_file,
             state_path=config.ilink_state_file,
@@ -113,6 +126,7 @@ class BridgeApp:
         text: str,
         session_key: str | None,
         image_paths: tuple[str, ...] = (),
+        file_paths: tuple[str, ...] = (),
     ) -> None:
         target = self._reply_targets.get(session_key or "")
         if target is None:
@@ -126,6 +140,9 @@ class BridgeApp:
         for image_path in image_paths:
             self.wechat.send_image(image_path, target)
             self._emit_event("outgoing", "微信 Bot", "[图片]")
+        for file_path in file_paths:
+            self.wechat.send_file(file_path, target)
+            self._emit_event("outgoing", "微信 Bot", f"[文件] {Path(file_path).name}")
 
     def _listen(self) -> None:
         consecutive_errors = 0
@@ -145,6 +162,7 @@ class BridgeApp:
                         event.text,
                         event.session_key,
                         event.image_paths,
+                        event.file_paths,
                     )
 
                 for message in self.wechat.poll():
@@ -210,7 +228,17 @@ class BridgeApp:
     ) -> None:
         route = route_message(message.content)
         codex_commands = {
-            RouteKind.WORK, RouteKind.CONTINUE, RouteKind.STATUS, RouteKind.STOP
+            RouteKind.WORK,
+            RouteKind.CONTINUE,
+            RouteKind.STATUS,
+            RouteKind.STOP,
+            RouteKind.CACHE_CLEAR,
+            RouteKind.RECENT_TASKS,
+            RouteKind.PROJECT_LIST,
+            RouteKind.SWITCH_PROJECT,
+            RouteKind.VIEW_LOGS,
+            RouteKind.RECONNECT_WECHAT,
+            RouteKind.RESTART_BROWSER,
         }
         if route.kind in codex_commands and not self._can_run_codex(message.sender_id):
             log.warning("拒绝未授权的 Codex 请求：%s", message.sender_id)
@@ -227,9 +255,129 @@ class BridgeApp:
             result = self.chat_runner.stop() if self.chat_runner.active else self.runner.stop()
             self._send(result, target)
             return
+        if route.kind == RouteKind.CURRENT_CHAT:
+            self._send(
+                self.chat_runner.conversation_info(
+                    session_key,
+                    self.config.chatgpt_conversation_title,
+                ),
+                target,
+            )
+            return
+        if route.kind == RouteKind.CONVERSATION_LIST:
+            self._send(
+                self.chat_runner.conversation_list(
+                    session_key,
+                    self.config.chatgpt_conversation_title,
+                ),
+                target,
+            )
+            return
+        if route.kind == RouteKind.SWITCH_CHAT:
+            ok, response = self.chat_runner.switch_conversation(
+                session_key,
+                route.number or 0,
+                self.config.chatgpt_conversation_title,
+            )
+            self._send(response, target)
+            return
+        if route.kind == RouteKind.ARCHIVE_CHAT:
+            ok, response = self.chat_runner.begin_archive(session_key)
+            if not ok:
+                self._send(response, target)
+            return
+        if route.kind == RouteKind.EXPORT_CHAT:
+            ok, response = self.chat_runner.begin_export(
+                session_key,
+                self.config.chatgpt_conversation_title,
+            )
+            if not ok:
+                self._send(response, target)
+            return
+        if route.kind == RouteKind.SUMMARIZE_CHAT:
+            ok, response = self.chat_runner.begin_summary(session_key)
+            if not ok:
+                self._send(response, target)
+            return
+        if route.kind == RouteKind.RENAME_CHAT:
+            ok, response = self.chat_runner.begin_rename(session_key, route.prompt)
+            if not ok:
+                self._send(response, target)
+            return
+        if route.kind == RouteKind.RETRY:
+            ok, response = self.chat_runner.begin_retry(session_key)
+            if not ok:
+                self._send(response, target)
+            return
+        if route.kind == RouteKind.RESEND:
+            if self.chat_runner.active or self.runner.active:
+                self._send("当前有任务正在执行，请完成或发送 /停止 后再重发", target)
+                return
+            event = self.chat_runner.last_reply(session_key)
+            if event is None or (
+                not event.text.strip()
+                and not event.image_paths
+                and not event.file_paths
+            ):
+                self._send("当前没有可以重发的成功回复", target)
+                return
+            self._send_event(
+                event.text,
+                session_key,
+                event.image_paths,
+                event.file_paths,
+            )
+            return
+        if route.kind == RouteKind.RECENT_TASKS:
+            self._send(self.runner.recent_tasks(session_key), target)
+            return
+        if route.kind == RouteKind.PROJECT_LIST:
+            self._send(self._project_list(session_key), target)
+            return
+        if route.kind == RouteKind.SWITCH_PROJECT:
+            self._send(
+                self._switch_project(session_key, route.project or ""),
+                target,
+            )
+            return
+        if route.kind == RouteKind.CACHE_STATUS:
+            self._send(self._cache_status(), target)
+            return
+        if route.kind == RouteKind.CACHE_CLEAR:
+            days = route.days or 7
+            if not 1 <= days <= 3650:
+                self._send("缓存保留天数必须在 1 到 3650 天之间", target)
+                return
+            self._send(self._clear_cache(days), target)
+            return
+        if route.kind == RouteKind.DOCTOR:
+            self._send(self._doctor_status(), target)
+            return
+        if route.kind == RouteKind.VIEW_LOGS:
+            number = route.number or 50
+            if not 1 <= number <= 200:
+                self._send("日志条数必须在 1 到 200 之间", target)
+                return
+            self._send(self._recent_logs(number), target)
+            return
+        if route.kind == RouteKind.RECONNECT_WECHAT:
+            if self.chat_runner.active or self.runner.active:
+                self._send("当前有任务正在执行，请完成或发送 /停止 后再重连", target)
+                return
+            try:
+                self.wechat.reconnect()
+            except Exception:
+                log.exception("微信 iLink 手动重连失败")
+                raise
+            self._send("微信 iLink 已重新连接", target)
+            return
+        if route.kind == RouteKind.RESTART_BROWSER:
+            ok, response = self.chat_runner.restart()
+            self._send(response, target)
+            return
         if route.kind == RouteKind.NEW_CHAT:
             if self.runner.active:
-                self._send("Codex 任务正在执行，请发送“状态”或“停止”", target)
+                self._send("Codex 任务正在执行，请发送 /状态 或 /停止", target)
                 return
             ok, response = self.chat_runner.begin_reset(session_key)
             if not ok:
@@ -237,7 +385,7 @@ class BridgeApp:
             return
         if route.kind == RouteKind.CONTINUE:
             if self.chat_runner.active:
-                self._send("ChatGPT 请求正在执行，请发送“状态”或“停止”", target)
+                self._send("ChatGPT 请求正在执行，请发送 /状态 或 /停止", target)
                 return
             ok, response = self.runner.begin_continue(route.prompt, session_key)
             if not ok:
@@ -245,9 +393,9 @@ class BridgeApp:
             return
         if route.kind == RouteKind.WORK:
             if self.chat_runner.active:
-                self._send("ChatGPT 请求正在执行，请发送“状态”或“停止”", target)
+                self._send("ChatGPT 请求正在执行，请发送 /状态 或 /停止", target)
                 return
-            project = route.project or self.config.default_project
+            project = route.project or self._selected_project(session_key)
             project_path = self.config.projects.get(project)
             if project_path is None:
                 self._send(
@@ -263,7 +411,7 @@ class BridgeApp:
             return
 
         if self.runner.active:
-            self._send("Codex 任务正在执行，请发送“状态”或“停止”", target)
+            self._send("Codex 任务正在执行，请发送 /状态 或 /停止", target)
             return
         prompt = route.prompt
         if message.image_path and prompt == "[图片]":
@@ -283,3 +431,148 @@ class BridgeApp:
 
     def _chat_conversation_title(self, message: IncomingMessage) -> str:
         return self.config.chatgpt_conversation_title
+
+    def _load_selected_projects(self) -> dict[str, str]:
+        if not self._project_selection_file.is_file():
+            return {}
+        try:
+            raw = json.loads(
+                self._project_selection_file.read_text(encoding="utf-8")
+            )
+            if not isinstance(raw, dict):
+                raise ValueError("顶层不是 JSON 对象")
+            return {
+                str(key): str(value)
+                for key, value in raw.items()
+                if str(key) and str(value) in self.config.projects
+            }
+        except Exception as exc:
+            log.warning("忽略无法读取的项目选择记录：%s", exc)
+            return {}
+
+    def _save_selected_projects(self) -> None:
+        self.config.runtime_dir.mkdir(parents=True, exist_ok=True)
+        temporary = self._project_selection_file.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps(self._selected_projects, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, self._project_selection_file)
+
+    def _selected_project(self, session_key: str) -> str:
+        return self._selected_projects.get(session_key, self.config.default_project)
+
+    def _project_list(self, session_key: str) -> str:
+        selected = self._selected_project(session_key)
+        lines = ["可用 Codex 项目："]
+        for name in self.config.projects:
+            marker = " [当前]" if name == selected else ""
+            lines.append(f"- {name}{marker}")
+        lines.append("发送 /切换项目：项目名 进行切换")
+        return "\n".join(lines)
+
+    def _switch_project(self, session_key: str, project: str) -> str:
+        if self.runner.active:
+            return "Codex 任务正在执行，暂不能切换项目"
+        if project not in self.config.projects:
+            return f"未知项目 {project!r}；可用项目：{'、'.join(self.config.projects)}"
+        self._selected_projects[session_key] = project
+        self._save_selected_projects()
+        return f"当前 Codex 项目已切换为：{project}"
+
+    @staticmethod
+    def _sanitize_log_line(line: str) -> str:
+        cleaned = _LOG_SECRET.sub(
+            lambda match: f"{match.group(1)}{match.group(2)}[已隐藏]",
+            line,
+        )
+        return _WECHAT_ID.sub("[微信ID]", cleaned)[:600]
+
+    def _recent_logs(self, number: int) -> str:
+        candidates = []
+        for name in ("bridge.err.log", "gui.log", "bridge.out.log"):
+            path = (self.config.runtime_dir / name).resolve()
+            try:
+                if path.is_file() and path.stat().st_size:
+                    candidates.append(path)
+            except OSError:
+                continue
+        if not candidates:
+            return "当前没有可读取的运行日志"
+        path = max(candidates, key=lambda candidate: candidate.stat().st_mtime)
+        try:
+            with path.open("rb") as stream:
+                stream.seek(0, os.SEEK_END)
+                size = stream.tell()
+                stream.seek(max(0, size - 512 * 1024), os.SEEK_SET)
+                payload = stream.read()
+            lines = payload.decode("utf-8", errors="replace").splitlines()
+            if size > 512 * 1024 and lines:
+                lines = lines[1:]
+            filtered = [
+                self._sanitize_log_line(line)
+                for line in lines
+                if line.strip()
+            ][-number:]
+        except OSError as exc:
+            return f"读取运行日志失败：{exc}"
+        if not filtered:
+            return "运行日志中没有可显示的内容"
+        return f"最近 {len(filtered)} 条运行日志（{path.name}，已脱敏）：\n" + "\n".join(filtered)
+
+    def _cache_files(self) -> list[Path]:
+        result: list[Path] = []
+        for name in ("inbound-images", "chatgpt-images"):
+            directory = (self.config.runtime_dir / name).resolve()
+            if not directory.is_dir():
+                continue
+            result.extend(path for path in directory.iterdir() if path.is_file())
+        return result
+
+    def _cache_status(self) -> str:
+        files = self._cache_files()
+        total_bytes = 0
+        readable = 0
+        for path in files:
+            try:
+                total_bytes += path.stat().st_size
+                readable += 1
+            except OSError:
+                pass
+        return f"图片缓存：{readable} 个文件，共 {total_bytes / 1024 / 1024:.1f} MB"
+
+    def _clear_cache(self, days: int) -> str:
+        if self.chat_runner.active:
+            return "ChatGPT 请求正在执行，暂不能清理图片缓存"
+        cutoff = time.time() - days * 86400
+        protected = self.chat_runner.protected_image_paths()
+        removed = 0
+        removed_bytes = 0
+        for path in self._cache_files():
+            try:
+                resolved = path.resolve()
+                stat = resolved.stat()
+                if resolved in protected or stat.st_mtime >= cutoff:
+                    continue
+                size = stat.st_size
+                resolved.unlink()
+                removed += 1
+                removed_bytes += size
+            except OSError:
+                log.warning("清理图片缓存失败：%s", path, exc_info=True)
+        return (
+            f"已清理 {days} 天前的图片缓存：{removed} 个文件，"
+            f"释放 {removed_bytes / 1024 / 1024:.1f} MB"
+        )
+
+    def _doctor_status(self) -> str:
+        wechat = "已连接" if self.wechat.connected else "未连接"
+        browser = "运行中" if self.chat_runner.browser_running else "未运行"
+        return (
+            "健康检查\n"
+            f"微信 iLink：{wechat}\n"
+            f"ChatGPT 浏览器：{browser}\n"
+            f"ChatGPT 状态：{self.chat_runner.status()}\n"
+            f"Codex 状态：{self.runner.status()}\n"
+            f"{self._cache_status()}"
+        )
