@@ -99,6 +99,45 @@ IMAGE_METADATA_SCRIPT = """img => {
         )
     };
 }"""
+REPLY_TEXT_SCRIPT = """node => {
+    const clone = node.cloneNode(true);
+    const citationSelectors = [
+        '[data-testid="webpage-citation-pill"]',
+        '[data-testid^="webpage-citation-"]',
+        '[data-testid*="citation-card" i]',
+        '[data-testid*="sources-footer" i]',
+        '[data-testid*="source-footer" i]',
+        '[aria-label^="Citation" i]',
+        '[aria-label*="citation" i]',
+        '[aria-label^="引用"]',
+        'sup a[href]'
+    ];
+    clone.querySelectorAll(citationSelectors.join(',')).forEach(
+        element => element.remove()
+    );
+    clone.querySelectorAll('a').forEach(anchor => {
+        if (anchor.querySelector('img') && (anchor.textContent || '').trim().length < 80) {
+            anchor.remove();
+        }
+    });
+
+    const wrapper = document.createElement('div');
+    wrapper.style.cssText = [
+        'position:fixed',
+        'left:-100000px',
+        'top:0',
+        `width:${Math.max(node.getBoundingClientRect().width, 320)}px`,
+        'visibility:hidden',
+        'pointer-events:none'
+    ].join(';');
+    wrapper.appendChild(clone);
+    document.body.appendChild(wrapper);
+    try {
+        return (clone.innerText || clone.textContent || '').trim();
+    } finally {
+        wrapper.remove();
+    }
+}"""
 EXPORT_TURNS_SCRIPT = """() => Array.from(
     document.querySelectorAll('main [data-message-author-role]')
 ).map(node => ({
@@ -132,6 +171,25 @@ IMAGE_PROGRESS_TEXT = re.compile(
     r"(?:图片|图像).{0,8}(?:生成中|编辑中|处理中)",
     re.IGNORECASE,
 )
+INTERNAL_CITATION = re.compile(
+    r"\ue200(?:cite|navlist)\ue202.*?\ue201",
+    re.IGNORECASE | re.DOTALL,
+)
+INTERNAL_TURN_REFERENCE = re.compile(
+    r"(?:\[\s*)?turn\d+(?:search|news|open|fetch|view|finance)\d+"
+    r"(?:\s*[,、]\s*turn\d+(?:search|news|open|fetch|view|finance)\d+)*"
+    r"(?:\s*\])?",
+    re.IGNORECASE,
+)
+MARKDOWN_LINK = re.compile(
+    r"\[([^\]\n]+)\]\((?:https?://|www\.)[^)\s]+(?:\s+\"[^\"]*\")?\)",
+    re.IGNORECASE,
+)
+BARE_URL = re.compile(r"(?:https?://|www\.)[^\s<>()，。！？；、]+", re.IGNORECASE)
+TRAILING_SOURCE_SECTION = re.compile(
+    r"\n(?:#{1,6}\s*)?(?:sources?|来源|参考资料|参考来源|引用)\s*[:：]?\s*\n.*\Z",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def _file_sha256(path: Path) -> str:
@@ -161,6 +219,36 @@ def _is_usable_generated_image(metadata: Any) -> bool:
         )
     except (TypeError, ValueError):
         return False
+
+
+def _filter_reply_text(value: Any) -> str:
+    """Return readable reply text without web-only citations or source links."""
+    if not isinstance(value, str):
+        return ""
+    text = value.replace("\r\n", "\n").replace("\r", "\n")
+    text = INTERNAL_CITATION.sub("", text)
+    text = INTERNAL_TURN_REFERENCE.sub("", text)
+    text = MARKDOWN_LINK.sub(r"\1", text)
+    text = TRAILING_SOURCE_SECTION.sub("", text)
+    text = BARE_URL.sub("", text)
+    lines: list[str] = []
+    for line in text.splitlines():
+        if not line.strip():
+            lines.append("")
+        elif line.strip(" \t-*•·—:：()（）[]【】"):
+            lines.append(line.rstrip())
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+
+def _extract_reply_text(reply: Any) -> str:
+    try:
+        text = reply.evaluate(REPLY_TEXT_SCRIPT)
+    except Exception:
+        try:
+            text = reply.inner_text(timeout=2_000)
+        except Exception:
+            return ""
+    return _filter_reply_text(text)
 
 
 @dataclass(frozen=True)
@@ -805,10 +893,7 @@ class PlaywrightChatSession:
             current = ""
             if count > previous_count:
                 reply = assistant_messages.nth(count - 1)
-                try:
-                    current = reply.inner_text(timeout=2_000).strip()
-                except Exception:
-                    current = ""
+                current = _extract_reply_text(reply)
                 image_count = max(
                     image_count,
                     PlaywrightChatSession._visible_reply_image_count(reply),

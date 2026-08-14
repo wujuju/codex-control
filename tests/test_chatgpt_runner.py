@@ -12,6 +12,8 @@ from wechat_codex.chatgpt_runner import (
     LOGIN_SELECTOR,
     PlaywrightChatSession,
     STOP_SELECTOR,
+    _extract_reply_text,
+    _filter_reply_text,
     _is_usable_generated_image,
     _is_chat_url,
     _persistent_context_options,
@@ -224,6 +226,29 @@ def make_runner(runtime_dir: Path, factory: FakeSessionFactory) -> ChatGPTRunner
 
 
 class ChatGPTRunnerTests(unittest.TestCase):
+    def test_reply_text_filters_web_citations_links_and_sources(self) -> None:
+        reply = (
+            "第一段结论。\ue200cite\ue202turn0search0\ue202turn0search1\ue201\n\n"
+            "详情可查看 [官方说明](https://example.com/guide)。\n"
+            "turn0search2\n\n"
+            "Sources:\n- 示例来源 https://example.com/source\n"
+        )
+
+        self.assertEqual(
+            _filter_reply_text(reply),
+            "第一段结论。\n\n详情可查看 官方说明。",
+        )
+
+    def test_reply_text_uses_dom_content_with_citations_removed(self) -> None:
+        class Reply:
+            def evaluate(self, _script):
+                return "保留的正文\n\n来源：\nhttps://example.com"
+
+            def inner_text(self, timeout):
+                raise AssertionError(f"unexpected fallback: {timeout}")
+
+        self.assertEqual(_extract_reply_text(Reply()), "保留的正文")
+
     def test_citation_icon_is_not_treated_as_generated_reply_image(self) -> None:
         citation_icon = {
             # Simulate a proxy URL that otherwise looks like an OpenAI image.
