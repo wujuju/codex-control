@@ -150,15 +150,7 @@ class BridgeApp:
                     self._send(event.text)
 
                 for message in self.wechat.poll():
-                    log.info(
-                        "收到消息（%s/%s/%s）：%s",
-                        message.chat_type,
-                        message.attr,
-                        message.sender,
-                        message.content,
-                    )
-                    self._emit_event("incoming", message.sender, message.content)
-                    self._handle(message)
+                    self._process_incoming(message)
                 consecutive_errors = 0
             except KeyboardInterrupt:
                 raise
@@ -168,6 +160,28 @@ class BridgeApp:
                 if consecutive_errors >= 5:
                     raise RuntimeError("微信连续 5 次访问失败，准备重新连接")
             self._stop_event.wait(self.config.poll_seconds)
+
+    def _process_incoming(self, message: IncomingMessage) -> None:
+        log.info(
+            "收到消息（%s/%s/%s）：%s",
+            message.chat_type,
+            message.attr,
+            message.sender,
+            message.content,
+        )
+        self._emit_event("incoming", message.sender, message.content)
+        self._acknowledge(message)
+        self._handle(message)
+
+    def _acknowledge(self, message: IncomingMessage) -> None:
+        if not self.config.send_received_ack or message.attr == "self":
+            return
+        try:
+            self._send(self.config.received_ack_text)
+        except Exception:
+            # The message has already been consumed from the incremental reader.
+            # Continue processing it even when the best-effort receipt cannot be sent.
+            log.exception("发送收到确认失败，继续处理原消息")
 
     def _handle(self, message: IncomingMessage) -> None:
         route = route_message(message.content)
@@ -229,7 +243,11 @@ class BridgeApp:
         if self.runner.active:
             self._send("Codex 任务正在执行，请发送“状态”或“停止”")
             return
-        ok, response = self.chat_runner.begin_chat(session_key, route.prompt)
+        ok, response = self.chat_runner.begin_chat(
+            session_key,
+            route.prompt,
+            conversation_title=self._chat_conversation_title(message),
+        )
         if not ok:
             self._send(response)
 
@@ -238,3 +256,10 @@ class BridgeApp:
         if message.chat_type == "group":
             return f"group:{conversation}:{message.sender}"
         return f"friend:{conversation}"
+
+    def _chat_conversation_title(self, message: IncomingMessage) -> str:
+        prefix = self.config.chatgpt_conversation_title_prefix
+        conversation = message.conversation or self.config.contact
+        if message.chat_type == "group":
+            return f"{prefix}群{conversation}-{message.sender}"[:80]
+        return f"{prefix}{conversation}"[:80]

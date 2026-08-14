@@ -111,6 +111,39 @@ class WeChatClientTests(unittest.TestCase):
         self.assertEqual(messages[0].sender, "無惧")
         self.assertEqual(messages[0].conversation, "测试群")
 
+    def test_wx_cli_read_mode_keeps_unmentioned_group_message(self) -> None:
+        client = WeChatClient(
+            "無惧",
+            True,
+            False,
+            True,
+            3,
+            "[助手] ",
+            1800,
+            "friend",
+            "ChatGpt机器人",
+            "wx_cli",
+            require_group_mention=False,
+        )
+        client._wx_cli_reader = SimpleNamespace(
+            poll=lambda: [
+                WxCliMessage(
+                    key="group-1",
+                    content="群里的普通消息",
+                    sender="张三",
+                    conversation="ChatGPT",
+                    chat_type="group",
+                    is_self=False,
+                )
+            ]
+        )
+
+        messages = client.poll()
+
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].content, "群里的普通消息")
+        self.assertEqual(messages[0].conversation, "ChatGPT")
+
     def test_accessibility_error_explains_narrator_restart(self) -> None:
         error = WeChatAccessibilityUnavailable("4.1.12.55")
 

@@ -11,6 +11,7 @@
 - 只有白名单中的“無惧”可以执行干活、继续、状态和停止命令
 - 普通中文聊天使用 ChatGPT Plus 网页，程序重启后继续原网页对话
 - 私聊按会话保存上下文；群聊按“群名 + 成员”隔离上下文
+- ChatGPT Plus 历史对话使用对应微信标题，例如私聊 `微信無惧`
 - `新对话` 切换到新网页对话，旧对话仍保留在 ChatGPT 历史中
 - `干活：任务` 修改默认项目
 - `干活 control：任务` 修改指定项目
@@ -18,6 +19,7 @@
 - `状态` 查看任务
 - `停止` 终止任务
 - 启动时忽略已有历史消息，回复自动防循环
+- 收到对方新消息后可先立即回复“已收到，正在处理中，请稍等…”，最终结果完成后再发送
 - 可用外部 `wx`/`wechat-cli` 的 JSON 增量接口读取消息，轮询时不打开或激活微信
 - 可选在登录连接成功后发送一条“已上线”消息（当前默认关闭）
 - 读取微信原生自动转写结果，识别内容按普通消息继续处理
@@ -56,15 +58,20 @@ chat_type: "friend" # 监听群聊时改为 group
 wechat_message_source: "wx_cli"
 wx_cli_path: "wx" # 也可以填写 wechat-cli.exe 的绝对路径
 wx_cli_username: "" # 同名联系人时建议填写其稳定 wxid
+wx_cli_contacts: ["無惧"] # 精确私聊名称白名单
+wx_cli_groups: ["ChatGPT"] # 精确群聊名称白名单
 wx_cli_timeout_seconds: 30
 bot_name: "ChatGpt机器人"
 authorized_senders: ["無惧"]
 background_mode: true
+send_received_ack: true
+received_ack_text: "已收到，正在处理中，请稍等…"
 voice_recognition: true
 voice_retry_count: 3
 chatgpt_browser_channel: "chrome"
 chatgpt_headless: false
 chatgpt_proxy_server: "socks5://127.0.0.1:7890" # 留空则使用系统网络设置
+chatgpt_conversation_title_prefix: "微信"
 chat_timeout_seconds: 180
 default_project: "control"
 projects:
@@ -73,6 +80,14 @@ projects:
 ```
 
 项目必须是 Git 仓库。微信消息不能直接指定磁盘路径，只能使用这里登记的项目别名。
+
+`send_received_ack` 只在完整桥接的 `start`/GUI 处理链路中生效。每条对方消息会先发送
+`received_ack_text`，然后进入 ChatGPT/Codex；手机端标记为 `self` 的消息不会发送这条确认。
+纯 `read` 命令始终不发送任何内容。
+
+首次为某个微信会话创建 ChatGPT Plus 网页对话后，程序会通过网页菜单设置固定标题。
+私聊标题为 `微信 + 联系人名`（例如 `微信無惧`）；群聊按成员隔离，标题为
+`微信群 + 群名 + - + 成员名`。本地仍以对话 URL 作为复用依据，后续问题继续进入同一个网页对话。
 
 `wechat_message_source: wx_cli` 只调用已经由你安装、初始化好的外部工具，执行
 `new-messages --json`；本项目不捆绑、不下载，也不负责提取密钥或解密数据库。启动时会先调用一次并丢弃结果来建立增量基线，之后只接收新消息。外部工具的增量游标通常是用户级共享状态，不要同时在另一个终端反复执行 `new-messages`，否则另一个进程可能先消费游标。当前只接入文本和引用文本；语音仍只在 `uia` 读取模式下可用。
@@ -115,7 +130,10 @@ projects:
 .\.venv\Scripts\wechat-codex.exe --config config.yaml read
 ```
 
-命令会先建立一次消息基线并忽略旧消息，随后逐行输出新消息 JSON；按 `Ctrl+C` 停止。
+命令会先建立一次消息基线并忽略旧消息，随后逐行输出
+`wx_cli_contacts` 和 `wx_cli_groups` 白名单中的新消息 JSON；按 `Ctrl+C` 停止。
+只读命令会显示白名单群里的全部文本消息，不要求包含机器人 `@`。正式桥接器目前仍按
+`contact`/`chat_type` 的单一目标处理回复，避免在多会话发送接入前把回复发错会话。
 
 如果 PowerShell 允许执行本地脚本，也可以在后台运行：
 

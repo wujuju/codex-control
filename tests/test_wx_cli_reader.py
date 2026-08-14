@@ -202,6 +202,52 @@ class WxCliReaderTests(unittest.TestCase):
 
         self.assertTrue(messages[0].is_self)
 
+    def test_filters_private_and_group_whitelists_independently(self) -> None:
+        reader = WxCliReader(
+            contact="無惧",
+            chat_type="friend",
+            contacts=["無惧"],
+            groups=["ChatGPT"],
+        )
+        reader._executable = "wx"
+        payload = {
+            "messages": [
+                {
+                    "chat": chat,
+                    "username": username,
+                    "chat_type": chat_type,
+                    "timestamp": index,
+                    "sender": sender,
+                    "content": content,
+                    "type": "text",
+                }
+                for index, (chat, username, chat_type, sender, content) in enumerate(
+                    [
+                        ("無惧", "wxid_friend", "private", "", "私聊命中"),
+                        ("其他人", "wxid_other", "private", "", "私聊排除"),
+                        ("ChatGPT", "group@chatroom", "group", "张三", "群聊命中"),
+                        ("其他群", "other@chatroom", "group", "张三", "群聊排除"),
+                        ("ChatGPT", "official", "official_account", "", "公众号排除"),
+                    ],
+                    start=1,
+                )
+            ]
+        }
+
+        with patch(
+            "wechat_codex.wx_cli_reader.subprocess.run",
+            return_value=completed(payload),
+        ):
+            messages = reader.poll()
+
+        self.assertEqual(
+            [(message.conversation, message.chat_type, message.content) for message in messages],
+            [
+                ("無惧", "friend", "私聊命中"),
+                ("ChatGPT", "group", "群聊命中"),
+            ],
+        )
+
     def test_invalid_json_and_failed_command_are_reported(self) -> None:
         reader = WxCliReader(contact="無惧", chat_type="friend")
         reader._executable = "wx"

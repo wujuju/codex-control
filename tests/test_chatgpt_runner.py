@@ -15,7 +15,11 @@ from wechat_codex.chatgpt_runner import (
 
 
 class FakeSession:
-    def __init__(self, calls: list[tuple[str | None, str]], reply_number: int) -> None:
+    def __init__(
+        self,
+        calls: list[tuple[str | None, str, str | None]],
+        reply_number: int,
+    ) -> None:
         self.calls = calls
         self.reply_number = reply_number
 
@@ -25,8 +29,15 @@ class FakeSession:
     def __exit__(self, exc_type, exc, traceback) -> None:
         return None
 
-    def ask(self, conversation_url, prompt, timeout_seconds, stopped):
-        self.calls.append((conversation_url, prompt))
+    def ask(
+        self,
+        conversation_url,
+        prompt,
+        conversation_title,
+        timeout_seconds,
+        stopped,
+    ):
+        self.calls.append((conversation_url, prompt, conversation_title))
         return f"回复{self.reply_number}", (
             conversation_url or "https://chatgpt.com/c/web-conversation-1"
         )
@@ -34,7 +45,7 @@ class FakeSession:
 
 class FakeSessionFactory:
     def __init__(self) -> None:
-        self.calls: list[tuple[str | None, str]] = []
+        self.calls: list[tuple[str | None, str, str | None]] = []
         self.session_count = 0
 
     def __call__(self, profile_dir, browser_channel, headless, proxy_server):
@@ -185,7 +196,10 @@ class ChatGPTRunnerTests(unittest.TestCase):
             second.close()
 
             url = "https://chatgpt.com/c/web-conversation-1"
-            self.assertEqual(factory.calls, [(None, "第一问"), (url, "第二问")])
+            self.assertEqual(
+                factory.calls,
+                [(None, "第一问", None), (url, "第二问", None)],
+            )
             saved = json.loads(
                 (runtime_dir / "chatgpt_web_conversations.json").read_text(
                     encoding="utf-8"
@@ -227,7 +241,43 @@ class ChatGPTRunnerTests(unittest.TestCase):
             runner.close()
 
             self.assertEqual(factory.session_count, 1)
-            self.assertEqual(factory.calls, [(None, "第一问"), (None, "第二问")])
+            self.assertEqual(
+                factory.calls,
+                [(None, "第一问", None), (None, "第二问", None)],
+            )
+
+    def test_conversation_title_is_used_for_new_and_existing_web_chat(self) -> None:
+        with TemporaryDirectory() as directory:
+            factory = FakeSessionFactory()
+            runner = make_runner(Path(directory), factory)
+
+            self.assertTrue(
+                runner.begin_chat(
+                    "friend:無惧",
+                    "第一问",
+                    conversation_title="微信無惧",
+                )[0]
+            )
+            wait_until_idle(runner)
+            runner.drain_events()
+            self.assertTrue(
+                runner.begin_chat(
+                    "friend:無惧",
+                    "第二问",
+                    conversation_title="微信無惧",
+                )[0]
+            )
+            wait_until_idle(runner)
+            runner.close()
+
+            url = "https://chatgpt.com/c/web-conversation-1"
+            self.assertEqual(
+                factory.calls,
+                [
+                    (None, "第一问", "微信無惧"),
+                    (url, "第二问", "微信無惧"),
+                ],
+            )
 
     def test_only_chatgpt_conversation_urls_are_persisted(self) -> None:
         self.assertTrue(_is_chat_url("https://chatgpt.com/c/abc"))

@@ -26,12 +26,15 @@ class ReadMessagesTests(unittest.TestCase):
                 raise AssertionError("read command must never send")
 
         output = io.StringIO()
-        with patch("wechat_codex.cli._wechat_client", return_value=FakeClient()), patch(
-            "sys.stdout", output
-        ):
-            result = read_messages(SimpleNamespace(poll_seconds=1.0))
+        config = SimpleNamespace(poll_seconds=1.0)
+        with patch(
+            "wechat_codex.cli._wechat_client",
+            return_value=FakeClient(),
+        ) as client_factory, patch("sys.stdout", output):
+            result = read_messages(config)
 
         self.assertEqual(result, 0)
+        client_factory.assert_called_once_with(config, use_all_read_filters=True)
         self.assertEqual(calls, ["connect", "baseline", "poll"])
         self.assertIn("已忽略 4 条", output.getvalue())
         self.assertIn("已停止读取消息", output.getvalue())

@@ -173,7 +173,10 @@ class WeChatClient:
         message_source: str = "uia",
         wx_cli_path: str | None = None,
         wx_cli_username: str | None = None,
+        wx_cli_contacts: Iterable[str] | None = None,
+        wx_cli_groups: Iterable[str] | None = None,
         wx_cli_timeout_seconds: float = 30.0,
+        require_group_mention: bool = True,
     ) -> None:
         self.contact = contact
         self.background_mode = background_mode
@@ -185,12 +188,15 @@ class WeChatClient:
         self.chat_type = chat_type
         self.bot_name = bot_name
         self.message_source = message_source
+        self.require_group_mention = require_group_mention
         self._wx_cli_reader = (
             WxCliReader(
                 contact=contact,
                 chat_type=chat_type,
                 executable=wx_cli_path,
                 username=wx_cli_username,
+                contacts=wx_cli_contacts,
+                groups=wx_cli_groups,
                 timeout_seconds=wx_cli_timeout_seconds,
             )
             if message_source == "wx_cli"
@@ -859,9 +865,10 @@ class WeChatClient:
             content = raw.content
             sender = raw.sender
             if raw.chat_type == "group":
-                content = strip_required_group_mention(content, self.bot_name)
-                if content is None or not content:
-                    continue
+                if self.require_group_mention:
+                    content = strip_required_group_mention(content, self.bot_name)
+                    if content is None or not content:
+                        continue
             elif not sender or sender == "friend":
                 sender = self.contact
             incoming.append(

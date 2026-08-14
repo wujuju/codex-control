@@ -46,7 +46,11 @@ def _wechat_processes() -> list[str]:
     return result
 
 
-def _wechat_client(config: AppConfig) -> WeChatClient:
+def _wechat_client(
+    config: AppConfig,
+    *,
+    use_all_read_filters: bool = False,
+) -> WeChatClient:
     return WeChatClient(
         contact=config.contact,
         background_mode=config.background_mode,
@@ -60,7 +64,10 @@ def _wechat_client(config: AppConfig) -> WeChatClient:
         message_source=config.wechat_message_source,
         wx_cli_path=config.wx_cli_path,
         wx_cli_username=config.wx_cli_username,
+        wx_cli_contacts=config.wx_cli_contacts if use_all_read_filters else None,
+        wx_cli_groups=config.wx_cli_groups if use_all_read_filters else None,
         wx_cli_timeout_seconds=config.wx_cli_timeout_seconds,
+        require_group_mention=not use_all_read_filters,
     )
 
 
@@ -117,7 +124,7 @@ def doctor(config: AppConfig, connect: bool) -> int:
     print(f"[OK] 联系人：{config.contact}")
     if config.wechat_message_source == "wx_cli":
         try:
-            reader_check = _wechat_client(config)
+            reader_check = _wechat_client(config, use_all_read_filters=True)
             reader_check.connect()
             executable = reader_check._wx_cli_reader.executable
             print(f"[OK] wx-cli：{executable}")
@@ -151,7 +158,7 @@ def doctor(config: AppConfig, connect: bool) -> int:
 
 def read_messages(config: AppConfig) -> int:
     """Print new messages without starting ChatGPT or invoking WeChat send."""
-    client = _wechat_client(config)
+    client = _wechat_client(config, use_all_read_filters=True)
     client.connect()
     baseline_count = client.baseline()
     print(

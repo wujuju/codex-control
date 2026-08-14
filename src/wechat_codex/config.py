@@ -15,6 +15,8 @@ class AppConfig:
     wechat_message_source: str
     wx_cli_path: str | None
     wx_cli_username: str | None
+    wx_cli_contacts: tuple[str, ...]
+    wx_cli_groups: tuple[str, ...]
     wx_cli_timeout_seconds: float
     bot_name: str
     authorized_senders: frozenset[str]
@@ -24,11 +26,14 @@ class AppConfig:
     voice_retry_count: int
     response_prefix: str
     send_ready_message: bool
+    send_received_ack: bool
+    received_ack_text: str
     poll_seconds: float
     max_reply_chars: int
     chatgpt_browser_channel: str
     chatgpt_headless: bool
     chatgpt_proxy_server: str | None
+    chatgpt_conversation_title_prefix: str
     codex_command: str
     chat_timeout_seconds: int
     work_timeout_seconds: int
@@ -51,6 +56,18 @@ def _required_text(data: dict[str, Any], key: str) -> str:
     return value
 
 
+def _text_list(data: dict[str, Any], key: str) -> tuple[str, ...] | None:
+    if key not in data:
+        return None
+    values = data[key]
+    if isinstance(values, str):
+        values = [values]
+    if not isinstance(values, list):
+        raise ValueError(f"配置项 {key!r} 必须是名称列表")
+    result = tuple(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
+    return result
+
+
 def load_config(path: str | Path) -> AppConfig:
     source = Path(path).expanduser().resolve()
     if not source.is_file():
@@ -59,6 +76,8 @@ def load_config(path: str | Path) -> AppConfig:
     raw = yaml.safe_load(source.read_text(encoding="utf-8")) or {}
     if not isinstance(raw, dict):
         raise ValueError("配置文件顶层必须是 YAML 对象")
+
+    contact = _required_text(raw, "contact")
 
     project_values = raw.get("projects") or {}
     if not isinstance(project_values, dict) or not project_values:
@@ -95,6 +114,12 @@ def load_config(path: str | Path) -> AppConfig:
     response_prefix = str(raw.get("response_prefix", "[Codex助手] "))
     if not response_prefix:
         raise ValueError("response_prefix 不能为空，否则可能形成自动回复循环")
+    send_received_ack = bool(raw.get("send_received_ack", False))
+    received_ack_text = str(
+        raw.get("received_ack_text", "已收到，正在处理中，请稍等…")
+    ).strip()
+    if send_received_ack and not received_ack_text:
+        raise ValueError("启用 send_received_ack 时 received_ack_text 不能为空")
 
     chat_type = str(raw.get("chat_type", "friend")).strip().lower()
     if chat_type not in {"friend", "group", "auto"}:
@@ -107,6 +132,16 @@ def load_config(path: str | Path) -> AppConfig:
         raise ValueError("wechat_message_source 必须是 uia 或 wx_cli")
     wx_cli_path = str(raw.get("wx_cli_path", "")).strip() or None
     wx_cli_username = str(raw.get("wx_cli_username", "")).strip() or None
+    configured_contacts = _text_list(raw, "wx_cli_contacts")
+    configured_groups = _text_list(raw, "wx_cli_groups")
+    wx_cli_contacts = configured_contacts
+    wx_cli_groups = configured_groups
+    if wx_cli_contacts is None:
+        wx_cli_contacts = (contact,) if chat_type in {"friend", "auto"} else ()
+    if wx_cli_groups is None:
+        wx_cli_groups = (contact,) if chat_type in {"group", "auto"} else ()
+    if wechat_message_source == "wx_cli" and not (wx_cli_contacts or wx_cli_groups):
+        raise ValueError("wx_cli_contacts 和 wx_cli_groups 至少需要配置一个会话")
     wx_cli_timeout_seconds = float(raw.get("wx_cli_timeout_seconds", 30.0))
     if wx_cli_timeout_seconds < 1:
         raise ValueError("wx_cli_timeout_seconds 不能小于 1")
@@ -134,6 +169,11 @@ def load_config(path: str | Path) -> AppConfig:
     if proxy_value and "://" not in proxy_value:
         proxy_value = f"http://{proxy_value}"
     chatgpt_proxy_server = proxy_value or None
+    chatgpt_conversation_title_prefix = str(
+        raw.get("chatgpt_conversation_title_prefix", "微信")
+    ).strip()
+    if not chatgpt_conversation_title_prefix:
+        raise ValueError("chatgpt_conversation_title_prefix 不能为空")
 
     authorized_values = raw.get("authorized_senders", ["無惧"])
     if isinstance(authorized_values, str):
@@ -148,11 +188,13 @@ def load_config(path: str | Path) -> AppConfig:
 
     return AppConfig(
         source=source,
-        contact=_required_text(raw, "contact"),
+        contact=contact,
         chat_type=chat_type,
         wechat_message_source=wechat_message_source,
         wx_cli_path=wx_cli_path,
         wx_cli_username=wx_cli_username,
+        wx_cli_contacts=wx_cli_contacts,
+        wx_cli_groups=wx_cli_groups,
         wx_cli_timeout_seconds=wx_cli_timeout_seconds,
         bot_name=bot_name,
         authorized_senders=authorized_senders,
@@ -162,11 +204,14 @@ def load_config(path: str | Path) -> AppConfig:
         voice_retry_count=voice_retry_count,
         response_prefix=response_prefix,
         send_ready_message=bool(raw.get("send_ready_message", True)),
+        send_received_ack=send_received_ack,
+        received_ack_text=received_ack_text,
         poll_seconds=poll_seconds,
         max_reply_chars=max_reply_chars,
         chatgpt_browser_channel=chatgpt_browser_channel,
         chatgpt_headless=bool(raw.get("chatgpt_headless", True)),
         chatgpt_proxy_server=chatgpt_proxy_server,
+        chatgpt_conversation_title_prefix=chatgpt_conversation_title_prefix,
         codex_command=_required_text(raw, "codex_command")
         if "codex_command" in raw
         else "codex",

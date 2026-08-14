@@ -51,6 +51,7 @@ class BrowserSession(Protocol):
         self,
         conversation_url: str | None,
         prompt: str,
+        conversation_title: str | None,
         timeout_seconds: int,
         stopped: Callable[[], bool],
     ) -> tuple[str, str]: ...
@@ -83,6 +84,7 @@ class _ChatJob:
     session_key: str
     prompt: str
     conversation_url: str | None
+    conversation_title: str | None
 
 
 def _read_account_state(page: Any) -> _AccountState:
@@ -190,6 +192,7 @@ class PlaywrightChatSession:
         self,
         conversation_url: str | None,
         prompt: str,
+        conversation_title: str | None,
         timeout_seconds: int,
         stopped: Callable[[], bool],
     ) -> tuple[str, str]:
@@ -228,7 +231,96 @@ class PlaywrightChatSession:
             stopped,
         )
         conversation_url = self._wait_for_conversation_url(page)
+        if conversation_title:
+            try:
+                self._rename_conversation(page, conversation_url, conversation_title)
+            except Exception as exc:
+                log.warning(
+                    "ChatGPT 对话已创建并可继续使用，但标题更新失败（%s）：%s",
+                    conversation_title,
+                    exc,
+                )
         return text, conversation_url
+
+    @staticmethod
+    def _rename_conversation(page: Any, conversation_url: str, title: str) -> None:
+        """Rename the current web conversation through ChatGPT's visible UI."""
+        from urllib.parse import urlparse
+
+        cleaned = " ".join(title.split()).strip()[:80]
+        if not cleaned:
+            return
+        path = urlparse(conversation_url).path
+        if not path:
+            raise RuntimeError("无法从对话地址确定侧边栏项目")
+
+        anchor = page.locator(f'a[href="{path}"]')
+        if anchor.count() == 0:
+            sidebar_button = page.locator(
+                'button[data-testid="open-sidebar-button"], '
+                'button[aria-label*="sidebar" i], '
+                'button[aria-label*="边栏"]'
+            ).first
+            if sidebar_button.count() and sidebar_button.is_visible(timeout=500):
+                sidebar_button.click()
+                page.wait_for_timeout(300)
+                anchor = page.locator(f'a[href="{path}"]')
+        deadline = time.monotonic() + 5
+        while anchor.count() == 0 and time.monotonic() < deadline:
+            page.wait_for_timeout(250)
+            anchor = page.locator(f'a[href="{path}"]')
+        if anchor.count() == 0:
+            raise RuntimeError("侧边栏中找不到当前 ChatGPT 对话")
+
+        anchor = anchor.first
+        try:
+            current_text = " ".join(anchor.inner_text(timeout=1_000).split())
+        except Exception:
+            current_text = ""
+        if current_text == cleaned:
+            return
+
+        anchor.hover()
+        row = anchor.locator(
+            "xpath=ancestor::*[self::li or @data-testid][1]"
+        )
+        if row.count() == 0:
+            row = anchor.locator("xpath=..")
+        options = row.locator(
+            'button[aria-label*="option" i], '
+            'button[aria-label*="more" i], '
+            'button[aria-label*="选项"], '
+            'button[aria-label*="更多"], '
+            'button[data-testid*="menu"]'
+        )
+        if options.count() == 0:
+            options = row.locator("button")
+        if options.count() == 0:
+            raise RuntimeError("找不到 ChatGPT 对话选项按钮")
+        options.last.click()
+
+        rename_pattern = re.compile(r"^(?:Rename|重命名|重新命名)$", re.IGNORECASE)
+        rename_item = page.get_by_role("menuitem", name=rename_pattern)
+        if rename_item.count() == 0:
+            rename_item = page.get_by_text(rename_pattern)
+        if rename_item.count() == 0:
+            raise RuntimeError("找不到 ChatGPT 对话重命名菜单")
+        rename_item.last.click()
+
+        editor = page.locator(
+            '[role="dialog"] input, '
+            'input[data-testid*="rename"], '
+            'input[aria-label*="rename" i], '
+            'input[aria-label*="重命名"]'
+        )
+        if editor.count() == 0:
+            editor = row.locator("input")
+        if editor.count() == 0:
+            raise RuntimeError("找不到 ChatGPT 对话标题输入框")
+        editor = editor.last
+        editor.wait_for(state="visible", timeout=3_000)
+        editor.fill(cleaned)
+        editor.press("Enter")
 
     @staticmethod
     def _navigate(page: Any, url: str, timeout_seconds: int) -> None:
@@ -406,7 +498,12 @@ class ChatGPTRunner:
             detail = str(self._startup_error).strip() or type(self._startup_error).__name__
             raise RuntimeError(f"ChatGPT 专用浏览器启动失败：{detail}")
 
-    def begin_chat(self, session_key: str, prompt: str) -> tuple[bool, str]:
+    def begin_chat(
+        self,
+        session_key: str,
+        prompt: str,
+        conversation_title: str | None = None,
+    ) -> tuple[bool, str]:
         try:
             self.start()
         except RuntimeError as exc:
@@ -427,6 +524,7 @@ class ChatGPTRunner:
                 session_key=session_key,
                 prompt=prompt,
                 conversation_url=conversation_url,
+                conversation_title=conversation_title,
             )
         )
         return True, "已开始 ChatGPT Plus 网页请求"
@@ -477,6 +575,7 @@ class ChatGPTRunner:
             text, new_url = session.ask(
                 job.conversation_url,
                 job.prompt,
+                job.conversation_title,
                 self.timeout_seconds,
                 self._stopped,
             )

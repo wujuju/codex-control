@@ -7,7 +7,7 @@ import subprocess
 from collections import Counter, deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 
 class WxCliUnavailable(RuntimeError):
@@ -44,12 +44,32 @@ class WxCliReader:
         chat_type: str,
         executable: str | None = None,
         username: str | None = None,
+        contacts: Iterable[str] | None = None,
+        groups: Iterable[str] | None = None,
         timeout_seconds: float = 30.0,
     ) -> None:
         self.contact = contact.strip()
         self.chat_type = chat_type
         self.configured_executable = (executable or "").strip() or None
         self.username = (username or "").strip() or None
+        if contacts is None and groups is None:
+            self.contacts = (
+                frozenset({self.contact})
+                if chat_type in {"friend", "auto"}
+                else frozenset()
+            )
+            self.groups = (
+                frozenset({self.contact})
+                if chat_type in {"group", "auto"}
+                else frozenset()
+            )
+        else:
+            self.contacts = frozenset(
+                str(value).strip() for value in contacts or () if str(value).strip()
+            )
+            self.groups = frozenset(
+                str(value).strip() for value in groups or () if str(value).strip()
+            )
         self.timeout_seconds = timeout_seconds
         self._executable: str | None = None
         self._seen_order: deque[str] = deque()
@@ -181,21 +201,19 @@ class WxCliReader:
         raise WxCliReadError("wx-cli JSON 中缺少 messages 数组")
 
     def _matches_target(self, raw: dict[str, Any]) -> bool:
-        if self.username:
-            if str(raw.get("username", "")).strip() != self.username:
-                return False
-        elif str(raw.get("chat", "")).strip() != self.contact:
-            return False
-
+        chat = str(raw.get("chat", "")).strip()
         raw_type = str(raw.get("chat_type", "")).strip().lower()
         if not raw_type:
             raw_type = "group" if bool(raw.get("is_group")) else "private"
         elif raw_type == "friend":
             raw_type = "private"
-        expected = {"friend": "private", "group": "group"}.get(self.chat_type)
-        if expected is None:
-            return raw_type in {"private", "group"}
-        return raw_type == expected
+        if raw_type == "group":
+            return chat in self.groups
+        if raw_type != "private" or chat not in self.contacts:
+            return False
+        if self.username and chat == self.contact:
+            return str(raw.get("username", "")).strip() == self.username
+        return True
 
     def _normalize(
         self,
