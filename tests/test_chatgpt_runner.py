@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import time
@@ -12,6 +13,7 @@ from wechat_codex.chatgpt_runner import (
     PlaywrightChatSession,
     STOP_SELECTOR,
     _is_chat_url,
+    _persistent_context_options,
     _read_account_state,
 )
 
@@ -20,10 +22,14 @@ class FakeSession:
     def __init__(
         self,
         calls: list[tuple[str | None, str, str | None]],
+        image_calls: list[tuple[Path, ...]],
         reply_number: int,
+        reply_images: tuple[Path, ...],
     ) -> None:
         self.calls = calls
+        self.image_calls = image_calls
         self.reply_number = reply_number
+        self.reply_images = reply_images
 
     def __enter__(self):
         return self
@@ -38,21 +44,30 @@ class FakeSession:
         conversation_title,
         timeout_seconds,
         stopped,
+        image_paths,
     ):
         self.calls.append((conversation_url, prompt, conversation_title))
+        self.image_calls.append(image_paths)
         return f"回复{self.reply_number}", (
             conversation_url or "https://chatgpt.com/c/web-conversation-1"
-        )
+        ), self.reply_images
 
 
 class FakeSessionFactory:
     def __init__(self) -> None:
         self.calls: list[tuple[str | None, str, str | None]] = []
+        self.image_calls: list[tuple[Path, ...]] = []
         self.session_count = 0
+        self.reply_images: tuple[Path, ...] = ()
 
     def __call__(self, profile_dir, browser_channel, headless, proxy_server):
         self.session_count += 1
-        return FakeSession(self.calls, self.session_count)
+        return FakeSession(
+            self.calls,
+            self.image_calls,
+            self.session_count,
+            self.reply_images,
+        )
 
 
 class FakeProfile:
@@ -178,6 +193,58 @@ def make_runner(runtime_dir: Path, factory: FakeSessionFactory) -> ChatGPTRunner
 
 
 class ChatGPTRunnerTests(unittest.TestCase):
+    def test_reply_image_paths_are_exposed_on_chat_event(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            reply_image = root / "chatgpt-reply.png"
+            reply_image.write_bytes(b"reply-image")
+            factory = FakeSessionFactory()
+            factory.reply_images = (reply_image,)
+            runner = make_runner(root, factory)
+
+            self.assertTrue(runner.begin_chat("friend:测试", "生成图片")[0])
+            wait_until_idle(runner)
+            events = runner.drain_events()
+            runner.close()
+
+            self.assertEqual(events[0].text, "回复1")
+            self.assertEqual(events[0].image_paths, (str(reply_image),))
+
+    def test_image_path_is_forwarded_to_browser_session(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            image = root / "wechat.png"
+            image.write_bytes(b"image")
+            factory = FakeSessionFactory()
+            runner = make_runner(root, factory)
+
+            self.assertTrue(
+                runner.begin_chat("friend:测试", "分析图片", image_paths=(image,))[0]
+            )
+            wait_until_idle(runner)
+            runner.close()
+
+            self.assertEqual(factory.image_calls, [(image.resolve(),)])
+
+    def test_hidden_browser_uses_native_hidden_window_on_windows(self) -> None:
+        options, hide_native_window = _persistent_context_options(
+            Path("profile"),
+            "chrome",
+            "socks5://127.0.0.1:7890",
+            hide_window=True,
+        )
+
+        if os.name == "nt":
+            self.assertFalse(options["headless"])
+            self.assertTrue(hide_native_window)
+            self.assertIn("--window-position=-32000,-32000", options["args"])
+        else:
+            self.assertTrue(options["headless"])
+            self.assertFalse(hide_native_window)
+        self.assertEqual(
+            options["proxy"], {"server": "socks5://127.0.0.1:7890"}
+        )
+
     def test_anonymous_composer_is_not_treated_as_logged_in(self) -> None:
         state = _read_account_state(
             FakeAccountPage(

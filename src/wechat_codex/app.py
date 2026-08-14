@@ -108,7 +108,12 @@ class BridgeApp:
         self.wechat.send(text, target)
         self._emit_event("outgoing", "微信 Bot", text)
 
-    def _send_event(self, text: str, session_key: str | None) -> None:
+    def _send_event(
+        self,
+        text: str,
+        session_key: str | None,
+        image_paths: tuple[str, ...] = (),
+    ) -> None:
         target = self._reply_targets.get(session_key or "")
         if target is None:
             try:
@@ -116,7 +121,11 @@ class BridgeApp:
             except Exception:
                 log.error("异步回复缺少可用的 iLink 目标，已丢弃：%s", text)
                 return
-        self._send(text, target)
+        if text.strip():
+            self._send(text, target)
+        for image_path in image_paths:
+            self.wechat.send_image(image_path, target)
+            self._emit_event("outgoing", "微信 Bot", "[图片]")
 
     def _listen(self) -> None:
         consecutive_errors = 0
@@ -132,7 +141,11 @@ class BridgeApp:
                 for event in self.runner.drain_events():
                     self._send_event(event.text, event.session_key)
                 for event in self.chat_runner.drain_events():
-                    self._send_event(event.text, event.session_key)
+                    self._send_event(
+                        event.text,
+                        event.session_key,
+                        event.image_paths,
+                    )
 
                 for message in self.wechat.poll():
                     try:
@@ -166,10 +179,17 @@ class BridgeApp:
         if not self._is_allowed(message.sender_id):
             log.warning("忽略未授权的 iLink 消息发送者：%s", message.sender_id)
             return
+        target = message.reply_target
+        if message.image_item is not None:
+            try:
+                message = self.wechat.materialize_image(message)
+            except ILinkError as exc:
+                log.warning("接收微信图片失败：%s", exc)
+                self._send(f"图片接收失败，请重新发送（{exc}）", target)
+                return
         log.info("收到 iLink 消息（%s）：%s", message.sender_id, message.content)
         self._emit_event("incoming", message.sender, message.content)
         session_key = self._chat_session_key(message)
-        target = message.reply_target
         self._reply_targets[session_key] = target
         self._acknowledge(message, target)
         self._handle(message, target, session_key)
@@ -245,10 +265,14 @@ class BridgeApp:
         if self.runner.active:
             self._send("Codex 任务正在执行，请发送“状态”或“停止”", target)
             return
+        prompt = route.prompt
+        if message.image_path and prompt == "[图片]":
+            prompt = "请分析这张图片，并说明你看到了什么。"
         ok, response = self.chat_runner.begin_chat(
             session_key,
-            route.prompt,
+            prompt,
             conversation_title=self._chat_conversation_title(message),
+            image_paths=(message.image_path,) if message.image_path else (),
         )
         if not ok:
             self._send(response, target)

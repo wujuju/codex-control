@@ -149,7 +149,7 @@ def load_config(path: str | Path) -> AppConfig:
         poll_seconds=poll_seconds,
         max_reply_chars=max_reply_chars,
         chatgpt_browser_channel=browser_channel,
-        chatgpt_headless=bool(raw.get("chatgpt_headless", False)),
+        chatgpt_headless=bool(raw.get("chatgpt_headless", True)),
         chatgpt_proxy_server=proxy_value or None,
         chatgpt_conversation_title=conversation_title,
         codex_command=_required_text(raw, "codex_command")

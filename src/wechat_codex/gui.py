@@ -18,8 +18,10 @@ from PySide6.QtCore import (
     Signal,
     Slot,
 )
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap, QWindow
 from PySide6.QtQml import QQmlApplicationEngine
+from PySide6.QtQuickControls2 import QQuickStyle
+from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 from .app import BridgeApp
 from .config import AppConfig, load_config
@@ -268,6 +270,105 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _install_system_tray(
+    app: QApplication, window: QWindow
+) -> QSystemTrayIcon | None:
+    """Hide minimized windows from the taskbar and provide a restore path."""
+    if not QSystemTrayIcon.isSystemTrayAvailable():
+        log.warning("系统托盘不可用；最小化后仍会显示在任务栏")
+        return None
+
+    icon = _create_app_icon()
+    app.setWindowIcon(icon)
+    window.setIcon(icon)
+    app.setQuitOnLastWindowClosed(False)
+
+    tray = QSystemTrayIcon(icon, app)
+    tray.setToolTip("微信 Codex 控制台")
+    menu = QMenu()
+    show_action = menu.addAction("显示窗口")
+    quit_action = menu.addAction("退出")
+    tray.setContextMenu(menu)
+
+    notification_shown = False
+
+    def show_window() -> None:
+        tray.show()
+        window.showNormal()
+        window.raise_()
+        window.requestActivate()
+
+    def handle_activation(reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason in {
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        }:
+            show_window()
+
+    def handle_visibility(visibility: QWindow.Visibility) -> None:
+        nonlocal notification_shown
+        if visibility == QWindow.Visibility.Minimized:
+            tray.show()
+            if not notification_shown:
+                tray.showMessage(
+                    "微信 Codex 控制台",
+                    "程序仍在后台运行，双击托盘图标可重新打开界面。",
+                    QSystemTrayIcon.MessageIcon.Information,
+                    3000,
+                )
+                notification_shown = True
+            QTimer.singleShot(0, window.hide)
+
+    show_action.triggered.connect(show_window)
+    quit_action.triggered.connect(app.quit)
+    tray.activated.connect(handle_activation)
+    window.visibilityChanged.connect(handle_visibility)
+    tray.show()
+    app.processEvents()
+    log.info("系统托盘图标已显示；最小化后可双击恢复窗口")
+
+    # Keep Python callbacks and the menu alive for as long as the tray icon.
+    tray._menu = menu  # type: ignore[attr-defined]
+    tray._show_window = show_window  # type: ignore[attr-defined]
+    tray._handle_activation = handle_activation  # type: ignore[attr-defined]
+    tray._handle_visibility = handle_visibility  # type: ignore[attr-defined]
+    return tray
+
+
+def _create_app_icon() -> QIcon:
+    """Load icon.png, with a generated icon as a safe fallback."""
+    candidates = (
+        Path.cwd() / "icon.png",
+        Path(__file__).resolve().parents[2] / "icon.png",
+        Path(sys.executable).resolve().parent / "icon.png",
+    )
+    for path in dict.fromkeys(candidates):
+        if not path.is_file():
+            continue
+        icon = QIcon(str(path))
+        if not icon.isNull() and not icon.pixmap(32, 32).isNull():
+            log.info("使用应用图标：%s", path)
+            return icon
+        log.warning("无法读取应用图标：%s", path)
+
+    log.warning("找不到可用的 icon.png，改用内置托盘图标")
+    pixmap = QPixmap(64, 64)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor("#2f7df6"))
+    painter.drawRoundedRect(4, 6, 56, 46, 14, 14)
+    painter.setBrush(QColor("#ffffff"))
+    painter.drawEllipse(17, 26, 7, 7)
+    painter.drawEllipse(29, 26, 7, 7)
+    painter.drawEllipse(41, 26, 7, 7)
+    painter.setBrush(QColor("#22c55e"))
+    painter.drawEllipse(43, 43, 17, 17)
+    painter.end()
+    return QIcon(pixmap)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     config = load_config(args.config)
@@ -283,7 +384,8 @@ def main(argv: list[str] | None = None) -> int:
         ],
     )
 
-    app = QGuiApplication(sys.argv[:1])
+    QQuickStyle.setStyle("Basic")
+    app = QApplication(sys.argv[:1])
     app.setApplicationName("WeChat Codex Control")
     app.setOrganizationName("Sam")
 
@@ -301,10 +403,18 @@ def main(argv: list[str] | None = None) -> int:
     engine.load(qml_path.as_uri())
     if not engine.rootObjects():
         return 1
+    window = engine.rootObjects()[0]
+    if not isinstance(window, QWindow):
+        log.error("QML 根对象不是窗口")
+        return 1
+    tray = _install_system_tray(app, window)
 
     app.aboutToQuit.connect(controller.shutdown)
     QTimer.singleShot(0, controller.startBridge)
-    return app.exec()
+    exit_code = app.exec()
+    if tray is not None:
+        tray.hide()
+    return exit_code
 
 
 if __name__ == "__main__":

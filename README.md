@@ -91,7 +91,7 @@ ChatGPT 网页对话使用固定标题，可直接修改：
 chatgpt_conversation_title: "微信助手"
 ```
 
-标题会在下一次成功回复后同步到对应的 ChatGPT 对话。语音消息使用 iLink 提供的 `voice_item.text` 转写原文；没有转写文本的音频不会发送给 ChatGPT。
+标题会在下一次成功回复后同步到对应的 ChatGPT 对话。微信图片会从官方 CDN 下载、解密并上传到 ChatGPT，缓存位于 `.runtime/inbound-images/`；ChatGPT 回复中的图片也会被保存、加密上传到微信 CDN，再作为原生图片消息发回微信，缓存位于 `.runtime/chatgpt-images/`。单张图片限制为 20 MB。语音消息使用 iLink 提供的 `voice_item.text` 转写原文；没有转写文本的音频不会发送给 ChatGPT。
 
 ## 启动
 

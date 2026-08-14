@@ -9,7 +9,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -43,10 +43,24 @@ class IncomingMessage:
     reply_to: str = ""
     context_token: str = ""
     account_id: str = ""
+    image_item: dict[str, Any] | None = None
+    image_path: str = ""
 
     @property
     def reply_target(self) -> ReplyTarget:
         return ReplyTarget(self.reply_to or self.sender_id, self.context_token)
+
+
+def _image_suffix(data: bytes) -> str:
+    if data.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return ".gif"
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return ".webp"
+    raise ILinkProtocolError("微信图片格式不是受支持的 JPEG、PNG、GIF 或 WebP")
 
 
 def split_text(text: str, limit: int) -> list[str]:
@@ -142,6 +156,7 @@ class ILinkClient:
         self._api: ILinkAPI | None = None
         self._credentials = None
         self._worker_error: BaseException | None = None
+        self._inbound_image_dir = state_path.parent / "inbound-images"
 
     @property
     def account_id(self) -> str:
@@ -274,6 +289,59 @@ class ILinkClient:
                 }
             )
 
+    def send_image(
+        self,
+        image_path: str | Path,
+        target: ReplyTarget | None = None,
+    ) -> None:
+        api = self._api
+        if api is None:
+            self.connect()
+            api = self._api
+        assert api is not None
+        resolved = target or self.default_target()
+        path = Path(image_path).expanduser().resolve()
+        if not path.is_file():
+            raise ILinkProtocolError(f"待发送的图片不存在：{path}")
+        image_item = api.upload_image(path.read_bytes(), resolved.user_id)
+        api.send_message(
+            {
+                "from_user_id": "",
+                "to_user_id": resolved.user_id,
+                "client_id": f"wechat-codex:{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}",
+                "message_type": 2,
+                "message_state": 2,
+                "context_token": resolved.context_token or None,
+                "item_list": [{"type": 2, "image_item": image_item}],
+            }
+        )
+
+    def materialize_image(self, message: IncomingMessage) -> IncomingMessage:
+        if message.image_path or message.image_item is None:
+            return message
+        api = self._api
+        if api is None:
+            raise ILinkProtocolError("iLink 尚未连接，无法下载微信图片")
+
+        data = api.download_image(message.image_item)
+        suffix = _image_suffix(data)
+        digest = hashlib.sha256(message.key.encode("utf-8")).hexdigest()[:24]
+        self._inbound_image_dir.mkdir(parents=True, exist_ok=True)
+        destination = self._inbound_image_dir / f"{digest}{suffix}"
+        temporary = destination.with_suffix(destination.suffix + ".tmp")
+        temporary.write_bytes(data)
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, destination)
+        updated = replace(message, image_path=str(destination.resolve()))
+
+        with self._lock:
+            self._state["pending"] = [
+                asdict(updated) if str(value.get("key")) == message.key else value
+                for value in self._state["pending"]
+            ]
+            self._store.save(self._state)
+        return updated
+
     def _poll_loop(self) -> None:
         assert self._api is not None
         timeout = self.long_poll_timeout_seconds
@@ -335,12 +403,23 @@ class ILinkClient:
         sender_id = str(raw.get("from_user_id") or "").strip()
         if not sender_id:
             return None
+        identity = raw.get("message_id") or raw.get("seq") or raw.get("client_id")
+        if identity in (None, ""):
+            encoded = json.dumps(raw, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            identity = hashlib.sha256(encoded).hexdigest()
         parts: list[str] = []
+        image_item: dict[str, Any] | None = None
         for item in raw.get("item_list") or []:
             if not isinstance(item, dict):
                 continue
             if item.get("type") == 1:
                 text = (item.get("text_item") or {}).get("text")
+            elif item.get("type") == 2:
+                candidate = item.get("image_item")
+                if image_item is None and isinstance(candidate, dict):
+                    image_item = candidate
+                    parts.append("[图片]")
+                text = None
             elif item.get("type") == 3:
                 text = (item.get("voice_item") or {}).get("text")
             else:
@@ -350,10 +429,6 @@ class ILinkClient:
         content = "\n".join(parts).strip()
         if not content:
             return None
-        identity = raw.get("message_id") or raw.get("seq") or raw.get("client_id")
-        if identity in (None, ""):
-            encoded = json.dumps(raw, ensure_ascii=False, sort_keys=True).encode("utf-8")
-            identity = hashlib.sha256(encoded).hexdigest()
         return IncomingMessage(
             key=f"ilink:{identity}",
             content=content,
@@ -363,6 +438,7 @@ class ILinkClient:
             reply_to=sender_id,
             context_token=str(raw.get("context_token") or ""),
             account_id=self.account_id,
+            image_item=image_item,
         )
 
     @staticmethod
@@ -372,8 +448,12 @@ class ILinkClient:
             return None
         allowed = IncomingMessage.__dataclass_fields__
         try:
-            return IncomingMessage(**{
+            values = {
                 name: value for name, value in raw.items() if name in allowed
-            })
+            }
+            image_item = values.get("image_item")
+            if image_item is not None and not isinstance(image_item, dict):
+                values["image_item"] = None
+            return IncomingMessage(**values)
         except TypeError:
             return None

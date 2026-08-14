@@ -15,7 +15,8 @@ poll_seconds: 0.5
 max_reply_chars: 1800
 
 chatgpt_browser_channel: "chrome"
-chatgpt_headless: false
+# Windows 下使用隐藏的普通浏览器窗口，兼容 ChatGPT 登录态。
+chatgpt_headless: true
 # 留空时使用系统网络设置；例如 http://127.0.0.1:7890
 chatgpt_proxy_server: ""
 # ChatGPT 网页对话使用的完整固定标题。

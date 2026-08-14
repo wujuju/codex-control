@@ -14,7 +14,7 @@ poll_seconds: 0.5
 max_reply_chars: 1800
 
 chatgpt_browser_channel: "chrome"
-chatgpt_headless: false
+chatgpt_headless: true
 chatgpt_proxy_server: "socks5://127.0.0.1:7890"
 chatgpt_conversation_title: "微信助手"
 chat_timeout_seconds: 180

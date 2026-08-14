@@ -26,7 +26,7 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.ilink_codex_user_ids, frozenset())
             self.assertTrue(config.send_received_ack)
             self.assertEqual(config.chatgpt_browser_channel, "chrome")
-            self.assertFalse(config.chatgpt_headless)
+            self.assertTrue(config.chatgpt_headless)
             self.assertEqual(config.chatgpt_conversation_title, "微信助手")
             self.assertEqual(config.projects["demo"], (root / "repo").resolve())
 

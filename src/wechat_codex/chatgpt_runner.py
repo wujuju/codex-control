@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
 import os
@@ -7,6 +9,7 @@ import queue
 import re
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,8 +32,124 @@ STOP_SELECTOR = (
     'button[data-testid="stop-button"], '
     'button[data-testid="composer-stop-button"]'
 )
+FILE_INPUT_SELECTOR = 'input[type="file"]'
 ASSISTANT_SELECTOR = '[data-message-author-role="assistant"]'
 ASSISTANT_FALLBACK_SELECTOR = 'article[data-turn="assistant"]'
+GENERATED_IMAGE_SELECTOR = (
+    'main img[alt^="Generated image" i], '
+    'main img[alt*="生成"], '
+    'main img[src*="/backend-api/estuary/content"], '
+    'main img[src*="oaiusercontent.com"]'
+)
+MAX_REPLY_IMAGE_BYTES = 20 * 1024 * 1024
+IMAGE_METADATA_SCRIPT = """img => {
+    const box = img.getBoundingClientRect();
+    const style = getComputedStyle(img);
+    const source = img.currentSrc || img.src || '';
+    const turn = img.closest('[data-testid^="conversation-turn-"]');
+    const userTurn = Boolean(
+        turn && turn.querySelector('[data-message-author-role="user"]')
+    );
+    return {
+        source,
+        userTurn,
+        usable: Boolean(
+            source && img.naturalWidth >= 128 && img.naturalHeight >= 128 &&
+            box.width > 0 && box.height > 0 && style.visibility !== 'hidden' &&
+            style.display !== 'none'
+        )
+    };
+}"""
+
+
+def _persistent_context_options(
+    profile_dir: Path,
+    browser_channel: str,
+    proxy_server: str | None,
+    *,
+    hide_window: bool,
+) -> tuple[dict[str, Any], bool]:
+    """Build launch options, using a hidden headful window on Windows.
+
+    ChatGPT may treat Chrome's real headless mode as logged out even when the
+    persistent profile is valid. An off-screen headful window keeps normal
+    Chrome behavior; the native window is hidden immediately after launch.
+    """
+    hide_native_window = hide_window and os.name == "nt"
+    options: dict[str, Any] = {
+        "user_data_dir": str(profile_dir),
+        "channel": browser_channel,
+        "headless": hide_window and not hide_native_window,
+        "viewport": {"width": 1280, "height": 900},
+    }
+    if hide_native_window:
+        options["args"] = [
+            "--window-position=-32000,-32000",
+            "--window-size=1280,900",
+        ]
+    if proxy_server:
+        options["proxy"] = {"server": proxy_server}
+    return options, hide_native_window
+
+
+def _hide_native_browser_window(page: Any) -> bool:
+    """Hide the Chrome window containing *page* without affecting rendering."""
+    if os.name != "nt":
+        return False
+
+    import ctypes
+    from ctypes import wintypes
+
+    token = f"wechat-codex-hidden-{os.getpid()}-{time.monotonic_ns()}"
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    enum_callback = ctypes.WINFUNCTYPE(
+        wintypes.BOOL, wintypes.HWND, wintypes.LPARAM
+    )
+    user32.EnumWindows.argtypes = [enum_callback, wintypes.LPARAM]
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+    user32.GetWindowTextLengthW.restype = ctypes.c_int
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowTextW.restype = ctypes.c_int
+    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.ShowWindow.restype = wintypes.BOOL
+
+    deadline = time.monotonic() + 5
+    title_set = False
+    while time.monotonic() < deadline:
+        if not title_set:
+            try:
+                page.evaluate("title => document.title = title", token)
+                title_set = True
+            except Exception:
+                page.wait_for_timeout(50)
+                continue
+
+        found = False
+
+        @enum_callback
+        def find_window(hwnd: int, _lparam: int) -> bool:
+            nonlocal found
+            length = user32.GetWindowTextLengthW(hwnd)
+            if length <= 0:
+                return True
+            buffer = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buffer, len(buffer))
+            if token not in buffer.value:
+                return True
+            user32.ShowWindow(hwnd, 0)  # SW_HIDE
+            found = True
+            return False
+
+        user32.EnumWindows(find_window, 0)
+        if found:
+            return True
+        page.wait_for_timeout(50)
+
+    log.warning("未找到需要隐藏的 Chrome 窗口；窗口已移到屏幕外")
+    return False
+
+
 class ChatStopped(RuntimeError):
     pass
 
@@ -47,7 +166,8 @@ class BrowserSession(Protocol):
         conversation_title: str | None,
         timeout_seconds: int,
         stopped: Callable[[], bool],
-    ) -> tuple[str, str]: ...
+        image_paths: tuple[Path, ...],
+    ) -> tuple[str, str, tuple[Path, ...]]: ...
 
 
 SessionFactory = Callable[[Path, str, bool, str | None], BrowserSession]
@@ -57,6 +177,7 @@ SessionFactory = Callable[[Path, str, bool, str | None], BrowserSession]
 class ChatEvent:
     text: str
     session_key: str | None = None
+    image_paths: tuple[str, ...] = ()
 
 
 @dataclass
@@ -79,6 +200,7 @@ class _ChatJob:
     prompt: str
     conversation_url: str | None
     conversation_title: str | None
+    image_paths: tuple[Path, ...]
 
 
 def _read_account_state(page: Any) -> _AccountState:
@@ -145,14 +267,12 @@ class PlaywrightChatSession:
         self.profile_dir.mkdir(parents=True, exist_ok=True)
         self._playwright = sync_playwright().start()
         try:
-            launch_options: dict[str, Any] = {
-                "user_data_dir": str(self.profile_dir),
-                "channel": self.channel,
-                "headless": self.headless,
-                "viewport": {"width": 1280, "height": 900},
-            }
-            if self.proxy_server:
-                launch_options["proxy"] = {"server": self.proxy_server}
+            launch_options, hide_native_window = _persistent_context_options(
+                self.profile_dir,
+                self.channel,
+                self.proxy_server,
+                hide_window=self.headless,
+            )
             self._context = self._playwright.chromium.launch_persistent_context(
                 **launch_options
             )
@@ -162,6 +282,8 @@ class PlaywrightChatSession:
                 if self._context.pages
                 else self._context.new_page()
             )
+            if hide_native_window:
+                _hide_native_browser_window(self._page)
             self._navigate(self._page, CHATGPT_HOME, 60)
             return self
         except Exception:
@@ -189,7 +311,8 @@ class PlaywrightChatSession:
         conversation_title: str | None,
         timeout_seconds: int,
         stopped: Callable[[], bool],
-    ) -> tuple[str, str]:
+        image_paths: tuple[Path, ...],
+    ) -> tuple[str, str, tuple[Path, ...]]:
         page = self._page
         if page is None:
             raise RuntimeError("ChatGPT 浏览器尚未启动")
@@ -212,10 +335,13 @@ class PlaywrightChatSession:
             f"{ASSISTANT_SELECTOR}, {ASSISTANT_FALLBACK_SELECTOR}"
         )
         previous_count = assistant_messages.count()
+        if image_paths:
+            self._upload_images(page, image_paths)
+        baseline_image_sources = self._generated_image_sources(page)
         composer.fill(prompt)
         send_button = page.locator(SEND_SELECTOR).first
-        send_button.wait_for(state="visible", timeout=5_000)
-        send_button.click()
+        send_button.wait_for(state="visible", timeout=30_000)
+        send_button.click(timeout=30_000)
 
         text = self._wait_for_reply(
             page,
@@ -223,6 +349,13 @@ class PlaywrightChatSession:
             previous_count,
             timeout_seconds,
             stopped,
+            baseline_image_sources,
+        )
+        reply = assistant_messages.nth(assistant_messages.count() - 1)
+        image_paths = self._save_reply_images(
+            page,
+            reply,
+            baseline_image_sources,
         )
         conversation_url = self._wait_for_conversation_url(page)
         if conversation_title:
@@ -234,7 +367,24 @@ class PlaywrightChatSession:
                     conversation_title,
                     exc,
                 )
-        return text, conversation_url
+        return text, conversation_url, image_paths
+
+    @staticmethod
+    def _upload_images(page: Any, image_paths: tuple[Path, ...]) -> None:
+        missing = [str(path) for path in image_paths if not path.is_file()]
+        if missing:
+            raise RuntimeError(f"待上传的微信图片不存在：{missing[0]}")
+
+        inputs = page.locator(FILE_INPUT_SELECTOR)
+        deadline = time.monotonic() + 5
+        while inputs.count() == 0 and time.monotonic() < deadline:
+            page.wait_for_timeout(100)
+            inputs = page.locator(FILE_INPUT_SELECTOR)
+        if inputs.count() == 0:
+            raise RuntimeError("找不到 ChatGPT 图片上传控件；网页结构可能已经更新")
+
+        selected = inputs.last
+        selected.set_input_files([str(path) for path in image_paths])
 
     @staticmethod
     def _rename_conversation(page: Any, conversation_url: str, title: str) -> None:
@@ -384,9 +534,11 @@ class PlaywrightChatSession:
         previous_count: int,
         timeout_seconds: int,
         stopped: Callable[[], bool],
+        baseline_image_sources: frozenset[str] = frozenset(),
     ) -> str:
         deadline = time.monotonic() + timeout_seconds
         last_text = ""
+        last_image_count = 0
         unchanged_since: float | None = None
 
         while time.monotonic() < deadline:
@@ -394,32 +546,189 @@ class PlaywrightChatSession:
                 raise ChatStopped("ChatGPT 请求已停止")
 
             count = assistant_messages.count()
+            new_image_sources = (
+                PlaywrightChatSession._generated_image_sources(page)
+                - baseline_image_sources
+            )
+            image_count = len(new_image_sources)
+            current = ""
             if count > previous_count:
+                reply = assistant_messages.nth(count - 1)
                 try:
-                    current = assistant_messages.nth(count - 1).inner_text(
-                        timeout=2_000
-                    ).strip()
+                    current = reply.inner_text(timeout=2_000).strip()
                 except Exception:
                     current = ""
-                if current:
-                    if current != last_text:
-                        last_text = current
-                        unchanged_since = time.monotonic()
-                    elif unchanged_since is not None:
-                        generating = page.locator(STOP_SELECTOR).first.is_visible(
-                            timeout=500
-                        )
-                        if (
-                            not generating
-                            and time.monotonic() - unchanged_since >= 1.5
-                        ):
-                            return current
+                image_count = max(
+                    image_count,
+                    PlaywrightChatSession._visible_reply_image_count(reply),
+                )
+            if current or image_count:
+                if current != last_text or image_count != last_image_count:
+                    last_text = current
+                    last_image_count = image_count
+                    unchanged_since = time.monotonic()
+                elif unchanged_since is not None:
+                    generating = page.locator(STOP_SELECTOR).first.is_visible(
+                        timeout=500
+                    )
+                    if (
+                        not generating
+                        and time.monotonic() - unchanged_since >= 1.5
+                    ):
+                        return current
 
             page.wait_for_timeout(250)
 
-        if last_text:
+        if last_text or last_image_count:
             raise TimeoutError("ChatGPT 回复仍在生成，等待超时")
         raise TimeoutError("等待 ChatGPT 回复超时")
+
+    @staticmethod
+    def _visible_reply_image_count(reply: Any) -> int:
+        try:
+            images = reply.locator("img")
+            return sum(
+                1
+                for index in range(images.count())
+                if images.nth(index).evaluate(IMAGE_METADATA_SCRIPT).get("usable")
+            )
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _generated_image_sources(page: Any) -> frozenset[str]:
+        try:
+            images = page.locator(GENERATED_IMAGE_SELECTOR)
+            sources: set[str] = set()
+            for index in range(images.count()):
+                metadata = images.nth(index).evaluate(IMAGE_METADATA_SCRIPT)
+                if (
+                    metadata.get("usable")
+                    and not metadata.get("userTurn")
+                    and metadata.get("source")
+                ):
+                    sources.add(str(metadata["source"]))
+            return frozenset(sources)
+        except Exception:
+            return frozenset()
+
+    def _save_reply_images(
+        self,
+        page: Any,
+        reply: Any,
+        baseline_sources: frozenset[str],
+    ) -> tuple[Path, ...]:
+        output_dir = self.profile_dir.parent / "chatgpt-images"
+        saved: list[Path] = []
+        seen_sources: set[str] = set()
+        image_groups: list[Any] = []
+        try:
+            image_groups.append(reply.locator("img"))
+        except Exception:
+            pass
+        try:
+            image_groups.append(page.locator(GENERATED_IMAGE_SELECTOR))
+        except Exception:
+            pass
+
+        candidates = sum(group.count() for group in image_groups)
+        for images in image_groups:
+            for index in range(images.count()):
+                image = images.nth(index)
+                if self._save_reply_image(
+                    image,
+                    output_dir,
+                    baseline_sources,
+                    seen_sources,
+                    saved,
+                ):
+                    continue
+        log.info(
+            "ChatGPT 回复图片扫描完成：候选=%d，基线=%d，已保存=%d",
+            candidates,
+            len(baseline_sources),
+            len(saved),
+        )
+        return tuple(saved)
+
+    def _save_reply_image(
+        self,
+        image: Any,
+        output_dir: Path,
+        baseline_sources: frozenset[str],
+        seen_sources: set[str],
+        saved: list[Path],
+    ) -> bool:
+        try:
+            metadata = image.evaluate(IMAGE_METADATA_SCRIPT)
+        except Exception:
+            return False
+        if not metadata.get("usable") or metadata.get("userTurn"):
+            return False
+        source = str(metadata.get("source") or "")
+        if not source or source in baseline_sources or source in seen_sources:
+            return False
+        seen_sources.add(source)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        destination = output_dir / f"{uuid.uuid4().hex}.png"
+        try:
+            encoded = image.evaluate(
+                """async img => {
+                    try {
+                        const response = await fetch(
+                            img.currentSrc || img.src,
+                            {credentials: 'include'}
+                        );
+                        if (!response.ok) return null;
+                        const blob = await response.blob();
+                        if (!blob.size || blob.size > 20971520) return null;
+                        return await new Promise((resolve, reject) => {
+                            const reader = new FileReader();
+                            reader.onload = () => resolve(reader.result);
+                            reader.onerror = reject;
+                            reader.readAsDataURL(blob);
+                        });
+                    } catch (_) {
+                        return null;
+                    }
+                }"""
+            )
+            raw, suffix = self._decode_image_data_url(encoded)
+            destination = destination.with_suffix(suffix)
+            destination.write_bytes(raw)
+        except Exception:
+            try:
+                image.screenshot(path=str(destination), type="png")
+            except Exception:
+                log.warning("保存 ChatGPT 回复图片失败", exc_info=True)
+                return False
+        saved.append(destination.resolve())
+        return True
+
+    @staticmethod
+    def _decode_image_data_url(value: Any) -> tuple[bytes, str]:
+        if not isinstance(value, str) or not value.startswith("data:image/"):
+            raise ValueError("ChatGPT 图片没有可读取的数据")
+        header, separator, encoded = value.partition(",")
+        if not separator or ";base64" not in header.lower():
+            raise ValueError("ChatGPT 图片不是 Base64 数据")
+        media_type = header[5:].split(";", 1)[0].lower()
+        suffixes = {
+            "image/jpeg": ".jpg",
+            "image/png": ".png",
+            "image/gif": ".gif",
+            "image/webp": ".webp",
+        }
+        suffix = suffixes.get(media_type)
+        if suffix is None:
+            raise ValueError(f"不支持的 ChatGPT 图片格式：{media_type}")
+        try:
+            raw = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("ChatGPT 图片 Base64 数据无效") from exc
+        if not raw or len(raw) > MAX_REPLY_IMAGE_BYTES:
+            raise ValueError("ChatGPT 图片为空或超过 20 MB")
+        return raw, suffix
 
     @staticmethod
     def _wait_for_conversation_url(page: Any) -> str:
@@ -495,11 +804,17 @@ class ChatGPTRunner:
         session_key: str,
         prompt: str,
         conversation_title: str | None = None,
+        image_paths: tuple[str | Path, ...] = (),
     ) -> tuple[bool, str]:
         try:
             self.start()
         except RuntimeError as exc:
             return False, str(exc)
+
+        resolved_images = tuple(Path(path).expanduser().resolve() for path in image_paths)
+        missing = [str(path) for path in resolved_images if not path.is_file()]
+        if missing:
+            return False, f"微信图片文件不存在：{missing[0]}"
 
         with self._lock:
             if self._state.active:
@@ -517,6 +832,7 @@ class ChatGPTRunner:
                 prompt=prompt,
                 conversation_url=conversation_url,
                 conversation_title=conversation_title,
+                image_paths=resolved_images,
             )
         )
         return True, "已开始 ChatGPT Plus 网页请求"
@@ -569,19 +885,24 @@ class ChatGPTRunner:
 
     def _run_chat(self, session: BrowserSession, job: _ChatJob) -> None:
         try:
-            text, new_url = session.ask(
+            text, new_url, image_paths = session.ask(
                 job.conversation_url,
                 job.prompt,
                 job.conversation_title,
                 self.timeout_seconds,
                 self._stopped,
+                job.image_paths,
             )
 
             if self._stopped():
                 self.events.put(ChatEvent("ChatGPT 请求已停止", job.session_key))
                 return
             self._set_conversation(job.session_key, new_url)
-            self.events.put(ChatEvent(text, job.session_key))
+            self.events.put(ChatEvent(
+                text,
+                job.session_key,
+                tuple(str(path) for path in image_paths),
+            ))
         except ChatStopped:
             self.events.put(ChatEvent("ChatGPT 请求已停止", job.session_key))
         except Exception as exc:
@@ -690,17 +1011,17 @@ def has_chatgpt_plus_login(
 
     try:
         with sync_playwright() as playwright:
-            launch_options: dict[str, Any] = {
-                "user_data_dir": str(profile_dir),
-                "channel": browser_channel,
-                "headless": True,
-                "viewport": {"width": 1280, "height": 900},
-            }
-            if proxy_server:
-                launch_options["proxy"] = {"server": proxy_server}
+            launch_options, hide_native_window = _persistent_context_options(
+                profile_dir,
+                browser_channel,
+                proxy_server,
+                hide_window=True,
+            )
             context = playwright.chromium.launch_persistent_context(**launch_options)
             try:
                 page = context.pages[0] if context.pages else context.new_page()
+                if hide_native_window:
+                    _hide_native_browser_window(page)
                 PlaywrightChatSession._navigate(page, CHATGPT_HOME, 60)
                 return _wait_for_account_state(page, timeout_ms=10_000).plus
             finally:
@@ -721,14 +1042,12 @@ def login_chatgpt(
     profile_dir.mkdir(parents=True, exist_ok=True)
     try:
         with sync_playwright() as playwright:
-            launch_options: dict[str, Any] = {
-                "user_data_dir": str(profile_dir),
-                "channel": browser_channel,
-                "headless": False,
-                "viewport": {"width": 1280, "height": 900},
-            }
-            if proxy_server:
-                launch_options["proxy"] = {"server": proxy_server}
+            launch_options, _ = _persistent_context_options(
+                profile_dir,
+                browser_channel,
+                proxy_server,
+                hide_window=False,
+            )
             context = playwright.chromium.launch_persistent_context(**launch_options)
             try:
                 page = context.pages[0] if context.pages else context.new_page()

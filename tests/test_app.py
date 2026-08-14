@@ -9,9 +9,13 @@ class FakeWeChat:
     def __init__(self) -> None:
         self.user_id = "owner-id"
         self.sent: list[tuple[str, ReplyTarget]] = []
+        self.sent_images: list[tuple[str, ReplyTarget]] = []
 
     def send(self, text: str, target: ReplyTarget) -> None:
         self.sent.append((text, target))
+
+    def send_image(self, image_path: str, target: ReplyTarget) -> None:
+        self.sent_images.append((image_path, target))
 
 
 class FakeRunner:
@@ -27,10 +31,12 @@ class FakeRunner:
 class FakeChatRunner:
     def __init__(self) -> None:
         self.active = False
-        self.chat_calls: list[tuple[str, str, str | None]] = []
+        self.chat_calls: list[tuple[str, str, str | None, tuple[str, ...]]] = []
 
-    def begin_chat(self, session_key, prompt, conversation_title=None):
-        self.chat_calls.append((session_key, prompt, conversation_title))
+    def begin_chat(
+        self, session_key, prompt, conversation_title=None, image_paths=()
+    ):
+        self.chat_calls.append((session_key, prompt, conversation_title, image_paths))
         return True, "已开始"
 
 
@@ -110,7 +116,45 @@ class BridgeAppTests(unittest.TestCase):
 
         self.assertEqual(
             app.chat_runner.chat_calls,
-            [("ilink:bot-1:user-a", "你好", "微信助手")],
+            [("ilink:bot-1:user-a", "你好", "微信助手", ())],
+        )
+
+    def test_image_is_forwarded_to_chatgpt(self) -> None:
+        app = self.make_app()
+        incoming = IncomingMessage(
+            **{
+                **message("user-a", "[图片]").__dict__,
+                "image_path": "D:/runtime/inbound-images/photo.jpg",
+            }
+        )
+
+        app._handle(incoming, incoming.reply_target, app._chat_session_key(incoming))
+
+        self.assertEqual(
+            app.chat_runner.chat_calls,
+            [(
+                "ilink:bot-1:user-a",
+                "请分析这张图片，并说明你看到了什么。",
+                "微信助手",
+                ("D:/runtime/inbound-images/photo.jpg",),
+            )],
+        )
+
+    def test_chatgpt_reply_images_are_sent_to_same_wechat_context(self) -> None:
+        app = self.make_app()
+        target = ReplyTarget("user-a", "ctx-image")
+        app._reply_targets["ilink:bot-1:user-a"] = target
+
+        app._send_event(
+            "这是生成的图片",
+            "ilink:bot-1:user-a",
+            ("D:/runtime/chatgpt-images/reply.png",),
+        )
+
+        self.assertEqual(app.wechat.sent, [("这是生成的图片", target)])
+        self.assertEqual(
+            app.wechat.sent_images,
+            [("D:/runtime/chatgpt-images/reply.png", target)],
         )
 
 
