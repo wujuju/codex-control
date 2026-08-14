@@ -176,6 +176,28 @@ class FakeReplyList:
         return self.item
 
 
+class ChangingReplyItem:
+    def __init__(self, texts: list[str]) -> None:
+        self.texts = texts
+        self.index = 0
+
+    def inner_text(self, timeout):
+        text = self.texts[min(self.index, len(self.texts) - 1)]
+        self.index += 1
+        return text
+
+
+class ChangingReplyList:
+    def __init__(self, texts: list[str]) -> None:
+        self.item = ChangingReplyItem(texts)
+
+    def count(self):
+        return 1
+
+    def nth(self, index):
+        return self.item
+
+
 class FakeVisibility:
     def __init__(self, visible: bool = False) -> None:
         self.visible = visible
@@ -395,6 +417,27 @@ class ChatGPTRunnerTests(unittest.TestCase):
             )
 
         self.assertEqual(result, "完整回复")
+
+    def test_reply_activity_extends_timeout_until_generation_settles(self) -> None:
+        page = FakeReplyPage()
+        replies = ChangingReplyList(["第一段", "第一段\n第二段", "第一段\n第二段"])
+        # The final check happens after the original 10-second deadline. The
+        # update at 10.5 seconds must extend the wait long enough to finish.
+        clock = [0.0, 1.0, 10.5, 12.1]
+
+        with patch(
+            "wechat_codex.chatgpt_runner.time.monotonic",
+            side_effect=clock,
+        ):
+            result = PlaywrightChatSession._wait_for_reply(
+                page,
+                replies,
+                previous_count=0,
+                timeout_seconds=10,
+                stopped=lambda: False,
+            )
+
+        self.assertEqual(result, "第一段\n第二段")
 
     def test_image_prompt_can_finish_with_text_only_reply(self) -> None:
         page = FakeReplyPage()

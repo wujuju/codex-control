@@ -873,13 +873,19 @@ class PlaywrightChatSession:
         *,
         expect_image: bool = False,
     ) -> str:
-        deadline = time.monotonic() + timeout_seconds
+        started_at = time.monotonic()
+        initial_deadline = started_at + timeout_seconds
+        deadline = initial_deadline
         last_text = ""
         last_media_keys: frozenset[str] = frozenset()
         unchanged_since: float | None = None
         image_tool_seen = False
+        extension_logged = False
 
-        while time.monotonic() < deadline:
+        while True:
+            now = time.monotonic()
+            if now >= deadline:
+                break
             if stopped():
                 PlaywrightChatSession._stop_generation(page)
                 raise ChatStopped("ChatGPT 请求已停止")
@@ -902,7 +908,14 @@ class PlaywrightChatSession:
                 if current != last_text or new_media_keys != last_media_keys:
                     last_text = current
                     last_media_keys = new_media_keys
-                    unchanged_since = time.monotonic()
+                    unchanged_since = now
+                    # Treat the configured timeout as an inactivity limit once
+                    # ChatGPT starts streaming. Ongoing text/image changes keep
+                    # the request alive until the reply settles.
+                    deadline = now + timeout_seconds
+                    if now >= initial_deadline and not extension_logged:
+                        log.info("ChatGPT 回复仍在更新，已根据最近活动自动延长等待")
+                        extension_logged = True
                 elif unchanged_since is not None:
                     generating = page.locator(STOP_SELECTOR).first.is_visible(
                         timeout=500
@@ -915,14 +928,16 @@ class PlaywrightChatSession:
                     if (
                         not generating
                         and not image_progress
-                        and time.monotonic() - unchanged_since >= settle_seconds
+                        and now - unchanged_since >= settle_seconds
                     ):
                         return current
 
             page.wait_for_timeout(250)
 
         if last_text or last_media_keys:
-            raise TimeoutError("ChatGPT 回复仍在生成，等待超时")
+            raise TimeoutError(
+                f"ChatGPT 回复连续 {timeout_seconds} 秒没有继续更新，等待超时"
+            )
         raise TimeoutError("等待 ChatGPT 回复超时")
 
     @staticmethod

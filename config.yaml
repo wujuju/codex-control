@@ -17,7 +17,7 @@ chatgpt_browser_channel: "chrome"
 chatgpt_headless: true
 chatgpt_proxy_server: "socks5://127.0.0.1:7890"
 chatgpt_conversation_title: "微信助手"
-chat_timeout_seconds: 180
+chat_timeout_seconds: 360
 
 codex_command: "codex"
 work_timeout_seconds: 3600
