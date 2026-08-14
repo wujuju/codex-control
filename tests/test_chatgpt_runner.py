@@ -174,22 +174,30 @@ class FakeReplyList:
 
 
 class FakeVisibility:
+    def __init__(self, visible: bool = False) -> None:
+        self.visible = visible
+        self.clicks = 0
+
     @property
     def first(self):
         return self
 
     def is_visible(self, timeout):
-        return False
+        return self.visible
+
+    def click(self, timeout):
+        self.clicks += 1
 
 
 class FakeReplyPage:
-    def __init__(self) -> None:
+    def __init__(self, stop_visible: bool = False) -> None:
         self.waits: list[int] = []
+        self.stop_button = FakeVisibility(stop_visible)
 
     def locator(self, selector):
         if selector != STOP_SELECTOR:
             raise AssertionError(f"不应依赖其他按钮判断回复完成：{selector}")
-        return FakeVisibility()
+        return self.stop_button
 
     def wait_for_timeout(self, timeout):
         self.waits.append(timeout)
@@ -329,6 +337,40 @@ class ChatGPTRunnerTests(unittest.TestCase):
             )
 
         self.assertEqual(result, "完整回复")
+
+    def test_image_prompt_can_finish_with_text_only_reply(self) -> None:
+        page = FakeReplyPage()
+        replies = FakeReplyList("当前无法生成图片，请补充细节")
+        clock = [0.0, 0.1, 0.2, 1.0, 9.0]
+
+        with patch(
+            "wechat_codex.chatgpt_runner.time.monotonic",
+            side_effect=clock,
+        ):
+            result = PlaywrightChatSession._wait_for_reply(
+                page,
+                replies,
+                previous_count=0,
+                timeout_seconds=30,
+                stopped=lambda: False,
+                expect_image=True,
+            )
+
+        self.assertEqual(result, "当前无法生成图片，请补充细节")
+
+    def test_stopping_wait_clicks_web_stop_button(self) -> None:
+        page = FakeReplyPage(stop_visible=True)
+
+        with self.assertRaisesRegex(RuntimeError, "已停止"):
+            PlaywrightChatSession._wait_for_reply(
+                page,
+                FakeReplyList(""),
+                previous_count=0,
+                timeout_seconds=30,
+                stopped=lambda: True,
+            )
+
+        self.assertEqual(page.stop_button.clicks, 1)
 
     def test_conversation_url_survives_runner_restart(self) -> None:
         with TemporaryDirectory() as directory:

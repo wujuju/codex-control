@@ -111,6 +111,14 @@ IMAGE_PROGRESS_TEXT = re.compile(
 )
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 @dataclass(frozen=True)
 class _ImageBaseline:
     prior_turn_ids: frozenset[str] = frozenset()
@@ -409,7 +417,11 @@ class PlaywrightChatSession:
         if page is None:
             raise RuntimeError("ChatGPT 浏览器尚未启动")
 
-        target = conversation_url if _is_chat_url(conversation_url) else CHATGPT_HOME
+        target = (
+            conversation_url
+            if conversation_url is not None and _is_chat_url(conversation_url)
+            else CHATGPT_HOME
+        )
         self._navigate(page, target, timeout_seconds)
         try:
             composer = self._wait_for_composer(page)
@@ -733,10 +745,11 @@ class PlaywrightChatSession:
         last_text = ""
         last_media_keys: frozenset[str] = frozenset()
         unchanged_since: float | None = None
-        image_tool_seen = expect_image
+        image_tool_seen = False
 
         while time.monotonic() < deadline:
             if stopped():
+                PlaywrightChatSession._stop_generation(page)
                 raise ChatStopped("ChatGPT 请求已停止")
 
             count = assistant_messages.count()
@@ -767,12 +780,13 @@ class PlaywrightChatSession:
                     )
                     image_progress = PlaywrightChatSession._image_progress_visible(page)
                     image_tool_seen = image_tool_seen or image_progress
-                    settle_seconds = 8.0 if image_tool_seen or image_count else 1.5
+                    settle_seconds = (
+                        8.0 if expect_image or image_tool_seen or image_count else 1.5
+                    )
                     if (
                         not generating
                         and not image_progress
                         and time.monotonic() - unchanged_since >= settle_seconds
-                        and (not image_tool_seen or image_count > 0)
                     ):
                         return current
 
@@ -781,6 +795,16 @@ class PlaywrightChatSession:
         if last_text or last_media_keys:
             raise TimeoutError("ChatGPT 回复仍在生成，等待超时")
         raise TimeoutError("等待 ChatGPT 回复超时")
+
+    @staticmethod
+    def _stop_generation(page: Any) -> None:
+        """Best-effort cancellation of the active web generation."""
+        try:
+            button = page.locator(STOP_SELECTOR).first
+            if button.is_visible(timeout=500):
+                button.click(timeout=2_000)
+        except Exception:
+            log.debug("点击 ChatGPT 停止生成按钮失败", exc_info=True)
 
     @staticmethod
     def _visible_reply_image_count(reply: Any) -> int:
@@ -853,10 +877,9 @@ class PlaywrightChatSession:
         baseline: _ImageBaseline,
     ) -> frozenset[str]:
         try:
-            images = page.locator(GENERATED_IMAGE_SELECTOR)
             media_keys: set[str] = set()
-            for index in range(images.count()):
-                metadata = images.nth(index).evaluate(IMAGE_METADATA_SCRIPT)
+            for image in PlaywrightChatSession._current_reply_images(page, baseline):
+                metadata = image.evaluate(IMAGE_METADATA_SCRIPT)
                 turn_id = str(metadata.get("turnId") or "")
                 media_key = str(metadata.get("mediaKey") or "")
                 if (
@@ -870,6 +893,23 @@ class PlaywrightChatSession:
             return frozenset(media_keys)
         except Exception:
             return frozenset()
+
+    @staticmethod
+    def _current_reply_images(page: Any, baseline: _ImageBaseline) -> list[Any]:
+        """Return images from only the newest turns created after the baseline."""
+        turns = page.locator('main [data-testid^="conversation-turn-"]')
+        result: list[Any] = []
+        count = turns.count()
+        # A response can create a small number of adjacent tool/assistant turns.
+        # Capping the scan avoids repeatedly traversing the full conversation.
+        for index in range(max(0, count - 6), count):
+            turn = turns.nth(index)
+            turn_id = str(turn.get_attribute("data-testid") or "")
+            if not PlaywrightChatSession._is_current_turn(turn_id, baseline):
+                continue
+            images = turn.locator("img")
+            result.extend(images.nth(image_index) for image_index in range(images.count()))
+        return result
 
     @staticmethod
     def _is_current_turn(turn_id: str, baseline: _ImageBaseline) -> bool:
@@ -890,14 +930,14 @@ class PlaywrightChatSession:
         saved: list[Path] = []
         seen_images: set[str] = set()
         try:
-            images = page.locator(GENERATED_IMAGE_SELECTOR)
+            images = self._current_reply_images(page, baseline)
         except Exception:
             return ()
 
-        candidates = images.count()
-        for index in range(candidates):
+        candidates = len(images)
+        for image in images:
             self._save_reply_image(
-                images.nth(index),
+                image,
                 output_dir,
                 baseline,
                 seen_images,
@@ -971,7 +1011,7 @@ class PlaywrightChatSession:
             except Exception:
                 log.warning("保存 ChatGPT 回复图片失败", exc_info=True)
                 return False
-        digest = hashlib.sha256(destination.read_bytes()).hexdigest()
+        digest = _file_sha256(destination)
         assert self._saved_image_hashes is not None
         self._captured_media_keys.add(media_key)
         if digest in self._saved_image_hashes:
@@ -991,7 +1031,7 @@ class PlaywrightChatSession:
                 if not path.is_file():
                     continue
                 try:
-                    hashes.add(hashlib.sha256(path.read_bytes()).hexdigest())
+                    hashes.add(_file_sha256(path))
                 except OSError:
                     log.warning("读取 ChatGPT 历史图片缓存失败：%s", path)
         self._saved_image_hashes = hashes

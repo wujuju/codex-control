@@ -18,6 +18,8 @@ from .ilink_api import (
     ILinkAuthenticationError,
     ILinkError,
     ILinkProtocolError,
+    MAX_OUTBOUND_FILE_BYTES,
+    MAX_OUTBOUND_IMAGE_BYTES,
 )
 from .ilink_auth import load_credentials
 
@@ -319,6 +321,8 @@ class ILinkClient:
         path = Path(image_path).expanduser().resolve()
         if not path.is_file():
             raise ILinkProtocolError(f"待发送的图片不存在：{path}")
+        if path.stat().st_size > MAX_OUTBOUND_IMAGE_BYTES:
+            raise ILinkProtocolError("待发送的图片超过 20 MB 限制")
         image_item = api.upload_image(path.read_bytes(), resolved.user_id)
         api.send_message(
             {
@@ -346,6 +350,8 @@ class ILinkClient:
         path = Path(file_path).expanduser().resolve()
         if not path.is_file():
             raise ILinkProtocolError(f"待发送的文件不存在：{path}")
+        if path.stat().st_size > MAX_OUTBOUND_FILE_BYTES:
+            raise ILinkProtocolError("待发送的文件超过 20 MB 限制")
         file_item = api.upload_file(path.read_bytes(), resolved.user_id, path.name)
         api.send_message(
             {

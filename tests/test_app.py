@@ -17,8 +17,12 @@ class FakeWeChat:
         self.sent_images: list[tuple[str, ReplyTarget]] = []
         self.sent_files: list[tuple[str, ReplyTarget]] = []
         self.reconnect_calls = 0
+        self.send_failures = 0
 
     def send(self, text: str, target: ReplyTarget) -> None:
+        if self.send_failures:
+            self.send_failures -= 1
+            raise OSError("temporary send failure")
         self.sent.append((text, target))
 
     def send_image(self, image_path: str, target: ReplyTarget) -> None:
@@ -128,6 +132,8 @@ def message(sender: str = "owner-id", content: str = "你好") -> IncomingMessag
 
 class BridgeAppTests(unittest.TestCase):
     def make_app(self) -> BridgeApp:
+        runtime = TemporaryDirectory()
+        self.addCleanup(runtime.cleanup)
         app = BridgeApp.__new__(BridgeApp)
         app._event_sink = None
         app._state_sink = None
@@ -140,13 +146,15 @@ class BridgeAppTests(unittest.TestCase):
             projects={"control": "."},
             default_project="control",
             chatgpt_conversation_title="微信助手",
-            runtime_dir=Path(".runtime"),
+            runtime_dir=Path(runtime.name),
         )
         app.wechat = FakeWeChat()
         app.runner = FakeRunner()
         app.chat_runner = FakeChatRunner()
         app._project_selection_file = app.config.runtime_dir / "selected_projects.json"
         app._selected_projects = {}
+        app._outbox_file = app.config.runtime_dir / "outbound_queue.json"
+        app._outbox = []
         return app
 
     def test_incoming_ack_uses_same_reply_context(self) -> None:
@@ -250,6 +258,23 @@ class BridgeAppTests(unittest.TestCase):
             app.wechat.sent_files,
             [("D:/runtime/chatgpt-exports/conversation.md", target)],
         )
+
+    def test_async_reply_survives_temporary_send_failure(self) -> None:
+        app = self.make_app()
+        target = ReplyTarget("user-a", "ctx-retry")
+        app._reply_targets["ilink:bot-1:user-a"] = target
+        app.wechat.send_failures = 1
+
+        with self.assertRaises(OSError):
+            app._send_event("最终结果", "ilink:bot-1:user-a")
+
+        self.assertEqual(len(app._outbox), 1)
+        self.assertTrue(app._outbox_file.is_file())
+        app._outbox = app._load_outbox()
+        app._flush_outbox()
+
+        self.assertEqual(app.wechat.sent, [("最终结果", target)])
+        self.assertEqual(app._outbox, [])
 
     def test_conversation_commands_are_dispatched(self) -> None:
         app = self.make_app()

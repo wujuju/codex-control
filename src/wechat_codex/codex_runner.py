@@ -6,9 +6,10 @@ import queue
 import subprocess
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, TextIO
 
 
 @dataclass(frozen=True)
@@ -38,36 +39,93 @@ class ParsedOutput:
     error_text: str
 
 
-def parse_jsonl(lines: Iterable[str]) -> ParsedOutput:
-    final_messages: list[str] = []
-    thread_id: str | None = None
-    errors: list[str] = []
+class _JsonlCollector:
+    def __init__(self) -> None:
+        self._final_text = ""
+        self._thread_id: str | None = None
+        self._errors = _TextTail(64 * 1024)
+        self._lock = threading.Lock()
 
-    for raw_line in lines:
+    def feed(self, raw_line: str) -> None:
         line = raw_line.strip()
         if not line:
-            continue
+            return
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
-            continue
+            return
+        if not isinstance(event, dict):
+            return
 
         event_type = str(event.get("type", ""))
-        if event_type == "thread.started":
-            thread_id = event.get("thread_id") or thread_id
-        elif event_type == "item.completed":
-            item = event.get("item") or {}
-            if item.get("type") == "agent_message" and item.get("text"):
-                final_messages.append(str(item["text"]))
-        elif event_type in {"turn.failed", "error"}:
-            detail = event.get("error") or event.get("message") or event
-            errors.append(str(detail))
+        with self._lock:
+            if event_type == "thread.started":
+                self._thread_id = str(event.get("thread_id") or self._thread_id or "") or None
+            elif event_type == "item.completed":
+                item = event.get("item") or {}
+                if (
+                    isinstance(item, dict)
+                    and item.get("type") == "agent_message"
+                    and item.get("text")
+                ):
+                    self._final_text = str(item["text"]).strip()
+            elif event_type in {"turn.failed", "error"}:
+                detail = event.get("error") or event.get("message") or event
+                self._errors.append(str(detail) + "\n")
 
-    return ParsedOutput(
-        final_text=final_messages[-1].strip() if final_messages else "",
-        thread_id=thread_id,
-        error_text="\n".join(errors).strip(),
-    )
+    def result(self) -> ParsedOutput:
+        with self._lock:
+            return ParsedOutput(
+                final_text=self._final_text,
+                thread_id=self._thread_id,
+                error_text=self._errors.text().strip(),
+            )
+
+
+class _TextTail:
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self._parts: deque[str] = deque()
+        self._size = 0
+
+    def append(self, value: str) -> None:
+        if not value:
+            return
+        value = value[-self.limit :]
+        self._parts.append(value)
+        self._size += len(value)
+        while self._size > self.limit and self._parts:
+            excess = self._size - self.limit
+            first = self._parts[0]
+            if len(first) <= excess:
+                self._parts.popleft()
+                self._size -= len(first)
+            else:
+                self._parts[0] = first[excess:]
+                self._size -= excess
+
+    def text(self) -> str:
+        return "".join(self._parts)
+
+
+def _read_jsonl_stream(stream: TextIO, collector: _JsonlCollector) -> None:
+    with stream:
+        for line in stream:
+            collector.feed(line)
+
+
+def _read_text_tail(stream: TextIO, tail: _TextTail) -> None:
+    with stream:
+        for line in stream:
+            tail.append(line)
+
+
+def parse_jsonl(lines: Iterable[str]) -> ParsedOutput:
+    collector = _JsonlCollector()
+    for line in lines:
+        collector.feed(line)
+
+    return collector.result()
 
 
 class CodexRunner:
@@ -239,21 +297,44 @@ class CodexRunner:
             if stop_immediately:
                 process.terminate()
 
+            assert process.stdout is not None
+            assert process.stderr is not None
+            collector = _JsonlCollector()
+            stderr_tail = _TextTail(64 * 1024)
+            stdout_reader = threading.Thread(
+                target=_read_jsonl_stream,
+                args=(process.stdout, collector),
+                name="codex-stdout-reader",
+                daemon=True,
+            )
+            stderr_reader = threading.Thread(
+                target=_read_text_tail,
+                args=(process.stderr, stderr_tail),
+                name="codex-stderr-reader",
+                daemon=True,
+            )
+            stdout_reader.start()
+            stderr_reader.start()
+            timed_out = False
             try:
-                stdout, stderr = process.communicate(timeout=timeout)
+                process.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
+                timed_out = True
                 process.terminate()
                 try:
-                    stdout, stderr = process.communicate(timeout=5)
+                    process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     process.kill()
-                    stdout, stderr = process.communicate()
+                    process.wait()
+            stdout_reader.join(timeout=2)
+            stderr_reader.join(timeout=2)
+            if timed_out:
                 result = f"任务超时（{timeout} 秒），已停止"
                 self._complete_task("超时", result)
                 self.events.put(RunnerEvent(result, session_key))
                 return
 
-            parsed = parse_jsonl(stdout.splitlines())
+            parsed = collector.result()
             with self._lock:
                 stopped = self._state.stop_requested
                 if parsed.thread_id:
@@ -271,7 +352,7 @@ class CodexRunner:
                 self._complete_task("成功", parsed.final_text)
                 self.events.put(RunnerEvent(parsed.final_text, session_key))
             else:
-                detail = parsed.error_text or stderr.strip() or "Codex 没有返回结果"
+                detail = parsed.error_text or stderr_tail.text().strip() or "Codex 没有返回结果"
                 result = f"任务失败：{detail[-1200:]}"
                 self._complete_task("失败", result)
                 self.events.put(RunnerEvent(result, session_key))
@@ -338,7 +419,12 @@ class CodexRunner:
             return "当前没有保存的 Codex 任务"
         lines = ["最近 Codex 任务："]
         for index, record in enumerate(records, start=1):
-            started_at = float(record.get("started_at") or 0)
+            started_value = record.get("started_at")
+            started_at = (
+                float(started_value)
+                if isinstance(started_value, (int, float))
+                else 0.0
+            )
             started = (
                 time.strftime("%m-%d %H:%M", time.localtime(started_at))
                 if started_at

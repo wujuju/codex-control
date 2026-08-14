@@ -4,6 +4,7 @@ import argparse
 import logging
 import sys
 import threading
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,7 @@ from PySide6.QtCore import (
     QModelIndex,
     QObject,
     Property,
+    QPersistentModelIndex,
     QTimer,
     Qt,
     Signal,
@@ -46,10 +48,16 @@ class ConversationModel(QAbstractListModel):
             "active": True,
         }
 
-    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
+    def rowCount(
+        self, parent: QModelIndex | QPersistentModelIndex = QModelIndex()
+    ) -> int:
         return 0 if parent.isValid() else 1
 
-    def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> Any:
+    def data(
+        self,
+        index: QModelIndex | QPersistentModelIndex,
+        role: int = Qt.ItemDataRole.DisplayRole,
+    ) -> Any:
         if not index.isValid() or index.row() != 0:
             return None
         names = {
@@ -91,10 +99,16 @@ class MessageModel(QAbstractListModel):
         super().__init__()
         self._items: list[dict[str, Any]] = []
 
-    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
+    def rowCount(
+        self, parent: QModelIndex | QPersistentModelIndex = QModelIndex()
+    ) -> int:
         return 0 if parent.isValid() else len(self._items)
 
-    def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> Any:
+    def data(
+        self,
+        index: QModelIndex | QPersistentModelIndex,
+        role: int = Qt.ItemDataRole.DisplayRole,
+    ) -> Any:
         if not index.isValid() or not 0 <= index.row() < len(self._items):
             return None
         names = {
@@ -378,8 +392,11 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.INFO,
         format="%(asctime)s [%(name)s] [%(levelname)s] %(message)s",
         handlers=[
-            logging.FileHandler(
-                config.runtime_dir / "gui.log", encoding="utf-8"
+            RotatingFileHandler(
+                config.runtime_dir / "gui.log",
+                maxBytes=5 * 1024 * 1024,
+                backupCount=3,
+                encoding="utf-8",
             )
         ],
     )

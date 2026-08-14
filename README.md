@@ -120,7 +120,7 @@ chatgpt_conversation_title: "微信助手"
 .\stop.ps1
 ```
 
-后台日志位于 `.runtime/bridge.err.log`。
+后台日志位于 `.runtime/bridge.log`，单个文件最多 5 MB，并保留 3 个历史文件；启动器自身错误仍写入 `.runtime/bridge.err.log`。
 
 ## 辅助命令
 
@@ -178,6 +178,7 @@ Codex、项目、日志、缓存清理和故障恢复命令仅允许 `ilink_code
 - `chatgpt_web_conversations.json`：iLink 用户到 ChatGPT 对话 URL 的映射。
 - `chatgpt_conversation_titles.json`：用户手动设置的 ChatGPT 对话标题。
 - `chatgpt_conversation_history.json`：按微信用户隔离的最近对话索引。
+- `outbound_queue.json`：尚未成功投递到微信的异步回复；发送完成后自动清空。
 - `codex_task_history.json`：最近 Codex 任务、状态和结果。
 - `selected_projects.json`：各微信用户选择的默认 Codex 项目。
 - `chatgpt-exports/`：导出的 Markdown 对话文件。

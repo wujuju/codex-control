@@ -8,6 +8,7 @@ import re
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from .chatgpt_runner import ChatGPTRunner
@@ -27,6 +28,13 @@ _LOG_SECRET = re.compile(
 _WECHAT_ID = re.compile(r"[A-Za-z0-9_.-]+@im\.(?:wechat|bot)", re.IGNORECASE)
 
 
+@dataclass(frozen=True)
+class _OutboundItem:
+    kind: str
+    payload: str
+    target: ReplyTarget
+
+
 class BridgeApp:
     def __init__(
         self,
@@ -43,6 +51,8 @@ class BridgeApp:
         self._reply_targets: dict[str, ReplyTarget] = {}
         self._project_selection_file = config.runtime_dir / "selected_projects.json"
         self._selected_projects = self._load_selected_projects()
+        self._outbox_file = config.runtime_dir / "outbound_queue.json"
+        self._outbox = self._load_outbox()
         self.wechat = ILinkClient(
             credentials_path=config.ilink_credentials_file,
             state_path=config.ilink_state_file,
@@ -128,6 +138,17 @@ class BridgeApp:
         image_paths: tuple[str, ...] = (),
         file_paths: tuple[str, ...] = (),
     ) -> None:
+        """Durably enqueue an asynchronous result before attempting delivery."""
+        self._queue_event(text, session_key, image_paths, file_paths)
+        self._flush_outbox()
+
+    def _queue_event(
+        self,
+        text: str,
+        session_key: str | None,
+        image_paths: tuple[str, ...] = (),
+        file_paths: tuple[str, ...] = (),
+    ) -> None:
         target = self._reply_targets.get(session_key or "")
         if target is None:
             try:
@@ -135,14 +156,80 @@ class BridgeApp:
             except Exception:
                 log.error("异步回复缺少可用的 iLink 目标，已丢弃：%s", text)
                 return
+        items: list[_OutboundItem] = []
         if text.strip():
-            self._send(text, target)
+            items.append(_OutboundItem("text", text, target))
         for image_path in image_paths:
-            self.wechat.send_image(image_path, target)
-            self._emit_event("outgoing", "微信 Bot", "[图片]")
+            items.append(_OutboundItem("image", image_path, target))
         for file_path in file_paths:
-            self.wechat.send_file(file_path, target)
-            self._emit_event("outgoing", "微信 Bot", f"[文件] {Path(file_path).name}")
+            items.append(_OutboundItem("file", file_path, target))
+        if not items:
+            return
+        self._outbox.extend(items)
+        self._save_outbox()
+
+    def _load_outbox(self) -> list[_OutboundItem]:
+        if not self._outbox_file.is_file():
+            return []
+        try:
+            raw = json.loads(self._outbox_file.read_text(encoding="utf-8"))
+            if not isinstance(raw, list):
+                raise ValueError("顶层不是 JSON 数组")
+            result: list[_OutboundItem] = []
+            for value in raw:
+                if not isinstance(value, dict):
+                    continue
+                kind = str(value.get("kind") or "")
+                payload = str(value.get("payload") or "")
+                user_id = str(value.get("user_id") or "")
+                if kind not in {"text", "image", "file"} or not payload or not user_id:
+                    continue
+                result.append(
+                    _OutboundItem(
+                        kind,
+                        payload,
+                        ReplyTarget(user_id, str(value.get("context_token") or "")),
+                    )
+                )
+            return result
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            log.warning("忽略无法读取的异步出站队列：%s", exc)
+            return []
+
+    def _save_outbox(self) -> None:
+        self.config.runtime_dir.mkdir(parents=True, exist_ok=True)
+        temporary = self._outbox_file.with_suffix(".json.tmp")
+        payload = [
+            {
+                "kind": item.kind,
+                "payload": item.payload,
+                "user_id": item.target.user_id,
+                "context_token": item.target.context_token,
+            }
+            for item in self._outbox
+        ]
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, self._outbox_file)
+
+    def _flush_outbox(self) -> None:
+        while self._outbox:
+            item = self._outbox[0]
+            if item.kind == "text":
+                self._send(item.payload, item.target)
+            elif item.kind == "image":
+                self.wechat.send_image(item.payload, item.target)
+                self._emit_event("outgoing", "微信 Bot", "[图片]")
+            else:
+                self.wechat.send_file(item.payload, item.target)
+                self._emit_event(
+                    "outgoing", "微信 Bot", f"[文件] {Path(item.payload).name}"
+                )
+            self._outbox.pop(0)
+            self._save_outbox()
 
     def _listen(self) -> None:
         consecutive_errors = 0
@@ -155,15 +242,19 @@ class BridgeApp:
                         break
                     self._send(manual, self.wechat.default_target())
 
-                for event in self.runner.drain_events():
-                    self._send_event(event.text, event.session_key)
-                for event in self.chat_runner.drain_events():
-                    self._send_event(
+                self._flush_outbox()
+                runner_events = self.runner.drain_events()
+                chat_events = self.chat_runner.drain_events()
+                for event in runner_events:
+                    self._queue_event(event.text, event.session_key)
+                for event in chat_events:
+                    self._queue_event(
                         event.text,
                         event.session_key,
                         event.image_paths,
                         event.file_paths,
                     )
+                self._flush_outbox()
 
                 for message in self.wechat.poll():
                     try:
@@ -490,7 +581,7 @@ class BridgeApp:
 
     def _recent_logs(self, number: int) -> str:
         candidates = []
-        for name in ("bridge.err.log", "gui.log", "bridge.out.log"):
+        for name in ("bridge.log", "bridge.err.log", "gui.log", "bridge.out.log"):
             path = (self.config.runtime_dir / name).resolve()
             try:
                 if path.is_file() and path.stat().st_size:
@@ -545,7 +636,12 @@ class BridgeApp:
         if self.chat_runner.active:
             return "ChatGPT 请求正在执行，暂不能清理图片缓存"
         cutoff = time.time() - days * 86400
-        protected = self.chat_runner.protected_image_paths()
+        protected = set(self.chat_runner.protected_image_paths())
+        protected.update(
+            Path(item.payload).resolve()
+            for item in self._outbox
+            if item.kind == "image" and Path(item.payload).is_file()
+        )
         removed = 0
         removed_bytes = 0
         for path in self._cache_files():

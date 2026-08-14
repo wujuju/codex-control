@@ -5,6 +5,7 @@ $executable = Join-Path $projectRoot ".venv\Scripts\wechat-codex.exe"
 $pidFile = Join-Path $runtimeDir "bridge.pid"
 $stdoutLog = Join-Path $runtimeDir "bridge.out.log"
 $stderrLog = Join-Path $runtimeDir "bridge.err.log"
+$appLog = Join-Path $runtimeDir "bridge.log"
 
 if (-not (Test-Path -LiteralPath $executable)) {
     throw "Executable not found. Run: .\.venv\Scripts\python.exe -m pip install -e ."
@@ -23,12 +24,16 @@ if (Test-Path -LiteralPath $pidFile) {
 $env:PYTHONUTF8 = "1"
 & $executable --config (Join-Path $projectRoot "config.yaml") setup
 if ($LASTEXITCODE -ne 0) {
-    throw "登录检查未完成，后台服务没有启动。"
+    throw "Login check failed; the background service was not started."
 }
 
 $process = Start-Process `
     -FilePath $executable `
-    -ArgumentList @("--config", (Join-Path $projectRoot "config.yaml"), "start", "--skip-login-check") `
+    -ArgumentList @(
+        "--config", (Join-Path $projectRoot "config.yaml"),
+        "--log-file", $appLog,
+        "start", "--skip-login-check"
+    ) `
     -WorkingDirectory $projectRoot `
     -WindowStyle Hidden `
     -RedirectStandardOutput $stdoutLog `
@@ -36,4 +41,4 @@ $process = Start-Process `
     -PassThru
 Set-Content -LiteralPath $pidFile -Value $process.Id -Encoding ascii
 Write-Output "WeChat Codex bridge started. PID: $($process.Id)"
-Write-Output "Log: $stderrLog"
+Write-Output "Log: $appLog"

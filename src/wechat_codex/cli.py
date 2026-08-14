@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 from dataclasses import asdict
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from .app import BridgeApp
@@ -22,6 +23,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="微信 iLink Bot 到 ChatGPT/Codex 的桥接器")
     parser.add_argument("--config", default="config.yaml", help="配置文件路径")
     parser.add_argument("--verbose", action="store_true", help="显示调试日志")
+    parser.add_argument("--log-file", help="将日志写入滚动文件，而不是标准错误")
     sub = parser.add_subparsers(dest="command", required=True)
     start = sub.add_parser("start", help="检查登录并开始监听微信 Bot 消息")
     start.add_argument(
@@ -142,9 +144,24 @@ def main(argv: list[str] | None = None) -> int:
         if reconfigure:
             reconfigure(encoding="utf-8", errors="replace")
     args = _parser().parse_args(argv)
+    handlers: list[logging.Handler]
+    if args.log_file:
+        log_path = Path(args.log_file).expanduser().resolve()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        handlers = [
+            RotatingFileHandler(
+                log_path,
+                maxBytes=5 * 1024 * 1024,
+                backupCount=3,
+                encoding="utf-8",
+            )
+        ]
+    else:
+        handlers = [logging.StreamHandler()]
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
+        handlers=handlers,
     )
     try:
         config = load_config(Path(args.config))
