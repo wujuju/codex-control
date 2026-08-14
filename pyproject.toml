@@ -11,9 +11,8 @@ dependencies = [
   "playwright>=1.62,<2",
   "PySide6>=6.8,<7",
   "PyYAML>=6.0,<7",
-  "psutil>=7.0,<8",
-  "pywin32>=310",
-  "wxauto4>=41.1,<42",
+  "httpx>=0.28,<1",
+  "segno>=1.6,<2",
 ]
 
 [project.scripts]

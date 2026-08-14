@@ -8,12 +8,9 @@ from collections.abc import Callable
 from .chatgpt_runner import ChatGPTRunner
 from .codex_runner import CodexRunner
 from .config import AppConfig
+from .ilink_api import ILinkError
+from .ilink_client import ILinkClient, IncomingMessage, ReplyTarget
 from .router import RouteKind, help_text, route_message
-from .wechat_client import (
-    IncomingMessage,
-    WeChatAccessibilityUnavailable,
-    WeChatClient,
-)
 
 
 log = logging.getLogger(__name__)
@@ -32,20 +29,13 @@ class BridgeApp:
         self._state_sink = state_sink
         self._stop_event = threading.Event()
         self._manual_messages: queue.Queue[str] = queue.Queue()
-        self.wechat = WeChatClient(
-            contact=config.contact,
-            background_mode=config.background_mode,
-            allow_self_messages=config.allow_self_messages,
-            voice_recognition=config.voice_recognition,
-            voice_retry_count=config.voice_retry_count,
+        self._reply_targets: dict[str, ReplyTarget] = {}
+        self.wechat = ILinkClient(
+            credentials_path=config.ilink_credentials_file,
+            state_path=config.ilink_state_file,
             response_prefix=config.response_prefix,
             max_reply_chars=config.max_reply_chars,
-            chat_type=config.chat_type,
-            bot_name=config.bot_name,
-            message_source=config.wechat_message_source,
-            wx_cli_path=config.wx_cli_path,
-            wx_cli_username=config.wx_cli_username,
-            wx_cli_timeout_seconds=config.wx_cli_timeout_seconds,
+            long_poll_timeout_seconds=config.ilink_long_poll_timeout_seconds,
         )
         self.runner = CodexRunner(
             codex_command=config.codex_command,
@@ -59,53 +49,37 @@ class BridgeApp:
             timeout_seconds=config.chat_timeout_seconds,
             runtime_dir=config.runtime_dir,
         )
-        self._announced = False
 
     def run(self) -> None:
         try:
             self._emit_state("connecting", "正在启动 ChatGPT 专用浏览器")
             self.chat_runner.start()
-            accessibility_error: str | None = None
             while not self._stop_event.is_set():
                 try:
-                    if accessibility_error is None:
-                        self._emit_state("connecting", "正在连接微信")
+                    self._emit_state("connecting", "正在连接微信 iLink Bot API")
                     self.wechat.connect()
-                    accessibility_error = None
-                    baseline_count = self.wechat.baseline()
-                    log.info(
-                        "已连接微信联系人 %s，记录 %d 条已有消息；等待新消息",
-                        self.config.contact,
-                        baseline_count,
-                    )
-                    self._emit_state("running", f"正在监听 {self.config.contact}")
-                    if self.config.send_ready_message and not self._announced:
-                        voice = "，支持自动识别语音" if self.config.voice_recognition else ""
-                        self._send(f"已上线{voice}。发送“帮助”查看命令。")
-                        self._announced = True
+                    log.info("已连接微信 iLink Bot：%s", self.wechat.account_id)
+                    self._emit_state("running", "正在监听微信 Bot 消息")
                     self._listen()
                 except KeyboardInterrupt:
                     log.info("收到退出信号")
                     self.stop()
-                except WeChatAccessibilityUnavailable as exc:
-                    detail = str(exc)
-                    if detail != accessibility_error:
-                        log.warning("微信控件树尚未启用，等待用户重启微信：%s", detail)
-                        self._emit_state("reconnecting", detail)
-                    accessibility_error = detail
-                    self._stop_event.wait(15)
                 except Exception as exc:
-                    accessibility_error = None
-                    log.warning("微信尚未就绪，5 秒后重试：%s", exc)
-                    self._emit_state("reconnecting", f"连接失败，正在重试：{exc}")
+                    if self._stop_event.is_set():
+                        break
+                    log.warning("微信 iLink 连接中断，5 秒后重试：%s", exc)
+                    self._emit_state("reconnecting", f"iLink 连接失败，正在重试：{exc}")
+                    self.wechat.close()
                     self._stop_event.wait(5)
         finally:
+            self.wechat.close()
             self.chat_runner.close()
             self.runner.stop()
             self._emit_state("stopped", "已停止")
 
     def stop(self) -> None:
         self._stop_event.set()
+        self.wechat.close()
         self.chat_runner.stop()
         self.runner.stop()
 
@@ -130,9 +104,19 @@ class BridgeApp:
         except Exception:
             log.exception("界面状态回调失败")
 
-    def _send(self, text: str) -> None:
-        self.wechat.send(text)
-        self._emit_event("outgoing", self.config.bot_name, text)
+    def _send(self, text: str, target: ReplyTarget) -> None:
+        self.wechat.send(text, target)
+        self._emit_event("outgoing", "微信 Bot", text)
+
+    def _send_event(self, text: str, session_key: str | None) -> None:
+        target = self._reply_targets.get(session_key or "")
+        if target is None:
+            try:
+                target = self.wechat.default_target()
+            except Exception:
+                log.error("异步回复缺少可用的 iLink 目标，已丢弃：%s", text)
+                return
+        self._send(text, target)
 
     def _listen(self) -> None:
         consecutive_errors = 0
@@ -140,108 +124,126 @@ class BridgeApp:
             try:
                 while True:
                     try:
-                        self._send(self._manual_messages.get_nowait())
+                        manual = self._manual_messages.get_nowait()
                     except queue.Empty:
                         break
+                    self._send(manual, self.wechat.default_target())
 
                 for event in self.runner.drain_events():
-                    self._send(event.text)
+                    self._send_event(event.text, event.session_key)
                 for event in self.chat_runner.drain_events():
-                    self._send(event.text)
+                    self._send_event(event.text, event.session_key)
 
                 for message in self.wechat.poll():
-                    self._process_incoming(message)
+                    try:
+                        self._process_incoming(message)
+                    except Exception:
+                        self.wechat.retry(message)
+                        raise
+                    else:
+                        self.wechat.acknowledge(message.key)
                 consecutive_errors = 0
             except KeyboardInterrupt:
                 raise
+            except ILinkError:
+                raise
             except Exception:
                 consecutive_errors += 1
-                log.exception("微信轮询或发送失败（%d/5）", consecutive_errors)
+                log.exception("微信消息处理或发送失败（%d/5）", consecutive_errors)
                 if consecutive_errors >= 5:
-                    raise RuntimeError("微信连续 5 次访问失败，准备重新连接")
+                    raise RuntimeError("微信消息连续 5 次处理失败，准备重新连接")
             self._stop_event.wait(self.config.poll_seconds)
 
-    def _process_incoming(self, message: IncomingMessage) -> None:
-        log.info(
-            "收到消息（%s/%s/%s）：%s",
-            message.chat_type,
-            message.attr,
-            message.sender,
-            message.content,
-        )
-        self._emit_event("incoming", message.sender, message.content)
-        self._acknowledge(message)
-        self._handle(message)
+    def _is_allowed(self, sender_id: str) -> bool:
+        allowed = self.config.ilink_allowed_user_ids
+        return sender_id in allowed if allowed else sender_id == self.wechat.user_id
 
-    def _acknowledge(self, message: IncomingMessage) -> None:
-        if not self.config.send_received_ack or message.attr == "self":
+    def _can_run_codex(self, sender_id: str) -> bool:
+        allowed = self.config.ilink_codex_user_ids
+        return sender_id in allowed if allowed else sender_id == self.wechat.user_id
+
+    def _process_incoming(self, message: IncomingMessage) -> None:
+        if not self._is_allowed(message.sender_id):
+            log.warning("忽略未授权的 iLink 消息发送者：%s", message.sender_id)
+            return
+        log.info("收到 iLink 消息（%s）：%s", message.sender_id, message.content)
+        self._emit_event("incoming", message.sender, message.content)
+        session_key = self._chat_session_key(message)
+        target = message.reply_target
+        self._reply_targets[session_key] = target
+        self._acknowledge(message, target)
+        self._handle(message, target, session_key)
+
+    def _acknowledge(self, message: IncomingMessage, target: ReplyTarget) -> None:
+        if not self.config.send_received_ack:
             return
         try:
-            self._send(self.config.received_ack_text)
+            self._send(self.config.received_ack_text, target)
         except Exception:
-            # The message has already been consumed from the incremental reader.
-            # Continue processing it even when the best-effort receipt cannot be sent.
             log.exception("发送收到确认失败，继续处理原消息")
 
-    def _handle(self, message: IncomingMessage) -> None:
+    def _handle(
+        self,
+        message: IncomingMessage,
+        target: ReplyTarget,
+        session_key: str,
+    ) -> None:
         route = route_message(message.content)
-        if route.kind in {
-            RouteKind.WORK,
-            RouteKind.CONTINUE,
-            RouteKind.STATUS,
-            RouteKind.STOP,
-        } and message.sender not in self.config.authorized_senders:
-            log.warning("拒绝未授权的 Codex 操作请求，发送者：%s", message.sender)
-            self._send("无权限执行 Codex 操作")
+        codex_commands = {
+            RouteKind.WORK, RouteKind.CONTINUE, RouteKind.STATUS, RouteKind.STOP
+        }
+        if route.kind in codex_commands and not self._can_run_codex(message.sender_id):
+            log.warning("拒绝未授权的 Codex 请求：%s", message.sender_id)
+            self._send("无权限执行 Codex 操作", target)
             return
         if route.kind == RouteKind.HELP:
-            self._send(
-                help_text(list(self.config.projects), self.config.default_project)
-            )
+            self._send(help_text(list(self.config.projects), self.config.default_project), target)
             return
         if route.kind == RouteKind.STATUS:
             status = self.chat_runner.status() if self.chat_runner.active else self.runner.status()
-            self._send(status)
+            self._send(status, target)
             return
         if route.kind == RouteKind.STOP:
             result = self.chat_runner.stop() if self.chat_runner.active else self.runner.stop()
-            self._send(result)
+            self._send(result, target)
             return
-        session_key = self._chat_session_key(message)
         if route.kind == RouteKind.NEW_CHAT:
             if self.runner.active:
-                self._send("Codex 任务正在执行，请发送“状态”或“停止”")
+                self._send("Codex 任务正在执行，请发送“状态”或“停止”", target)
                 return
             ok, response = self.chat_runner.begin_reset(session_key)
             if not ok:
-                self._send(response)
+                self._send(response, target)
             return
         if route.kind == RouteKind.CONTINUE:
             if self.chat_runner.active:
-                self._send("ChatGPT 请求正在执行，请发送“状态”或“停止”")
+                self._send("ChatGPT 请求正在执行，请发送“状态”或“停止”", target)
                 return
-            ok, response = self.runner.begin_continue(route.prompt)
+            ok, response = self.runner.begin_continue(route.prompt, session_key)
             if not ok:
-                self._send(response)
+                self._send(response, target)
             return
         if route.kind == RouteKind.WORK:
             if self.chat_runner.active:
-                self._send("ChatGPT 请求正在执行，请发送“状态”或“停止”")
+                self._send("ChatGPT 请求正在执行，请发送“状态”或“停止”", target)
                 return
             project = route.project or self.config.default_project
             project_path = self.config.projects.get(project)
             if project_path is None:
                 self._send(
-                    f"未知项目 {project!r}；可用项目：{'、'.join(self.config.projects)}"
+                    f"未知项目 {project!r}；可用项目：{'、'.join(self.config.projects)}",
+                    target,
                 )
                 return
-            ok, response = self.runner.begin_work(project, project_path, route.prompt)
+            ok, response = self.runner.begin_work(
+                project, project_path, route.prompt, session_key
+            )
             if not ok:
-                self._send(response)
+                self._send(response, target)
             return
 
         if self.runner.active:
-            self._send("Codex 任务正在执行，请发送“状态”或“停止”")
+            self._send("Codex 任务正在执行，请发送“状态”或“停止”", target)
             return
         ok, response = self.chat_runner.begin_chat(
             session_key,
@@ -249,17 +251,11 @@ class BridgeApp:
             conversation_title=self._chat_conversation_title(message),
         )
         if not ok:
-            self._send(response)
+            self._send(response, target)
 
-    def _chat_session_key(self, message: IncomingMessage) -> str:
-        conversation = message.conversation or self.config.contact
-        if message.chat_type == "group":
-            return f"group:{conversation}:{message.sender}"
-        return f"friend:{conversation}"
+    @staticmethod
+    def _chat_session_key(message: IncomingMessage) -> str:
+        return f"ilink:{message.account_id}:{message.sender_id}"
 
     def _chat_conversation_title(self, message: IncomingMessage) -> str:
-        prefix = self.config.chatgpt_conversation_title_prefix
-        conversation = message.conversation or self.config.contact
-        if message.chat_type == "group":
-            return f"{prefix}群{conversation}-{message.sender}"[:80]
-        return f"{prefix}{conversation}"[:80]
+        return self.config.chatgpt_conversation_title

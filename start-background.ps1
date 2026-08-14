@@ -21,9 +21,14 @@ if (Test-Path -LiteralPath $pidFile) {
 }
 
 $env:PYTHONUTF8 = "1"
+& $executable --config (Join-Path $projectRoot "config.yaml") setup
+if ($LASTEXITCODE -ne 0) {
+    throw "登录检查未完成，后台服务没有启动。"
+}
+
 $process = Start-Process `
     -FilePath $executable `
-    -ArgumentList @("--config", (Join-Path $projectRoot "config.yaml"), "start") `
+    -ArgumentList @("--config", (Join-Path $projectRoot "config.yaml"), "start", "--skip-login-check") `
     -WorkingDirectory $projectRoot `
     -WindowStyle Hidden `
     -RedirectStandardOutput $stdoutLog `

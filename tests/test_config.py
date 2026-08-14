@@ -6,101 +6,63 @@ from wechat_codex.config import load_config
 
 
 class ConfigTests(unittest.TestCase):
-    def test_relative_project_is_resolved_from_config_file(self) -> None:
+    def test_defaults_and_relative_paths_are_resolved_from_config(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "repo").mkdir()
-            config_file = root / "config.yaml"
-            config_file.write_text(
-                "contact: 测试\ndefault_project: demo\nprojects:\n  demo: repo\n",
+            source = root / "config.yaml"
+            source.write_text(
+                "default_project: demo\nprojects:\n  demo: repo\n",
                 encoding="utf-8",
             )
 
-            config = load_config(config_file)
+            config = load_config(source)
 
-            self.assertEqual(config.contact, "测试")
-            self.assertEqual(config.chat_type, "friend")
-            self.assertEqual(config.wechat_message_source, "uia")
-            self.assertIsNone(config.wx_cli_path)
-            self.assertIsNone(config.wx_cli_username)
-            self.assertEqual(config.wx_cli_contacts, ("测试",))
-            self.assertEqual(config.wx_cli_groups, ())
-            self.assertEqual(config.wx_cli_timeout_seconds, 30.0)
-            self.assertEqual(config.bot_name, "ChatGpt机器人")
-            self.assertEqual(config.authorized_senders, frozenset({"無惧"}))
-            self.assertTrue(config.background_mode)
-            self.assertTrue(config.voice_recognition)
-            self.assertEqual(config.voice_retry_count, 3)
-            self.assertFalse(config.send_received_ack)
-            self.assertEqual(config.received_ack_text, "已收到，正在处理中，请稍等…")
-            self.assertEqual(config.chatgpt_browser_channel, "msedge")
-            self.assertTrue(config.chatgpt_headless)
-            self.assertIsNone(config.chatgpt_proxy_server)
-            self.assertEqual(config.chatgpt_conversation_title_prefix, "微信")
+            self.assertEqual(config.ilink_api_base_url, "https://ilinkai.weixin.qq.com")
+            self.assertEqual(
+                config.ilink_credentials_file, (root / ".runtime/ilink-account.json").resolve()
+            )
+            self.assertEqual(config.ilink_allowed_user_ids, frozenset())
+            self.assertEqual(config.ilink_codex_user_ids, frozenset())
+            self.assertTrue(config.send_received_ack)
+            self.assertEqual(config.chatgpt_browser_channel, "chrome")
+            self.assertFalse(config.chatgpt_headless)
+            self.assertEqual(config.chatgpt_conversation_title, "微信助手")
             self.assertEqual(config.projects["demo"], (root / "repo").resolve())
 
-    def test_chatgpt_proxy_server_gets_default_scheme(self) -> None:
+    def test_user_lists_proxy_and_custom_state_file(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "repo").mkdir()
-            config_file = root / "config.yaml"
-            config_file.write_text(
-                "contact: 测试\ndefault_project: demo\n"
+            source = root / "config.yaml"
+            source.write_text(
+                "default_project: demo\n"
+                "ilink_allowed_user_ids: [user-a, user-b]\n"
+                "ilink_codex_user_ids: user-a\n"
+                "ilink_state_file: state/data.json\n"
                 "chatgpt_proxy_server: 127.0.0.1:7890\n"
-                "projects:\n  demo: repo\n",
+                "chatgpt_conversation_title: 我的微信对话\n"
+                "projects:\n  demo: .\n",
                 encoding="utf-8",
             )
 
-            config = load_config(config_file)
+            config = load_config(source)
 
-            self.assertEqual(
-                config.chatgpt_proxy_server,
-                "http://127.0.0.1:7890",
-            )
+            self.assertEqual(config.ilink_allowed_user_ids, frozenset({"user-a", "user-b"}))
+            self.assertEqual(config.ilink_codex_user_ids, frozenset({"user-a"}))
+            self.assertEqual(config.ilink_state_file, (root / "state/data.json").resolve())
+            self.assertEqual(config.chatgpt_proxy_server, "http://127.0.0.1:7890")
+            self.assertEqual(config.chatgpt_conversation_title, "我的微信对话")
 
-    def test_wx_cli_message_source_options(self) -> None:
+    def test_rejects_non_https_ilink_base_url(self) -> None:
         with TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / "repo").mkdir()
-            config_file = root / "config.yaml"
-            config_file.write_text(
-                "contact: 测试\ndefault_project: demo\n"
-                "wechat_message_source: wx-cli\n"
-                "wx_cli_path: C:\\Tools\\wx.exe\n"
-                "wx_cli_username: wxid_target\n"
-                "wx_cli_contacts: [测试, 好友二]\n"
-                "wx_cli_groups: [ChatGPT]\n"
-                "wx_cli_timeout_seconds: 12\n"
-                "projects:\n  demo: repo\n",
+            source = Path(directory) / "config.yaml"
+            source.write_text(
+                "ilink_api_base_url: http://example.test\nprojects:\n  demo: .\n",
                 encoding="utf-8",
             )
 
-            config = load_config(config_file)
-
-            self.assertEqual(config.wechat_message_source, "wx_cli")
-            self.assertEqual(config.wx_cli_path, r"C:\Tools\wx.exe")
-            self.assertEqual(config.wx_cli_username, "wxid_target")
-            self.assertEqual(config.wx_cli_contacts, ("测试", "好友二"))
-            self.assertEqual(config.wx_cli_groups, ("ChatGPT",))
-            self.assertEqual(config.wx_cli_timeout_seconds, 12.0)
-
-    def test_received_ack_options(self) -> None:
-        with TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / "repo").mkdir()
-            config_file = root / "config.yaml"
-            config_file.write_text(
-                "contact: 测试\ndefault_project: demo\n"
-                "send_received_ack: true\n"
-                "received_ack_text: 已收到，处理中\n"
-                "projects:\n  demo: repo\n",
-                encoding="utf-8",
-            )
-
-            config = load_config(config_file)
-
-            self.assertTrue(config.send_received_ack)
-            self.assertEqual(config.received_ack_text, "已收到，处理中")
+            with self.assertRaisesRegex(RuntimeError, "HTTPS"):
+                load_config(source)
 
 
 if __name__ == "__main__":

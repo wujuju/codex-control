@@ -3,12 +3,14 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import time
 import unittest
+from unittest.mock import patch
 
 from wechat_codex.chatgpt_runner import (
     ACCOUNT_SELECTOR,
     ChatGPTRunner,
     LOGIN_SELECTOR,
     PlaywrightChatSession,
+    STOP_SELECTOR,
     _is_chat_url,
     _read_account_state,
 )
@@ -115,6 +117,47 @@ class FakeNavigationPage:
         self.waits.append(timeout)
 
 
+class FakeReplyItem:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    def inner_text(self, timeout):
+        return self.text
+
+
+class FakeReplyList:
+    def __init__(self, text: str) -> None:
+        self.item = FakeReplyItem(text)
+
+    def count(self):
+        return 1
+
+    def nth(self, index):
+        return self.item
+
+
+class FakeVisibility:
+    @property
+    def first(self):
+        return self
+
+    def is_visible(self, timeout):
+        return False
+
+
+class FakeReplyPage:
+    def __init__(self) -> None:
+        self.waits: list[int] = []
+
+    def locator(self, selector):
+        if selector != STOP_SELECTOR:
+            raise AssertionError(f"不应依赖其他按钮判断回复完成：{selector}")
+        return FakeVisibility()
+
+    def wait_for_timeout(self, timeout):
+        self.waits.append(timeout)
+
+
 def wait_until_idle(runner: ChatGPTRunner) -> None:
     deadline = time.monotonic() + 2
     while runner.active and time.monotonic() < deadline:
@@ -178,6 +221,25 @@ class ChatGPTRunnerTests(unittest.TestCase):
 
         self.assertEqual(page.goto_count, 3)
         self.assertEqual(page.waits, [1000, 2000])
+
+    def test_stable_reply_does_not_require_send_button(self) -> None:
+        page = FakeReplyPage()
+        replies = FakeReplyList("完整回复")
+        clock = [0.0, 0.1, 0.2, 2.0, 2.1]
+
+        with patch(
+            "wechat_codex.chatgpt_runner.time.monotonic",
+            side_effect=clock,
+        ):
+            result = PlaywrightChatSession._wait_for_reply(
+                page,
+                replies,
+                previous_count=0,
+                timeout_seconds=30,
+                stopped=lambda: False,
+            )
+
+        self.assertEqual(result, "完整回复")
 
     def test_conversation_url_survives_runner_restart(self) -> None:
         with TemporaryDirectory() as directory:

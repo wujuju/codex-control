@@ -1,5 +1,0 @@
-[console_scripts]
-wechat-codex = wechat_codex.cli:main
-
-[gui_scripts]
-wechat-codex-gui = wechat_codex.gui:main

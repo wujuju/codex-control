@@ -23,6 +23,7 @@ from PySide6.QtQml import QQmlApplicationEngine
 
 from .app import BridgeApp
 from .config import AppConfig, load_config
+from .onboarding import ensure_logins
 
 
 log = logging.getLogger(__name__)
@@ -37,8 +38,8 @@ class ConversationModel(QAbstractListModel):
     def __init__(self, config: AppConfig) -> None:
         super().__init__()
         self._item = {
-            "name": config.contact,
-            "type": "群聊" if config.chat_type == "group" else "私聊",
+            "name": "微信 iLink Bot",
+            "type": "Bot 私聊",
             "preview": "等待微信消息",
             "active": True,
         }
@@ -164,7 +165,7 @@ class BridgeController(QObject):
         self.bridgeState.connect(
             self._apply_state, Qt.ConnectionType.QueuedConnection
         )
-        self.messages.add_message("system", "系统", "界面已启动，正在连接微信")
+        self.messages.add_message("system", "系统", "界面已启动，正在连接微信 iLink")
 
     @Property(str, notify=statusChanged)
     def statusText(self) -> str:
@@ -180,17 +181,15 @@ class BridgeController(QObject):
 
     @Property(str, constant=True)
     def conversationTitle(self) -> str:
-        return self.config.contact
+        return "微信 iLink Bot"
 
     @Property(str, constant=True)
     def conversationType(self) -> str:
-        return "群聊" if self.config.chat_type == "group" else "私聊"
+        return "Bot 私聊"
 
     @Property(str, constant=True)
     def policyText(self) -> str:
-        if self.config.chat_type == "group":
-            return f"仅响应 @{self.config.bot_name}"
-        return "私聊直接回复"
+        return "仅响应已授权的 iLink 用户 ID"
 
     @Slot()
     def startBridge(self) -> None:
@@ -273,6 +272,7 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     config = load_config(args.config)
     config.runtime_dir.mkdir(parents=True, exist_ok=True)
+    ensure_logins(config)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(name)s] [%(levelname)s] %(message)s",

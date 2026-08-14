@@ -119,10 +119,10 @@ ApplicationWindow {
                                 Layout.preferredWidth: 42
                                 Layout.preferredHeight: 42
                                 radius: 14
-                                color: conversationDelegate.chatType === "群聊" ? "#7357d9" : "#2d9b73"
+                                color: "#2d9b73"
                                 Text {
                                     anchors.centerIn: parent
-                                    text: conversationDelegate.chatType === "群聊" ? "群" : "私"
+                                    text: "Bot"
                                     color: "white"
                                     font.pixelSize: 14
                                     font.bold: true

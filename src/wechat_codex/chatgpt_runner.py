@@ -31,13 +31,6 @@ STOP_SELECTOR = (
 )
 ASSISTANT_SELECTOR = '[data-message-author-role="assistant"]'
 ASSISTANT_FALLBACK_SELECTOR = 'article[data-turn="assistant"]'
-CHAT_PROMPT_PREFIX = (
-    "这是从我的个人微信转发到 ChatGPT 的消息。请使用中文，回答适合微信阅读，"
-    "简洁、直接、准确。需要操作本地项目时，请提示我使用“干活：任务”命令。\n\n"
-    "微信消息：\n"
-)
-
-
 class ChatStopped(RuntimeError):
     pass
 
@@ -63,6 +56,7 @@ SessionFactory = Callable[[Path, str, bool, str | None], BrowserSession]
 @dataclass(frozen=True)
 class ChatEvent:
     text: str
+    session_key: str | None = None
 
 
 @dataclass
@@ -214,11 +208,11 @@ class PlaywrightChatSession:
         if stopped():
             raise ChatStopped("ChatGPT 请求已停止")
 
-        assistant_messages = page.locator(ASSISTANT_SELECTOR)
-        if assistant_messages.count() == 0:
-            assistant_messages = page.locator(ASSISTANT_FALLBACK_SELECTOR)
+        assistant_messages = page.locator(
+            f"{ASSISTANT_SELECTOR}, {ASSISTANT_FALLBACK_SELECTOR}"
+        )
         previous_count = assistant_messages.count()
-        composer.fill(CHAT_PROMPT_PREFIX + prompt)
+        composer.fill(prompt)
         send_button = page.locator(SEND_SELECTOR).first
         send_button.wait_for(state="visible", timeout=5_000)
         send_button.click()
@@ -415,10 +409,8 @@ class PlaywrightChatSession:
                         generating = page.locator(STOP_SELECTOR).first.is_visible(
                             timeout=500
                         )
-                        ready = page.locator(SEND_SELECTOR).first.is_visible(timeout=500)
                         if (
                             not generating
-                            and ready
                             and time.monotonic() - unchanged_since >= 1.5
                         ):
                             return current
@@ -537,7 +529,10 @@ class ChatGPTRunner:
                 return False, "当前已经是新的 ChatGPT 对话"
         self._remove_conversation(session_key)
         self.events.put(
-            ChatEvent("已切换到新的 ChatGPT 对话；旧对话仍保留在你的 ChatGPT 历史中")
+            ChatEvent(
+                "已切换到新的 ChatGPT 对话；旧对话仍保留在你的 ChatGPT 历史中",
+                session_key,
+            )
         )
         return True, "已切换到新的 ChatGPT 对话"
 
@@ -560,9 +555,11 @@ class ChatGPTRunner:
                 self._startup_error = exc
             else:
                 detail = str(exc).strip() or type(exc).__name__
-                self.events.put(
-                    ChatEvent(f"ChatGPT 专用浏览器意外退出：{detail[-1000:]}")
-                )
+                with self._lock:
+                    session_key = self._state.session_key
+                self.events.put(ChatEvent(
+                    f"ChatGPT 专用浏览器意外退出：{detail[-1000:]}", session_key
+                ))
                 self._finish()
         finally:
             self._worker_ready.set()
@@ -581,15 +578,17 @@ class ChatGPTRunner:
             )
 
             if self._stopped():
-                self.events.put(ChatEvent("ChatGPT 请求已停止"))
+                self.events.put(ChatEvent("ChatGPT 请求已停止", job.session_key))
                 return
             self._set_conversation(job.session_key, new_url)
-            self.events.put(ChatEvent(text))
+            self.events.put(ChatEvent(text, job.session_key))
         except ChatStopped:
-            self.events.put(ChatEvent("ChatGPT 请求已停止"))
+            self.events.put(ChatEvent("ChatGPT 请求已停止", job.session_key))
         except Exception as exc:
             detail = str(exc).strip() or type(exc).__name__
-            self.events.put(ChatEvent(f"ChatGPT Plus 网页请求失败：{detail[-1000:]}"))
+            self.events.put(ChatEvent(
+                f"ChatGPT Plus 网页请求失败：{detail[-1000:]}", job.session_key
+            ))
         finally:
             self._finish()
 
@@ -676,6 +675,39 @@ class ChatGPTRunner:
                 result.append(self.events.get_nowait())
             except queue.Empty:
                 return result
+
+
+def has_chatgpt_plus_login(
+    profile_dir: Path,
+    browser_channel: str,
+    proxy_server: str | None,
+) -> bool:
+    """Check the dedicated profile without opening a visible browser window."""
+    if not profile_dir.is_dir() or not any(profile_dir.iterdir()):
+        return False
+
+    from playwright.sync_api import sync_playwright
+
+    try:
+        with sync_playwright() as playwright:
+            launch_options: dict[str, Any] = {
+                "user_data_dir": str(profile_dir),
+                "channel": browser_channel,
+                "headless": True,
+                "viewport": {"width": 1280, "height": 900},
+            }
+            if proxy_server:
+                launch_options["proxy"] = {"server": proxy_server}
+            context = playwright.chromium.launch_persistent_context(**launch_options)
+            try:
+                page = context.pages[0] if context.pages else context.new_page()
+                PlaywrightChatSession._navigate(page, CHATGPT_HOME, 60)
+                return _wait_for_account_state(page, timeout_ms=10_000).plus
+            finally:
+                context.close()
+    except Exception:
+        log.warning("无法静默确认 ChatGPT Plus 登录状态", exc_info=True)
+        return False
 
 
 def login_chatgpt(

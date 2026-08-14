@@ -14,6 +14,7 @@ from typing import Iterable
 @dataclass(frozen=True)
 class RunnerEvent:
     text: str
+    session_key: str | None = None
 
 
 @dataclass
@@ -26,6 +27,7 @@ class RunnerState:
     thread_id: str | None = None
     process: subprocess.Popen[str] | None = None
     stop_requested: bool = False
+    session_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -91,7 +93,13 @@ class CodexRunner:
         with self._lock:
             return self._state.active
 
-    def begin_work(self, project: str, project_path: Path, prompt: str) -> tuple[bool, str]:
+    def begin_work(
+        self,
+        project: str,
+        project_path: Path,
+        prompt: str,
+        session_key: str | None = None,
+    ) -> tuple[bool, str]:
         if not project_path.is_dir():
             return False, f"项目目录不存在：{project_path}"
         if not (project_path / ".git").exists():
@@ -103,9 +111,13 @@ class CodexRunner:
             "最终用中文简洁说明改了什么、验证结果和未解决问题。\n\n任务：\n" + prompt
         )
         args = self.build_work_args(project_path, work_prompt)
-        return self._begin(args, "work", project, project_path, self.work_timeout_seconds)
+        return self._begin(
+            args, "work", project, project_path, self.work_timeout_seconds, session_key
+        )
 
-    def begin_continue(self, prompt: str) -> tuple[bool, str]:
+    def begin_continue(
+        self, prompt: str, session_key: str | None = None
+    ) -> tuple[bool, str]:
         with self._lock:
             thread_id = self._last_work_thread_id
             project = self._last_work_project
@@ -117,7 +129,9 @@ class CodexRunner:
             + prompt
         )
         args = self.build_continue_args(thread_id, continue_prompt)
-        return self._begin(args, "continue", project, project_path, self.work_timeout_seconds)
+        return self._begin(
+            args, "continue", project, project_path, self.work_timeout_seconds, session_key
+        )
 
     def build_work_args(self, project_path: Path, prompt: str) -> list[str]:
         return [
@@ -141,6 +155,7 @@ class CodexRunner:
         project: str | None,
         cwd: Path,
         timeout: int,
+        session_key: str | None,
     ) -> tuple[bool, str]:
         with self._lock:
             if self._state.active:
@@ -151,6 +166,7 @@ class CodexRunner:
                 project=project,
                 project_path=cwd,
                 started_at=time.time(),
+                session_key=session_key,
             )
 
         worker = threading.Thread(
@@ -163,6 +179,8 @@ class CodexRunner:
         return True, f"已开始 Codex 任务（{project}）"
 
     def _run(self, args: list[str], cwd: Path, timeout: int) -> None:
+        with self._lock:
+            session_key = self._state.session_key
         flags = 0
         if os.name == "nt":
             flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
@@ -197,7 +215,7 @@ class CodexRunner:
                 except subprocess.TimeoutExpired:
                     process.kill()
                     stdout, stderr = process.communicate()
-                self.events.put(RunnerEvent(f"任务超时（{timeout} 秒），已停止"))
+                self.events.put(RunnerEvent(f"任务超时（{timeout} 秒），已停止", session_key))
                 return
 
             parsed = parse_jsonl(stdout.splitlines())
@@ -211,16 +229,18 @@ class CodexRunner:
                         self._last_work_path = self._state.project_path
 
             if stopped:
-                self.events.put(RunnerEvent("任务已停止"))
+                self.events.put(RunnerEvent("任务已停止", session_key))
             elif process.returncode == 0 and parsed.final_text:
-                self.events.put(RunnerEvent(parsed.final_text))
+                self.events.put(RunnerEvent(parsed.final_text, session_key))
             else:
                 detail = parsed.error_text or stderr.strip() or "Codex 没有返回结果"
-                self.events.put(RunnerEvent(f"任务失败：{detail[-1200:]}"))
+                self.events.put(RunnerEvent(f"任务失败：{detail[-1200:]}", session_key))
         except FileNotFoundError:
-            self.events.put(RunnerEvent(f"找不到 Codex 命令：{self.codex_command}"))
+            self.events.put(RunnerEvent(f"找不到 Codex 命令：{self.codex_command}", session_key))
         except Exception as exc:  # pragma: no cover - defensive boundary around subprocesses
-            self.events.put(RunnerEvent(f"Codex 执行异常：{type(exc).__name__}: {exc}"))
+            self.events.put(
+                RunnerEvent(f"Codex 执行异常：{type(exc).__name__}: {exc}", session_key)
+            )
         finally:
             with self._lock:
                 self._state.active = False
