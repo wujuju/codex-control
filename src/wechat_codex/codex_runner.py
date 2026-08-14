@@ -235,7 +235,7 @@ class CodexRunner:
         started_at = time.time()
         with self._lock:
             if self._state.active:
-                return False, "已有任务在执行，请发送 /状态 或 /停止"
+                return False, "已有任务在执行，请发送 @状态 或 @停止"
             self._state = RunnerState(
                 active=True,
                 kind=kind,

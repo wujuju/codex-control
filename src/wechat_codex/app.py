@@ -35,6 +35,16 @@ class _OutboundItem:
     target: ReplyTarget
 
 
+@dataclass(frozen=True)
+class _PendingChat:
+    message_key: str
+    session_key: str
+    prompt: str
+    conversation_title: str
+    image_paths: tuple[str, ...]
+    target: ReplyTarget
+
+
 class BridgeApp:
     def __init__(
         self,
@@ -53,6 +63,8 @@ class BridgeApp:
         self._selected_projects = self._load_selected_projects()
         self._outbox_file = config.runtime_dir / "outbound_queue.json"
         self._outbox = self._load_outbox()
+        self._pending_file = config.runtime_dir / "pending_chats.json"
+        self._pending_chats = self._load_pending_chats()
         self.wechat = ILinkClient(
             credentials_path=config.ilink_credentials_file,
             state_path=config.ilink_state_file,
@@ -255,6 +267,7 @@ class BridgeApp:
                         event.file_paths,
                     )
                 self._flush_outbox()
+                self._start_next_pending_chat()
 
                 for message in self.wechat.poll():
                     try:
@@ -304,7 +317,7 @@ class BridgeApp:
         self._handle(message, target, session_key)
 
     def _acknowledge(self, message: IncomingMessage, target: ReplyTarget) -> None:
-        if not self.config.send_received_ack or message.content.lstrip().startswith("/"):
+        if not self.config.send_received_ack or message.content.lstrip().startswith("@"):
             return
         try:
             self._send(self.config.received_ack_text, target)
@@ -340,7 +353,7 @@ class BridgeApp:
             suggestion_text = f"\n你是否想使用：{suggestion}" if suggestion else ""
             self._send(
                 f"命令不存在：{route.prompt}{suggestion_text}"
-                "\n发送 /帮助 查看全部命令。",
+                "\n发送 @帮助 查看全部命令。",
                 target,
             )
             return
@@ -349,6 +362,8 @@ class BridgeApp:
             return
         if route.kind == RouteKind.STATUS:
             status = self.chat_runner.status() if self.chat_runner.active else self.runner.status()
+            if self._pending_chats:
+                status += f"\n待处理消息：{len(self._pending_chats)} 条"
             self._send(status, target)
             return
         if route.kind == RouteKind.STOP:
@@ -411,7 +426,7 @@ class BridgeApp:
             return
         if route.kind == RouteKind.RESEND:
             if self.chat_runner.active or self.runner.active:
-                self._send("当前有任务正在执行，请完成或发送 /停止 后再重发", target)
+                self._send("当前有任务正在执行，请完成或发送 @停止 后再重发", target)
                 return
             event = self.chat_runner.last_reply(session_key)
             if event is None or (
@@ -462,7 +477,7 @@ class BridgeApp:
             return
         if route.kind == RouteKind.RECONNECT_WECHAT:
             if self.chat_runner.active or self.runner.active:
-                self._send("当前有任务正在执行，请完成或发送 /停止 后再重连", target)
+                self._send("当前有任务正在执行，请完成或发送 @停止 后再重连", target)
                 return
             try:
                 self.wechat.reconnect()
@@ -477,7 +492,7 @@ class BridgeApp:
             return
         if route.kind == RouteKind.NEW_CHAT:
             if self.runner.active:
-                self._send("Codex 任务正在执行，请发送 /状态 或 /停止", target)
+                self._send("Codex 任务正在执行，请发送 @状态 或 @停止", target)
                 return
             ok, response = self.chat_runner.begin_reset(session_key)
             if not ok:
@@ -485,7 +500,7 @@ class BridgeApp:
             return
         if route.kind == RouteKind.CONTINUE:
             if self.chat_runner.active:
-                self._send("ChatGPT 请求正在执行，请发送 /状态 或 /停止", target)
+                self._send("ChatGPT 请求正在执行，请发送 @状态 或 @停止", target)
                 return
             ok, response = self.runner.begin_continue(route.prompt, session_key)
             if not ok:
@@ -493,7 +508,7 @@ class BridgeApp:
             return
         if route.kind == RouteKind.WORK:
             if self.chat_runner.active:
-                self._send("ChatGPT 请求正在执行，请发送 /状态 或 /停止", target)
+                self._send("ChatGPT 请求正在执行，请发送 @状态 或 @停止", target)
                 return
             project = route.project or self._selected_project(session_key)
             project_path = self.config.projects.get(project)
@@ -511,19 +526,123 @@ class BridgeApp:
             return
 
         if self.runner.active:
-            self._send("Codex 任务正在执行，请发送 /状态 或 /停止", target)
+            self._send("Codex 任务正在执行，请发送 @状态 或 @停止", target)
             return
         prompt = route.prompt
         if message.image_path and prompt == "[图片]":
             prompt = "请分析这张图片，并说明你看到了什么。"
+        pending = _PendingChat(
+            message_key=message.key,
+            session_key=session_key,
+            prompt=prompt,
+            conversation_title=self._chat_conversation_title(message),
+            image_paths=(message.image_path,) if message.image_path else (),
+            target=target,
+        )
+        if self.chat_runner.active or self._pending_chats:
+            self._enqueue_pending_chat(pending)
+            if not self.chat_runner.active:
+                self._start_next_pending_chat()
+            return
         ok, response = self.chat_runner.begin_chat(
             session_key,
             prompt,
-            conversation_title=self._chat_conversation_title(message),
-            image_paths=(message.image_path,) if message.image_path else (),
+            conversation_title=pending.conversation_title,
+            image_paths=pending.image_paths,
         )
         if not ok:
             self._send(response, target)
+
+    def _enqueue_pending_chat(self, pending: _PendingChat) -> None:
+        if any(item.message_key == pending.message_key for item in self._pending_chats):
+            return
+        self._pending_chats.append(pending)
+        self._save_pending_chats()
+        self._send(
+            f"当前请求仍在处理；本消息已排队（第 {len(self._pending_chats)} 位）",
+            pending.target,
+        )
+
+    def _start_next_pending_chat(self) -> None:
+        if not self._pending_chats or self.chat_runner.active or self.runner.active:
+            return
+        pending = self._pending_chats[0]
+        self._reply_targets[pending.session_key] = pending.target
+        ok, response = self.chat_runner.begin_chat(
+            pending.session_key,
+            pending.prompt,
+            conversation_title=pending.conversation_title,
+            image_paths=pending.image_paths,
+        )
+        if not ok and self.chat_runner.active:
+            return
+        self._pending_chats.pop(0)
+        self._save_pending_chats()
+        if not ok:
+            self._send_event(response, pending.session_key)
+
+    def _load_pending_chats(self) -> list[_PendingChat]:
+        if not self._pending_file.is_file():
+            return []
+        try:
+            raw = json.loads(self._pending_file.read_text(encoding="utf-8"))
+            if not isinstance(raw, list):
+                raise ValueError("顶层不是 JSON 数组")
+            result: list[_PendingChat] = []
+            for value in raw:
+                if not isinstance(value, dict):
+                    continue
+                message_key = str(value.get("message_key") or "")
+                session_key = str(value.get("session_key") or "")
+                prompt = str(value.get("prompt") or "")
+                user_id = str(value.get("user_id") or "")
+                if not message_key or not session_key or not prompt or not user_id:
+                    continue
+                raw_images = value.get("image_paths")
+                image_paths = (
+                    tuple(str(path) for path in raw_images if str(path))
+                    if isinstance(raw_images, list)
+                    else ()
+                )
+                result.append(
+                    _PendingChat(
+                        message_key,
+                        session_key,
+                        prompt,
+                        str(value.get("conversation_title") or "微信助手"),
+                        image_paths,
+                        ReplyTarget(
+                            user_id,
+                            str(value.get("context_token") or ""),
+                        ),
+                    )
+                )
+            return result
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            log.warning("忽略无法读取的待处理消息队列：%s", exc)
+            return []
+
+    def _save_pending_chats(self) -> None:
+        self.config.runtime_dir.mkdir(parents=True, exist_ok=True)
+        temporary = self._pending_file.with_suffix(".json.tmp")
+        payload = [
+            {
+                "message_key": item.message_key,
+                "session_key": item.session_key,
+                "prompt": item.prompt,
+                "conversation_title": item.conversation_title,
+                "image_paths": list(item.image_paths),
+                "user_id": item.target.user_id,
+                "context_token": item.target.context_token,
+            }
+            for item in self._pending_chats
+        ]
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, self._pending_file)
 
     @staticmethod
     def _chat_session_key(message: IncomingMessage) -> str:
@@ -568,7 +687,7 @@ class BridgeApp:
         for name in self.config.projects:
             marker = " [当前]" if name == selected else ""
             lines.append(f"- {name}{marker}")
-        lines.append("发送 /切换项目：项目名 进行切换")
+        lines.append("发送 @切换项目：项目名 进行切换")
         return "\n".join(lines)
 
     def _switch_project(self, session_key: str, project: str) -> str:

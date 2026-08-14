@@ -155,6 +155,8 @@ class BridgeAppTests(unittest.TestCase):
         app._selected_projects = {}
         app._outbox_file = app.config.runtime_dir / "outbound_queue.json"
         app._outbox = []
+        app._pending_file = app.config.runtime_dir / "pending_chats.json"
+        app._pending_chats = []
         return app
 
     def test_incoming_ack_uses_same_reply_context(self) -> None:
@@ -169,21 +171,21 @@ class BridgeAppTests(unittest.TestCase):
             app._reply_targets["ilink:bot-1:owner-id"], ReplyTarget("owner-id", "ctx-1")
         )
 
-    def test_slash_commands_skip_ack_and_unknown_command_skips_chatgpt(self) -> None:
+    def test_at_commands_skip_ack_and_unknown_command_skips_chatgpt(self) -> None:
         app = self.make_app()
 
-        app._process_incoming(message(content="/归档"))
+        app._process_incoming(message(content="@归档"))
 
         self.assertEqual(len(app.wechat.sent), 1)
-        self.assertIn("命令不存在：/归档", app.wechat.sent[0][0])
-        self.assertIn("你是否想使用：/归档对话", app.wechat.sent[0][0])
+        self.assertIn("命令不存在：@归档", app.wechat.sent[0][0])
+        self.assertIn("你是否想使用：@归档对话", app.wechat.sent[0][0])
         self.assertNotIn("已收到", app.wechat.sent[0][0])
         self.assertEqual(app.chat_runner.chat_calls, [])
 
-    def test_known_slash_command_returns_result_without_ack(self) -> None:
+    def test_known_at_command_returns_result_without_ack(self) -> None:
         app = self.make_app()
 
-        app._process_incoming(message(content="/状态"))
+        app._process_incoming(message(content="@状态"))
 
         self.assertEqual(
             app.wechat.sent,
@@ -205,7 +207,7 @@ class BridgeAppTests(unittest.TestCase):
             "ilink_allowed_user_ids": frozenset({"user-a"}),
             "ilink_codex_user_ids": frozenset({"user-a"}),
         })
-        incoming = message("user-a", "/干活：运行测试")
+        incoming = message("user-a", "@干活：运行测试")
         target = incoming.reply_target
         session_key = app._chat_session_key(incoming)
 
@@ -245,6 +247,51 @@ class BridgeAppTests(unittest.TestCase):
                 ("D:/runtime/inbound-images/photo.jpg",),
             )],
         )
+
+    def test_message_received_during_chat_is_queued_and_started_later(self) -> None:
+        app = self.make_app()
+        incoming = message("user-a", "后续问题")
+        target = incoming.reply_target
+        session_key = app._chat_session_key(incoming)
+        app.chat_runner.active = True
+
+        app._handle(incoming, target, session_key)
+
+        self.assertEqual(app.chat_runner.chat_calls, [])
+        self.assertEqual(len(app._pending_chats), 1)
+        self.assertTrue(app._pending_file.is_file())
+        self.assertIn("已排队", app.wechat.sent[-1][0])
+
+        app.chat_runner.active = False
+        app._start_next_pending_chat()
+
+        self.assertEqual(
+            app.chat_runner.chat_calls,
+            [(session_key, "后续问题", "微信助手", ())],
+        )
+        self.assertEqual(app._pending_chats, [])
+
+    def test_pending_chat_queue_is_restored_after_restart(self) -> None:
+        app = self.make_app()
+        incoming = message("user-a", "不能丢失的问题")
+        app.chat_runner.active = True
+        app._handle(incoming, incoming.reply_target, app._chat_session_key(incoming))
+
+        app._pending_chats = app._load_pending_chats()
+
+        self.assertEqual(len(app._pending_chats), 1)
+        self.assertEqual(app._pending_chats[0].prompt, "不能丢失的问题")
+        self.assertEqual(app._pending_chats[0].target, incoming.reply_target)
+
+    def test_pending_chat_deduplicates_retried_ilink_message(self) -> None:
+        app = self.make_app()
+        incoming = message("user-a", "同一条问题")
+        app.chat_runner.active = True
+
+        app._handle(incoming, incoming.reply_target, app._chat_session_key(incoming))
+        app._handle(incoming, incoming.reply_target, app._chat_session_key(incoming))
+
+        self.assertEqual(len(app._pending_chats), 1)
 
     def test_chatgpt_reply_images_are_sent_to_same_wechat_context(self) -> None:
         app = self.make_app()
@@ -299,13 +346,13 @@ class BridgeAppTests(unittest.TestCase):
 
     def test_conversation_commands_are_dispatched(self) -> None:
         app = self.make_app()
-        incoming = message("user-a", "/归档对话")
+        incoming = message("user-a", "@归档对话")
         target = incoming.reply_target
         session_key = app._chat_session_key(incoming)
 
         app._handle(incoming, target, session_key)
-        app._handle(message("user-a", "/重命名对话：发布方案"), target, session_key)
-        app._handle(message("user-a", "/重试"), target, session_key)
+        app._handle(message("user-a", "@重命名对话：发布方案"), target, session_key)
+        app._handle(message("user-a", "@重试"), target, session_key)
 
         self.assertEqual(app.chat_runner.archive_calls, [session_key])
         self.assertEqual(
@@ -316,14 +363,14 @@ class BridgeAppTests(unittest.TestCase):
 
     def test_second_stage_conversation_commands_are_dispatched(self) -> None:
         app = self.make_app()
-        incoming = message("user-a", "/对话列表")
+        incoming = message("user-a", "@对话列表")
         target = incoming.reply_target
         session_key = app._chat_session_key(incoming)
 
         app._handle(incoming, target, session_key)
-        app._handle(message("user-a", "/切换对话：2"), target, session_key)
-        app._handle(message("user-a", "/导出对话"), target, session_key)
-        app._handle(message("user-a", "/总结对话"), target, session_key)
+        app._handle(message("user-a", "@切换对话：2"), target, session_key)
+        app._handle(message("user-a", "@导出对话"), target, session_key)
+        app._handle(message("user-a", "@总结对话"), target, session_key)
 
         self.assertEqual(
             app.chat_runner.switch_calls,
@@ -338,7 +385,7 @@ class BridgeAppTests(unittest.TestCase):
 
     def test_resend_uses_only_last_successful_reply(self) -> None:
         app = self.make_app()
-        incoming = message("user-a", "/重发")
+        incoming = message("user-a", "@重发")
         target = incoming.reply_target
         session_key = app._chat_session_key(incoming)
         app._reply_targets[session_key] = target
@@ -406,12 +453,12 @@ class BridgeAppTests(unittest.TestCase):
                 "projects": {"control": root, "demo": root / "demo"},
             })
             app._project_selection_file = root / "selected_projects.json"
-            incoming = message("owner-id", "/切换项目：demo")
+            incoming = message("owner-id", "@切换项目：demo")
             session_key = app._chat_session_key(incoming)
 
             app._handle(incoming, incoming.reply_target, session_key)
             app._handle(
-                message("owner-id", "/干活：运行测试"),
+                message("owner-id", "@干活：运行测试"),
                 incoming.reply_target,
                 session_key,
             )
@@ -450,7 +497,7 @@ class BridgeAppTests(unittest.TestCase):
             "ilink_allowed_user_ids": frozenset({"user-a"}),
             "ilink_codex_user_ids": frozenset({"owner-id"}),
         })
-        incoming = message("user-a", "/重启浏览器")
+        incoming = message("user-a", "@重启浏览器")
 
         app._handle(incoming, incoming.reply_target, app._chat_session_key(incoming))
 
@@ -459,8 +506,8 @@ class BridgeAppTests(unittest.TestCase):
 
     def test_authorized_recovery_commands_restart_connections(self) -> None:
         app = self.make_app()
-        reconnect = message("owner-id", "/重连微信")
-        restart = message("owner-id", "/重启浏览器")
+        reconnect = message("owner-id", "@重连微信")
+        restart = message("owner-id", "@重启浏览器")
 
         app._handle(reconnect, reconnect.reply_target, app._chat_session_key(reconnect))
         app._handle(restart, restart.reply_target, app._chat_session_key(restart))

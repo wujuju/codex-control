@@ -221,6 +221,23 @@ def _is_usable_generated_image(metadata: Any) -> bool:
         return False
 
 
+def _prompt_expects_image(prompt: str) -> bool:
+    return bool(IMAGE_REQUEST.search(prompt) or IMAGE_EDIT_FOLLOWUP.search(prompt))
+
+
+def _normalize_activity_text(value: str) -> str:
+    """Remove live timers so only meaningful tool/reply changes renew a wait."""
+    text = re.sub(r"\b\d{1,2}:\d{2}(?::\d{2})?\b", "<time>", value)
+    text = re.sub(
+        r"(?:\b\d+\s*(?:milliseconds?|seconds?|secs?|minutes?|mins?|"
+        r"hours?|hrs?|[hms])\b|\d+\s*(?:毫秒|秒钟?|分钟|小时))",
+        "<duration>",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return " ".join(text.split())[-4000:]
+
+
 def _filter_reply_text(value: Any) -> str:
     """Return readable reply text without web-only citations or source links."""
     if not isinstance(value, str):
@@ -363,6 +380,7 @@ class BrowserSession(Protocol):
         timeout_seconds: int,
         stopped: Callable[[], bool],
         image_paths: tuple[Path, ...],
+        expect_image: bool | None = None,
     ) -> tuple[str, str, tuple[Path, ...]]: ...
 
     def archive(self, conversation_url: str, timeout_seconds: int) -> None: ...
@@ -415,6 +433,7 @@ class _ChatJob:
     conversation_url: str | None
     conversation_title: str | None
     image_paths: tuple[Path, ...]
+    expect_image: bool
 
 
 class _ControlKind(str, Enum):
@@ -431,6 +450,7 @@ class _ControlJob:
     kind: _ControlKind
     conversation_url: str
     value: str = ""
+    expect_image: bool = False
 
 
 def _read_account_state(page: Any) -> _AccountState:
@@ -544,6 +564,7 @@ class PlaywrightChatSession:
         timeout_seconds: int,
         stopped: Callable[[], bool],
         image_paths: tuple[Path, ...],
+        expect_image: bool | None = None,
     ) -> tuple[str, str, tuple[Path, ...]]:
         page = self._page
         if page is None:
@@ -578,12 +599,12 @@ class PlaywrightChatSession:
             usable_only=False,
             exclude_user=False,
         )
-        expect_image = bool(
-            IMAGE_REQUEST.search(prompt) or IMAGE_EDIT_FOLLOWUP.search(prompt)
+        effective_expect_image = (
+            _prompt_expects_image(prompt) if expect_image is None else expect_image
         )
         log.info(
             "等待 ChatGPT 回复：图片模式=%s，轮次边界=%d，已存在轮次=%d，历史图片=%d",
-            expect_image,
+            effective_expect_image,
             image_baseline.max_turn_number,
             len(image_baseline.prior_turn_ids),
             len(image_baseline.media_keys),
@@ -600,7 +621,7 @@ class PlaywrightChatSession:
             timeout_seconds,
             stopped,
             image_baseline,
-            expect_image=expect_image,
+            expect_image=effective_expect_image,
         )
         image_paths = self._save_reply_images(
             page,
@@ -878,9 +899,11 @@ class PlaywrightChatSession:
         deadline = initial_deadline
         last_text = ""
         last_media_keys: frozenset[str] = frozenset()
+        last_activity_key: tuple[tuple[str, str, int], ...] = ()
         unchanged_since: float | None = None
         image_tool_seen = False
         extension_logged = False
+        saw_tool_activity = False
 
         while True:
             now = time.monotonic()
@@ -895,28 +918,52 @@ class PlaywrightChatSession:
                 page,
                 image_baseline,
             )
+            activity_key = PlaywrightChatSession._reply_activity_key(
+                page,
+                image_baseline,
+            )
             image_count = len(new_media_keys)
             current = ""
-            if count > previous_count:
+            reply = PlaywrightChatSession._current_reply_assistant(
+                page,
+                image_baseline,
+            )
+            if reply is None and count > previous_count:
                 reply = assistant_messages.nth(count - 1)
+            if reply is not None:
                 current = _extract_reply_text(reply)
                 image_count = max(
                     image_count,
                     PlaywrightChatSession._visible_reply_image_count(reply),
                 )
+            content_changed = (
+                current != last_text or new_media_keys != last_media_keys
+            ) and bool(current or new_media_keys or last_text or last_media_keys)
+            activity_changed = bool(
+                activity_key and activity_key != last_activity_key
+            )
+            if activity_changed:
+                last_activity_key = activity_key
+                saw_tool_activity = True
+            if content_changed:
+                last_text = current
+                last_media_keys = new_media_keys
+            if content_changed or activity_changed:
+                unchanged_since = now
+                # Treat the configured timeout as an inactivity limit once
+                # ChatGPT starts streaming or a web/tool turn changes.
+                deadline = now + timeout_seconds
+                if now >= initial_deadline and not extension_logged:
+                    log.info("ChatGPT 回复仍在更新，已根据最近活动自动延长等待")
+                    extension_logged = True
+
             if current or image_count:
-                if current != last_text or new_media_keys != last_media_keys:
+                if unchanged_since is None:
                     last_text = current
                     last_media_keys = new_media_keys
                     unchanged_since = now
-                    # Treat the configured timeout as an inactivity limit once
-                    # ChatGPT starts streaming. Ongoing text/image changes keep
-                    # the request alive until the reply settles.
                     deadline = now + timeout_seconds
-                    if now >= initial_deadline and not extension_logged:
-                        log.info("ChatGPT 回复仍在更新，已根据最近活动自动延长等待")
-                        extension_logged = True
-                elif unchanged_since is not None:
+                else:
                     generating = page.locator(STOP_SELECTOR).first.is_visible(
                         timeout=500
                     )
@@ -937,6 +984,10 @@ class PlaywrightChatSession:
         if last_text or last_media_keys:
             raise TimeoutError(
                 f"ChatGPT 回复连续 {timeout_seconds} 秒没有继续更新，等待超时"
+            )
+        if saw_tool_activity:
+            raise TimeoutError(
+                f"ChatGPT 搜索或工具连续 {timeout_seconds} 秒没有继续更新，等待超时"
             )
         raise TimeoutError("等待 ChatGPT 回复超时")
 
@@ -1041,18 +1092,70 @@ class PlaywrightChatSession:
             return frozenset()
 
     @staticmethod
-    def _current_reply_images(page: Any, baseline: _ImageBaseline) -> list[Any]:
-        """Return images from only the newest turns created after the baseline."""
+    def _current_reply_turns(page: Any, baseline: _ImageBaseline) -> list[Any]:
+        """Return recent DOM turns created after the request baseline."""
         turns = page.locator('main [data-testid^="conversation-turn-"]')
         result: list[Any] = []
         count = turns.count()
-        # A response can create a small number of adjacent tool/assistant turns.
-        # Capping the scan avoids repeatedly traversing the full conversation.
-        for index in range(max(0, count - 6), count):
+        # Tool use can create several adjacent turns; scan a bounded tail to
+        # support long conversations whose older DOM nodes are virtualized.
+        for index in range(max(0, count - 10), count):
             turn = turns.nth(index)
             turn_id = str(turn.get_attribute("data-testid") or "")
-            if not PlaywrightChatSession._is_current_turn(turn_id, baseline):
-                continue
+            if PlaywrightChatSession._is_current_turn(turn_id, baseline):
+                result.append(turn)
+        return result
+
+    @staticmethod
+    def _current_reply_assistant(page: Any, baseline: _ImageBaseline) -> Any | None:
+        """Find the newest assistant node by turn id, not by total node count."""
+        try:
+            selector = f"{ASSISTANT_SELECTOR}, {ASSISTANT_FALLBACK_SELECTOR}"
+            for turn in reversed(
+                PlaywrightChatSession._current_reply_turns(page, baseline)
+            ):
+                if (
+                    turn.get_attribute("data-message-author-role") == "assistant"
+                    or turn.get_attribute("data-turn") == "assistant"
+                ):
+                    return turn
+                assistants = turn.locator(selector)
+                if assistants.count():
+                    return assistants.last
+            return None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _reply_activity_key(
+        page: Any,
+        baseline: _ImageBaseline,
+    ) -> tuple[tuple[str, str, int], ...]:
+        """Fingerprint new assistant/tool turns to renew an active wait."""
+        try:
+            result: list[tuple[str, str, int]] = []
+            for turn in PlaywrightChatSession._current_reply_turns(page, baseline):
+                turn_id = str(turn.get_attribute("data-testid") or "")
+                try:
+                    text = _normalize_activity_text(turn.inner_text(timeout=500))
+                except Exception:
+                    text = ""
+                try:
+                    element_count = int(
+                        turn.evaluate("node => node.querySelectorAll('*').length")
+                    )
+                except Exception:
+                    element_count = 0
+                result.append((turn_id, text, element_count))
+            return tuple(result)
+        except Exception:
+            return ()
+
+    @staticmethod
+    def _current_reply_images(page: Any, baseline: _ImageBaseline) -> list[Any]:
+        """Return images from only the newest turns created after the baseline."""
+        result: list[Any] = []
+        for turn in PlaywrightChatSession._current_reply_turns(page, baseline):
             images = turn.locator("img")
             result.extend(images.nth(image_index) for image_index in range(images.count()))
         return result
@@ -1253,6 +1356,7 @@ class ChatGPTRunner:
         self._titles = self._load_titles()
         self._history = self._load_history()
         self._last_replies: dict[str, ChatEvent] = {}
+        self._last_image_requests: dict[str, bool] = {}
         self._seed_history_from_current()
 
     @property
@@ -1307,9 +1411,11 @@ class ChatGPTRunner:
 
         with self._lock:
             if self._state.active:
-                return False, "已有 ChatGPT 请求在执行，请发送 /状态 或 /停止"
+                return False, "已有 ChatGPT 请求在执行，请发送 @状态 或 @停止"
             conversation_url = self._conversations.get(session_key)
             effective_title = self._titles.get(session_key, conversation_title)
+            expect_image = _prompt_expects_image(prompt)
+            self._last_image_requests[session_key] = expect_image
             self._state = ChatState(
                 active=True,
                 session_key=session_key,
@@ -1324,6 +1430,7 @@ class ChatGPTRunner:
                 conversation_url=conversation_url,
                 conversation_title=effective_title,
                 image_paths=resolved_images,
+                expect_image=expect_image,
             )
         )
         return True, "已开始 ChatGPT Plus 网页请求"
@@ -1331,7 +1438,7 @@ class ChatGPTRunner:
     def begin_reset(self, session_key: str) -> tuple[bool, str]:
         with self._lock:
             if self._state.active:
-                return False, "已有 ChatGPT 请求在执行，请发送 /状态 或 /停止"
+                return False, "已有 ChatGPT 请求在执行，请发送 @状态 或 @停止"
             if session_key not in self._conversations:
                 return False, "当前已经是新的 ChatGPT 对话"
         self._remove_conversation(session_key)
@@ -1396,17 +1503,30 @@ class ChatGPTRunner:
             return False, str(exc)
         with self._lock:
             if self._state.active:
-                return False, "已有 ChatGPT 请求在执行，请发送 /状态 或 /停止"
+                return False, "已有 ChatGPT 请求在执行，请发送 @状态 或 @停止"
             conversation_url = self._conversations.get(session_key)
             if not conversation_url:
                 return False, "当前还没有可操作的 ChatGPT 对话"
+            expect_image = (
+                self._last_image_requests.get(session_key, False)
+                if kind == _ControlKind.RETRY
+                else False
+            )
             self._state = ChatState(
                 active=True,
                 session_key=session_key,
                 started_at=time.time(),
                 operation=operation,
             )
-        self._jobs.put(_ControlJob(session_key, kind, conversation_url, value))
+        self._jobs.put(
+            _ControlJob(
+                session_key,
+                kind,
+                conversation_url,
+                value,
+                expect_image,
+            )
+        )
         return True, f"已开始{operation}"
 
     def conversation_info(self, session_key: str, default_title: str) -> str:
@@ -1444,7 +1564,7 @@ class ChatGPTRunner:
                 flags.append("已归档")
             suffix = f" [{' / '.join(flags)}]" if flags else ""
             lines.append(f"{index}. {title}（{updated}）{suffix}")
-        lines.append("发送 /切换对话：编号 以恢复历史对话")
+        lines.append("发送 @切换对话：编号 以恢复历史对话")
         return "\n".join(lines)
 
     def switch_conversation(
@@ -1455,7 +1575,7 @@ class ChatGPTRunner:
     ) -> tuple[bool, str]:
         with self._lock:
             if self._state.active:
-                return False, "已有 ChatGPT 请求在执行，请发送 /状态 或 /停止"
+                return False, "已有 ChatGPT 请求在执行，请发送 @状态 或 @停止"
             records = self._history.get(session_key, [])
             if number < 1 or number > len(records):
                 return False, f"对话编号无效；当前共有 {len(records)} 个保存的对话"
@@ -1535,6 +1655,7 @@ class ChatGPTRunner:
                 self.timeout_seconds,
                 self._stopped,
                 job.image_paths,
+                expect_image=job.expect_image,
             )
 
             if self._stopped():
@@ -1602,6 +1723,7 @@ class ChatGPTRunner:
                     self.timeout_seconds,
                     self._stopped,
                     (),
+                    expect_image=job.expect_image,
                 )
                 if self._stopped():
                     self.events.put(ChatEvent("ChatGPT 请求已停止", job.session_key))
@@ -1651,6 +1773,7 @@ class ChatGPTRunner:
                     self.timeout_seconds,
                     self._stopped,
                     (),
+                    expect_image=False,
                 )
                 if self._stopped():
                     self.events.put(ChatEvent("ChatGPT 请求已停止", job.session_key))
@@ -1885,7 +2008,7 @@ class ChatGPTRunner:
     def restart(self) -> tuple[bool, str]:
         with self._lock:
             if self._state.active:
-                return False, "ChatGPT 请求正在执行，请先发送 /停止"
+                return False, "ChatGPT 请求正在执行，请先发送 @停止"
         self.close()
         with self._lock:
             self._closing = False

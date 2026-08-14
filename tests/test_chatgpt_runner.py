@@ -26,6 +26,7 @@ class FakeSession:
         self,
         calls: list[tuple[str | None, str, str | None]],
         image_calls: list[tuple[Path, ...]],
+        image_expectations: list[bool | None],
         archive_calls: list[str],
         rename_calls: list[tuple[str, str]],
         export_calls: list[tuple[str, str]],
@@ -34,6 +35,7 @@ class FakeSession:
     ) -> None:
         self.calls = calls
         self.image_calls = image_calls
+        self.image_expectations = image_expectations
         self.archive_calls = archive_calls
         self.rename_calls = rename_calls
         self.export_calls = export_calls
@@ -54,9 +56,11 @@ class FakeSession:
         timeout_seconds,
         stopped,
         image_paths,
+        expect_image=None,
     ):
         self.calls.append((conversation_url, prompt, conversation_title))
         self.image_calls.append(image_paths)
+        self.image_expectations.append(expect_image)
         return f"回复{self.reply_number}", (
             conversation_url or "https://chatgpt.com/c/web-conversation-1"
         ), self.reply_images
@@ -76,6 +80,7 @@ class FakeSessionFactory:
     def __init__(self) -> None:
         self.calls: list[tuple[str | None, str, str | None]] = []
         self.image_calls: list[tuple[Path, ...]] = []
+        self.image_expectations: list[bool | None] = []
         self.archive_calls: list[str] = []
         self.rename_calls: list[tuple[str, str]] = []
         self.export_calls: list[tuple[str, str]] = []
@@ -87,6 +92,7 @@ class FakeSessionFactory:
         return FakeSession(
             self.calls,
             self.image_calls,
+            self.image_expectations,
             self.archive_calls,
             self.rename_calls,
             self.export_calls,
@@ -196,6 +202,14 @@ class ChangingReplyList:
 
     def nth(self, index):
         return self.item
+
+
+class EmptyReplyList:
+    def count(self):
+        return 0
+
+    def nth(self, index):
+        raise AssertionError(f"unexpected reply index: {index}")
 
 
 class FakeVisibility:
@@ -439,6 +453,75 @@ class ChatGPTRunnerTests(unittest.TestCase):
 
         self.assertEqual(result, "第一段\n第二段")
 
+    def test_tool_activity_extends_timeout_before_final_reply_appears(self) -> None:
+        page = FakeReplyPage()
+        final_reply = FakeReplyItem("搜索完成后的最终回复")
+        clock = [0.0, 1.0, 10.5, 12.0, 13.6]
+        activity = [
+            (("conversation-turn-11", "正在搜索", 2),),
+            (("conversation-turn-11", "已搜索 3 个网页", 4),),
+            (("conversation-turn-12", "搜索完成后的最终回复", 3),),
+            (("conversation-turn-12", "搜索完成后的最终回复", 3),),
+        ]
+
+        with (
+            patch(
+                "wechat_codex.chatgpt_runner.time.monotonic",
+                side_effect=clock,
+            ),
+            patch.object(
+                PlaywrightChatSession,
+                "_reply_activity_key",
+                side_effect=activity,
+            ),
+            patch.object(
+                PlaywrightChatSession,
+                "_current_reply_assistant",
+                side_effect=[None, None, final_reply, final_reply],
+            ),
+        ):
+            result = PlaywrightChatSession._wait_for_reply(
+                page,
+                EmptyReplyList(),
+                previous_count=0,
+                timeout_seconds=10,
+                stopped=lambda: False,
+            )
+
+        self.assertEqual(result, "搜索完成后的最终回复")
+
+    def test_new_turn_reply_is_found_when_virtualized_node_count_is_unchanged(self) -> None:
+        page = FakeReplyPage()
+        final_reply = FakeReplyItem("虚拟列表中的新回复")
+        clock = [0.0, 0.1, 2.0]
+        activity_key = (("conversation-turn-21", "虚拟列表中的新回复", 3),)
+
+        with (
+            patch(
+                "wechat_codex.chatgpt_runner.time.monotonic",
+                side_effect=clock,
+            ),
+            patch.object(
+                PlaywrightChatSession,
+                "_reply_activity_key",
+                return_value=activity_key,
+            ),
+            patch.object(
+                PlaywrightChatSession,
+                "_current_reply_assistant",
+                return_value=final_reply,
+            ),
+        ):
+            result = PlaywrightChatSession._wait_for_reply(
+                page,
+                EmptyReplyList(),
+                previous_count=0,
+                timeout_seconds=30,
+                stopped=lambda: False,
+            )
+
+        self.assertEqual(result, "虚拟列表中的新回复")
+
     def test_image_prompt_can_finish_with_text_only_reply(self) -> None:
         page = FakeReplyPage()
         replies = FakeReplyList("当前无法生成图片，请补充细节")
@@ -653,6 +736,21 @@ class ChatGPTRunnerTests(unittest.TestCase):
                 "https://chatgpt.com/c/web-conversation-1",
             )
             self.assertEqual(last_reply, events[0])
+            self.assertEqual(factory.image_expectations, [True, True])
+
+    def test_text_retry_is_not_misclassified_by_retry_prompt_wording(self) -> None:
+        with TemporaryDirectory() as directory:
+            factory = FakeSessionFactory()
+            runner = make_runner(Path(directory), factory)
+            runner.begin_chat("friend:测试", "分析最近的市场波动")
+            wait_until_idle(runner)
+            runner.drain_events()
+
+            self.assertTrue(runner.begin_retry("friend:测试")[0])
+            wait_until_idle(runner)
+            runner.close()
+
+            self.assertEqual(factory.image_expectations, [False, False])
 
     def test_history_list_and_switch_are_isolated_by_session(self) -> None:
         with TemporaryDirectory() as directory:
