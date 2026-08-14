@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 from wechat_codex.wechat_client import (
     WeChatClient,
+    WeChatAccessibilityUnavailable,
     extract_voice_transcript,
     is_voice_message,
     normalize_message,
@@ -11,6 +12,7 @@ from wechat_codex.wechat_client import (
     split_text,
     strip_required_group_mention,
 )
+from wechat_codex.wx_cli_reader import WxCliMessage
 
 
 class FakeMessage:
@@ -34,6 +36,104 @@ class FakeVoiceMessage:
 
 
 class WeChatClientTests(unittest.TestCase):
+    def test_wx_cli_connect_and_baseline_do_not_connect_uia(self) -> None:
+        client = WeChatClient(
+            "無惧",
+            True,
+            False,
+            True,
+            3,
+            "[助手] ",
+            1800,
+            message_source="wx_cli",
+        )
+        reader = SimpleNamespace(
+            connect=lambda: None,
+            baseline=lambda: 3,
+            poll=lambda: [],
+        )
+        client._wx_cli_reader = reader
+
+        with patch.object(
+            client,
+            "_connect_uia",
+            side_effect=AssertionError("UIA must not be used for reading"),
+        ):
+            client.connect()
+            self.assertEqual(client.baseline(), 3)
+
+    def test_wx_cli_poll_applies_existing_reply_filters(self) -> None:
+        client = WeChatClient(
+            "测试群",
+            True,
+            False,
+            True,
+            3,
+            "[助手] ",
+            1800,
+            "group",
+            "ChatGpt机器人",
+            "wx_cli",
+        )
+        client._wx_cli_reader = SimpleNamespace(
+            poll=lambda: [
+                WxCliMessage(
+                    key="1",
+                    content="大家好",
+                    sender="李四",
+                    conversation="测试群",
+                    chat_type="group",
+                    is_self=False,
+                ),
+                WxCliMessage(
+                    key="2",
+                    content="@ChatGpt机器人\u2005 干活：运行测试",
+                    sender="無惧",
+                    conversation="测试群",
+                    chat_type="group",
+                    is_self=False,
+                ),
+                WxCliMessage(
+                    key="3",
+                    content="[助手] 不应回环",
+                    sender="he yang",
+                    conversation="测试群",
+                    chat_type="group",
+                    is_self=False,
+                ),
+            ]
+        )
+
+        messages = client.poll()
+
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].content, "干活：运行测试")
+        self.assertEqual(messages[0].sender, "無惧")
+        self.assertEqual(messages[0].conversation, "测试群")
+
+    def test_accessibility_error_explains_narrator_restart(self) -> None:
+        error = WeChatAccessibilityUnavailable("4.1.12.55")
+
+        self.assertEqual(error.version, "4.1.12.55")
+        self.assertIn("4.1.12.55", str(error))
+        self.assertIn("Win+Ctrl+Enter", str(error))
+        self.assertIn("完全退出微信", str(error))
+        self.assertIn("不是 contact 名称或登录状态错误", str(error))
+
+    def test_detects_wechat_product_version(self) -> None:
+        fake_api = SimpleNamespace(
+            GetFileVersionInfo=lambda _path, _root: {
+                "ProductVersionMS": (4 << 16) | 1,
+                "ProductVersionLS": (12 << 16) | 55,
+            }
+        )
+
+        with patch.dict("sys.modules", {"win32api": fake_api}):
+            self.assertEqual(
+                WeChatClient._detect_wechat_version([None, "Weixin.exe"]),
+                "4.1.12.55",
+            )
+
     def test_normalize_text_message(self) -> None:
         message = normalize_message(FakeMessage())
         self.assertIsNotNone(message)
@@ -233,6 +333,71 @@ class WeChatClientTests(unittest.TestCase):
                 client._activate_target_for_new_message(object(), object())
             )
         self.assertEqual(selected, [session])
+
+    def test_open_target_is_read_only_after_session_preview_changes(self) -> None:
+        class Node:
+            AutomationId = "session_item_無惧"
+            ClassName = "mmui::SessionItemView"
+
+            def __init__(self, name: str, children: list[object] | None = None) -> None:
+                self.Name = name
+                self._children = children or []
+
+            def GetChildren(self) -> list[object]:
+                return self._children
+
+        preview = Node("旧消息")
+        session = Node("無惧", [preview])
+        client = WeChatClient("無惧", True, False, True, 3, "[助手] ", 1800)
+        client._session_watch_initialized = True
+        client._target_session_control = session
+        client._target_session_signature = client._session_signature(session)
+        client._current_contact = lambda _uia: "無惧"
+        bind_calls: list[str] = []
+        client._bind_current_chatbox = lambda _uia, _chatbox: bind_calls.append(
+            "bind"
+        )
+
+        self.assertFalse(client._activate_target_for_new_message(object(), object()))
+        self.assertEqual(bind_calls, [])
+
+        preview.Name = "新消息"
+        self.assertTrue(client._activate_target_for_new_message(object(), object()))
+        self.assertEqual(bind_calls, ["bind"])
+
+    def test_session_watcher_reuses_cached_control_without_repeated_search(self) -> None:
+        class Node:
+            Name = "無惧"
+            AutomationId = "session_item_無惧"
+            ClassName = "mmui::SessionItemView"
+
+            def GetChildren(self) -> list[object]:
+                return []
+
+        client = WeChatClient("無惧", True, False, True, 3, "[助手] ", 1800)
+        session = Node()
+        searches: list[str] = []
+
+        def find(_uia: object) -> object:
+            searches.append("find")
+            return session
+
+        client._find_session_item = find
+        client._session_watch_initialized = True
+        client._target_session_signature = client._session_signature(session)
+
+        self.assertFalse(client._activate_target_for_new_message(object(), object()))
+        self.assertFalse(client._activate_target_for_new_message(object(), object()))
+        self.assertEqual(searches, ["find"])
+
+    def test_group_header_member_count_matches_configured_group(self) -> None:
+        client = WeChatClient(
+            "测试群", True, False, True, 3, "[助手] ", 1800, "group", "ChatGpt机器人"
+        )
+
+        self.assertTrue(client._is_target_contact("测试群（23）"))
+        self.assertTrue(client._is_target_contact("测试群(23)"))
+        self.assertFalse(client._is_target_contact("其他群（23）"))
 
     def test_passive_activation_marks_history_and_keeps_only_new_tail(self) -> None:
         client = WeChatClient("無惧", True, False, True, 3, "[助手] ", 1800)

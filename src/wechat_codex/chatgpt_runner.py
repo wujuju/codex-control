@@ -19,6 +19,8 @@ log = logging.getLogger(__name__)
 CHATGPT_HOME = "https://chatgpt.com/"
 CHAT_URL = re.compile(r"^https://chatgpt\.com/(?:g/[^/]+/)?c/", re.IGNORECASE)
 PROMPT_SELECTOR = '[data-testid="prompt-textarea"], #prompt-textarea'
+ACCOUNT_SELECTOR = '[data-testid="accounts-profile-button"]'
+LOGIN_SELECTOR = '[data-testid="login-button"]'
 SEND_SELECTOR = (
     'button[data-testid="send-button"], '
     'button[data-testid="composer-submit-button"]'
@@ -54,7 +56,7 @@ class BrowserSession(Protocol):
     ) -> tuple[str, str]: ...
 
 
-SessionFactory = Callable[[Path, str, bool], BrowserSession]
+SessionFactory = Callable[[Path, str, bool, str | None], BrowserSession]
 
 
 @dataclass(frozen=True)
@@ -70,13 +72,73 @@ class ChatState:
     stop_requested: bool = False
 
 
-class PlaywrightChatSession:
-    """One short-lived browser process backed by a persistent Plus profile."""
+@dataclass(frozen=True)
+class _AccountState:
+    logged_in: bool
+    plus: bool
 
-    def __init__(self, profile_dir: Path, channel: str, headless: bool) -> None:
+
+@dataclass(frozen=True)
+class _ChatJob:
+    session_key: str
+    prompt: str
+    conversation_url: str | None
+
+
+def _read_account_state(page: Any) -> _AccountState:
+    logged_in = False
+    plus = False
+    try:
+        login_buttons = page.locator(LOGIN_SELECTOR)
+        for index in range(login_buttons.count()):
+            if login_buttons.nth(index).is_visible(timeout=500):
+                return _AccountState(logged_in=False, plus=False)
+
+        profiles = page.locator(ACCOUNT_SELECTOR)
+        for index in range(profiles.count()):
+            profile = profiles.nth(index)
+            if not profile.is_visible(timeout=500):
+                continue
+            logged_in = True
+            try:
+                text = profile.inner_text(timeout=500)
+            except Exception:
+                text = ""
+            try:
+                label = profile.get_attribute("aria-label", timeout=500) or ""
+            except Exception:
+                label = ""
+            plus = plus or "plus" in f"{text} {label}".lower()
+    except Exception:
+        log.debug("读取 ChatGPT 账号状态失败", exc_info=True)
+    return _AccountState(logged_in=logged_in, plus=plus)
+
+
+def _wait_for_account_state(page: Any, timeout_ms: int) -> _AccountState:
+    deadline = time.monotonic() + timeout_ms / 1000
+    last_state = _AccountState(logged_in=False, plus=False)
+    while time.monotonic() < deadline:
+        last_state = _read_account_state(page)
+        if last_state.plus:
+            return last_state
+        page.wait_for_timeout(250)
+    return last_state
+
+
+class PlaywrightChatSession:
+    """One long-lived browser process backed by a persistent Plus profile."""
+
+    def __init__(
+        self,
+        profile_dir: Path,
+        channel: str,
+        headless: bool,
+        proxy_server: str | None,
+    ) -> None:
         self.profile_dir = profile_dir
         self.channel = channel
         self.headless = headless
+        self.proxy_server = proxy_server
         self._playwright: Any = None
         self._context: Any = None
         self._page: Any = None
@@ -87,11 +149,16 @@ class PlaywrightChatSession:
         self.profile_dir.mkdir(parents=True, exist_ok=True)
         self._playwright = sync_playwright().start()
         try:
+            launch_options: dict[str, Any] = {
+                "user_data_dir": str(self.profile_dir),
+                "channel": self.channel,
+                "headless": self.headless,
+                "viewport": {"width": 1280, "height": 900},
+            }
+            if self.proxy_server:
+                launch_options["proxy"] = {"server": self.proxy_server}
             self._context = self._playwright.chromium.launch_persistent_context(
-                user_data_dir=str(self.profile_dir),
-                channel=self.channel,
-                headless=self.headless,
-                viewport={"width": 1280, "height": 900},
+                **launch_options
             )
             self._context.set_default_timeout(15_000)
             self._page = (
@@ -99,6 +166,7 @@ class PlaywrightChatSession:
                 if self._context.pages
                 else self._context.new_page()
             )
+            self._navigate(self._page, CHATGPT_HOME, 60)
             return self
         except Exception:
             self.__exit__(None, None, None)
@@ -164,14 +232,51 @@ class PlaywrightChatSession:
 
     @staticmethod
     def _navigate(page: Any, url: str, timeout_seconds: int) -> None:
-        page.goto(
-            url,
-            wait_until="domcontentloaded",
-            timeout=min(timeout_seconds, 45) * 1000,
+        timeout_ms = min(timeout_seconds, 45) * 1000
+        retryable_errors = (
+            "ERR_ABORTED",
+            "ERR_CONNECTION_CLOSED",
+            "ERR_CONNECTION_RESET",
+            "ERR_CONNECTION_TIMED_OUT",
+            "ERR_PROXY_CONNECTION_FAILED",
+            "ERR_SOCKS_CONNECTION_FAILED",
+            "frame was detached",
         )
+        max_attempts = 5
+        for attempt in range(max_attempts):
+            try:
+                page.goto(url, wait_until="commit", timeout=timeout_ms)
+                return
+            except Exception as exc:
+                detail = str(exc)
+                if not any(marker in detail for marker in retryable_errors):
+                    raise
+                interrupted_navigation = (
+                    "ERR_ABORTED" in detail or "frame was detached" in detail
+                )
+                if interrupted_navigation and str(page.url).startswith(
+                    "https://chatgpt.com/"
+                ):
+                    return
+                if attempt == max_attempts - 1:
+                    raise
+                delay_ms = 1000 * (2**attempt)
+                log.warning(
+                    "ChatGPT 页面连接失败，%s 毫秒后重试（%d/%d）：%s",
+                    delay_ms,
+                    attempt + 1,
+                    max_attempts,
+                    detail.splitlines()[0],
+                )
+                page.wait_for_timeout(delay_ms)
 
     @staticmethod
     def _wait_for_composer(page: Any) -> Any:
+        account = _wait_for_account_state(page, timeout_ms=10_000)
+        if not account.logged_in:
+            raise RuntimeError("ChatGPT Plus 尚未登录，请先运行 chatgpt-login")
+        if not account.plus:
+            raise RuntimeError("当前 ChatGPT 账号未检测到 Plus 订阅")
         composer = page.locator(PROMPT_SELECTOR).first
         try:
             composer.wait_for(state="visible", timeout=20_000)
@@ -249,12 +354,14 @@ class ChatGPTRunner:
         *,
         browser_channel: str,
         headless: bool,
+        proxy_server: str | None,
         timeout_seconds: int,
         runtime_dir: Path,
         session_factory: SessionFactory | None = None,
     ) -> None:
         self.browser_channel = browser_channel
         self.headless = headless
+        self.proxy_server = proxy_server
         self.timeout_seconds = timeout_seconds
         self.runtime_dir = runtime_dir
         self.profile_dir = runtime_dir / "chatgpt-plus-profile"
@@ -262,6 +369,11 @@ class ChatGPTRunner:
         self._session_factory = session_factory or PlaywrightChatSession
         self._state = ChatState()
         self._lock = threading.RLock()
+        self._jobs: queue.Queue[_ChatJob | None] = queue.Queue()
+        self._worker: threading.Thread | None = None
+        self._worker_ready = threading.Event()
+        self._startup_error: Exception | None = None
+        self._closing = False
         self._conversation_file = runtime_dir / "chatgpt_web_conversations.json"
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
         self._conversations = self._load_conversations()
@@ -271,23 +383,52 @@ class ChatGPTRunner:
         with self._lock:
             return self._state.active
 
+    def start(self) -> None:
+        """Start one dedicated browser and keep it alive for this runner."""
+        with self._lock:
+            if self._closing:
+                raise RuntimeError("ChatGPT 浏览器已经关闭")
+            if self._worker is not None and self._worker.is_alive():
+                return
+            self._worker_ready.clear()
+            self._startup_error = None
+            worker = threading.Thread(
+                target=self._browser_loop,
+                name="chatgpt-plus-browser",
+                daemon=True,
+            )
+            self._worker = worker
+            worker.start()
+
+        if not self._worker_ready.wait(60):
+            raise RuntimeError("等待 ChatGPT 专用浏览器启动超时")
+        if self._startup_error is not None:
+            detail = str(self._startup_error).strip() or type(self._startup_error).__name__
+            raise RuntimeError(f"ChatGPT 专用浏览器启动失败：{detail}")
+
     def begin_chat(self, session_key: str, prompt: str) -> tuple[bool, str]:
+        try:
+            self.start()
+        except RuntimeError as exc:
+            return False, str(exc)
+
         with self._lock:
             if self._state.active:
                 return False, "已有 ChatGPT 请求在执行，请发送“状态”或“停止”"
+            conversation_url = self._conversations.get(session_key)
             self._state = ChatState(
                 active=True,
                 session_key=session_key,
                 started_at=time.time(),
             )
 
-        worker = threading.Thread(
-            target=self._run_chat,
-            args=(session_key, prompt),
-            name="chatgpt-plus-web",
-            daemon=True,
+        self._jobs.put(
+            _ChatJob(
+                session_key=session_key,
+                prompt=prompt,
+                conversation_url=conversation_url,
+            )
         )
-        worker.start()
         return True, "已开始 ChatGPT Plus 网页请求"
 
     def begin_reset(self, session_key: str) -> tuple[bool, str]:
@@ -302,26 +443,48 @@ class ChatGPTRunner:
         )
         return True, "已切换到新的 ChatGPT 对话"
 
-    def _run_chat(self, session_key: str, prompt: str) -> None:
+    def _browser_loop(self) -> None:
         try:
-            with self._lock:
-                conversation_url = self._conversations.get(session_key)
             with self._session_factory(
                 self.profile_dir,
                 self.browser_channel,
                 self.headless,
+                self.proxy_server,
             ) as session:
-                text, new_url = session.ask(
-                    conversation_url,
-                    prompt,
-                    self.timeout_seconds,
-                    self._stopped,
+                self._worker_ready.set()
+                while True:
+                    job = self._jobs.get()
+                    if job is None:
+                        return
+                    self._run_chat(session, job)
+        except Exception as exc:
+            if not self._worker_ready.is_set():
+                self._startup_error = exc
+            else:
+                detail = str(exc).strip() or type(exc).__name__
+                self.events.put(
+                    ChatEvent(f"ChatGPT 专用浏览器意外退出：{detail[-1000:]}")
                 )
+                self._finish()
+        finally:
+            self._worker_ready.set()
+            with self._lock:
+                if threading.current_thread() is self._worker:
+                    self._worker = None
+
+    def _run_chat(self, session: BrowserSession, job: _ChatJob) -> None:
+        try:
+            text, new_url = session.ask(
+                job.conversation_url,
+                job.prompt,
+                self.timeout_seconds,
+                self._stopped,
+            )
 
             if self._stopped():
                 self.events.put(ChatEvent("ChatGPT 请求已停止"))
                 return
-            self._set_conversation(session_key, new_url)
+            self._set_conversation(job.session_key, new_url)
             self.events.put(ChatEvent(text))
         except ChatStopped:
             self.events.put(ChatEvent("ChatGPT 请求已停止"))
@@ -385,6 +548,20 @@ class ChatGPTRunner:
             self._state.stop_requested = True
         return "正在停止 ChatGPT 请求"
 
+    def close(self, timeout_seconds: float = 10) -> None:
+        """Stop pending work and close the dedicated browser process."""
+        with self._lock:
+            self._closing = True
+            if self._state.active:
+                self._state.stop_requested = True
+            worker = self._worker
+        if worker is None or not worker.is_alive():
+            return
+        self._jobs.put(None)
+        worker.join(timeout_seconds)
+        if worker.is_alive():
+            log.warning("等待 ChatGPT 专用浏览器关闭超时")
+
     def status(self) -> str:
         with self._lock:
             state = self._state
@@ -402,24 +579,43 @@ class ChatGPTRunner:
                 return result
 
 
-def login_chatgpt(profile_dir: Path, browser_channel: str) -> None:
+def login_chatgpt(
+    profile_dir: Path,
+    browser_channel: str,
+    proxy_server: str | None,
+) -> None:
     """Open the dedicated profile visibly so the owner can complete login."""
     from playwright.sync_api import sync_playwright
 
     profile_dir.mkdir(parents=True, exist_ok=True)
     try:
         with sync_playwright() as playwright:
-            context = playwright.chromium.launch_persistent_context(
-                user_data_dir=str(profile_dir),
-                channel=browser_channel,
-                headless=False,
-                viewport={"width": 1280, "height": 900},
-            )
+            launch_options: dict[str, Any] = {
+                "user_data_dir": str(profile_dir),
+                "channel": browser_channel,
+                "headless": False,
+                "viewport": {"width": 1280, "height": 900},
+            }
+            if proxy_server:
+                launch_options["proxy"] = {"server": proxy_server}
+            context = playwright.chromium.launch_persistent_context(**launch_options)
             try:
                 page = context.pages[0] if context.pages else context.new_page()
-                page.goto(CHATGPT_HOME, wait_until="domcontentloaded", timeout=60_000)
-                print("请在打开的浏览器中登录你的 ChatGPT Plus 账号。")
+                PlaywrightChatSession._navigate(page, CHATGPT_HOME, 60)
+                account = _wait_for_account_state(page, timeout_ms=5_000)
+                if account.plus:
+                    print("已检测到保存的 ChatGPT Plus 登录状态，无需重新登录。")
+                    return
+                if account.logged_in:
+                    print("当前已登录，但未检测到 Plus 订阅；请切换到 Plus 账号。")
+                else:
+                    print("请在打开的浏览器中登录你的 ChatGPT Plus 账号。")
                 input("登录完成并看到 ChatGPT 输入框后，回到这里按 Enter 保存登录状态：")
+                account = _wait_for_account_state(page, timeout_ms=10_000)
+                if not account.logged_in:
+                    raise RuntimeError("未检测到已登录的 ChatGPT 账号")
+                if not account.plus:
+                    raise RuntimeError("已登录，但未检测到 ChatGPT Plus 订阅")
                 composer = page.locator(PROMPT_SELECTOR).first
                 if not composer.is_visible(timeout=5_000):
                     raise RuntimeError("未检测到 ChatGPT 输入框，登录可能尚未完成")

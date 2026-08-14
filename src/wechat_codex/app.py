@@ -9,7 +9,11 @@ from .chatgpt_runner import ChatGPTRunner
 from .codex_runner import CodexRunner
 from .config import AppConfig
 from .router import RouteKind, help_text, route_message
-from .wechat_client import IncomingMessage, WeChatClient
+from .wechat_client import (
+    IncomingMessage,
+    WeChatAccessibilityUnavailable,
+    WeChatClient,
+)
 
 
 log = logging.getLogger(__name__)
@@ -38,6 +42,10 @@ class BridgeApp:
             max_reply_chars=config.max_reply_chars,
             chat_type=config.chat_type,
             bot_name=config.bot_name,
+            message_source=config.wechat_message_source,
+            wx_cli_path=config.wx_cli_path,
+            wx_cli_username=config.wx_cli_username,
+            wx_cli_timeout_seconds=config.wx_cli_timeout_seconds,
         )
         self.runner = CodexRunner(
             codex_command=config.codex_command,
@@ -47,6 +55,7 @@ class BridgeApp:
         self.chat_runner = ChatGPTRunner(
             browser_channel=config.chatgpt_browser_channel,
             headless=config.chatgpt_headless,
+            proxy_server=config.chatgpt_proxy_server,
             timeout_seconds=config.chat_timeout_seconds,
             runtime_dir=config.runtime_dir,
         )
@@ -54,10 +63,15 @@ class BridgeApp:
 
     def run(self) -> None:
         try:
+            self._emit_state("connecting", "正在启动 ChatGPT 专用浏览器")
+            self.chat_runner.start()
+            accessibility_error: str | None = None
             while not self._stop_event.is_set():
                 try:
-                    self._emit_state("connecting", "正在连接微信")
+                    if accessibility_error is None:
+                        self._emit_state("connecting", "正在连接微信")
                     self.wechat.connect()
+                    accessibility_error = None
                     baseline_count = self.wechat.baseline()
                     log.info(
                         "已连接微信联系人 %s，记录 %d 条已有消息；等待新消息",
@@ -73,12 +87,20 @@ class BridgeApp:
                 except KeyboardInterrupt:
                     log.info("收到退出信号")
                     self.stop()
+                except WeChatAccessibilityUnavailable as exc:
+                    detail = str(exc)
+                    if detail != accessibility_error:
+                        log.warning("微信控件树尚未启用，等待用户重启微信：%s", detail)
+                        self._emit_state("reconnecting", detail)
+                    accessibility_error = detail
+                    self._stop_event.wait(15)
                 except Exception as exc:
+                    accessibility_error = None
                     log.warning("微信尚未就绪，5 秒后重试：%s", exc)
                     self._emit_state("reconnecting", f"连接失败，正在重试：{exc}")
                     self._stop_event.wait(5)
         finally:
-            self.chat_runner.stop()
+            self.chat_runner.close()
             self.runner.stop()
             self._emit_state("stopped", "已停止")
 

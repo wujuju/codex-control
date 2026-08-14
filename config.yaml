@@ -2,6 +2,12 @@
 contact: "無惧"
 # 当前监听对象类型。监听群聊时改为 group，并把 contact 改为群名。
 chat_type: "friend"
+# 使用外部 wx/wechat-cli 增量读取，不会为了轮询而打开或激活微信。
+wechat_message_source: "wx_cli"
+wx_cli_path: "wx"
+# 同名联系人时填写 wx-cli 输出中的 username（wxid）；否则可以留空。
+wx_cli_username: ""
+wx_cli_timeout_seconds: 30
 bot_name: "ChatGpt机器人"
 authorized_senders:
   - "無惧"
@@ -18,7 +24,8 @@ poll_seconds: 1.0
 max_reply_chars: 1800
 
 chatgpt_browser_channel: "chrome"
-chatgpt_headless: true
+chatgpt_headless: false
+chatgpt_proxy_server: "socks5://127.0.0.1:7890"
 chat_timeout_seconds: 180
 
 codex_command: "codex"

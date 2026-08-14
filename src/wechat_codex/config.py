@@ -12,6 +12,10 @@ class AppConfig:
     source: Path
     contact: str
     chat_type: str
+    wechat_message_source: str
+    wx_cli_path: str | None
+    wx_cli_username: str | None
+    wx_cli_timeout_seconds: float
     bot_name: str
     authorized_senders: frozenset[str]
     background_mode: bool
@@ -24,6 +28,7 @@ class AppConfig:
     max_reply_chars: int
     chatgpt_browser_channel: str
     chatgpt_headless: bool
+    chatgpt_proxy_server: str | None
     codex_command: str
     chat_timeout_seconds: int
     work_timeout_seconds: int
@@ -95,6 +100,17 @@ def load_config(path: str | Path) -> AppConfig:
     if chat_type not in {"friend", "group", "auto"}:
         raise ValueError("chat_type 必须是 friend、group 或 auto")
 
+    wechat_message_source = str(
+        raw.get("wechat_message_source", "uia")
+    ).strip().lower().replace("-", "_")
+    if wechat_message_source not in {"uia", "wx_cli"}:
+        raise ValueError("wechat_message_source 必须是 uia 或 wx_cli")
+    wx_cli_path = str(raw.get("wx_cli_path", "")).strip() or None
+    wx_cli_username = str(raw.get("wx_cli_username", "")).strip() or None
+    wx_cli_timeout_seconds = float(raw.get("wx_cli_timeout_seconds", 30.0))
+    if wx_cli_timeout_seconds < 1:
+        raise ValueError("wx_cli_timeout_seconds 不能小于 1")
+
     bot_name = str(raw.get("bot_name", "ChatGpt机器人")).strip()
     if not bot_name:
         raise ValueError("bot_name 不能为空")
@@ -114,6 +130,11 @@ def load_config(path: str | Path) -> AppConfig:
     }:
         raise ValueError("chatgpt_browser_channel 必须是受支持的 Edge 或 Chrome 通道")
 
+    proxy_value = str(raw.get("chatgpt_proxy_server", "")).strip()
+    if proxy_value and "://" not in proxy_value:
+        proxy_value = f"http://{proxy_value}"
+    chatgpt_proxy_server = proxy_value or None
+
     authorized_values = raw.get("authorized_senders", ["無惧"])
     if isinstance(authorized_values, str):
         authorized_values = [authorized_values]
@@ -129,6 +150,10 @@ def load_config(path: str | Path) -> AppConfig:
         source=source,
         contact=_required_text(raw, "contact"),
         chat_type=chat_type,
+        wechat_message_source=wechat_message_source,
+        wx_cli_path=wx_cli_path,
+        wx_cli_username=wx_cli_username,
+        wx_cli_timeout_seconds=wx_cli_timeout_seconds,
         bot_name=bot_name,
         authorized_senders=authorized_senders,
         background_mode=bool(raw.get("background_mode", True)),
@@ -141,6 +166,7 @@ def load_config(path: str | Path) -> AppConfig:
         max_reply_chars=max_reply_chars,
         chatgpt_browser_channel=chatgpt_browser_channel,
         chatgpt_headless=bool(raw.get("chatgpt_headless", True)),
+        chatgpt_proxy_server=chatgpt_proxy_server,
         codex_command=_required_text(raw, "codex_command")
         if "codex_command" in raw
         else "codex",

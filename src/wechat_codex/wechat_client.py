@@ -8,8 +8,24 @@ from collections import deque
 from dataclasses import dataclass, replace
 from typing import Any, Iterable
 
+from .wx_cli_reader import WxCliReader
+
 
 log = logging.getLogger(__name__)
+
+
+class WeChatAccessibilityUnavailable(RuntimeError):
+    """WeChat is open but has not published its message control tree."""
+
+    def __init__(self, version: str | None = None) -> None:
+        version_text = f"（{version}）" if version else ""
+        super().__init__(
+            f"已找到微信窗口{version_text}，但微信未开放消息控件树。"
+            "请先从托盘完全退出微信，按 Win+Ctrl+Enter 打开 Windows 讲述人，"
+            "再重新启动并登录微信；程序连接成功后可以关闭讲述人。"
+            "这不是 contact 名称或登录状态错误。"
+        )
+        self.version = version
 
 
 @dataclass(frozen=True)
@@ -154,6 +170,10 @@ class WeChatClient:
         max_reply_chars: int,
         chat_type: str = "friend",
         bot_name: str = "ChatGpt机器人",
+        message_source: str = "uia",
+        wx_cli_path: str | None = None,
+        wx_cli_username: str | None = None,
+        wx_cli_timeout_seconds: float = 30.0,
     ) -> None:
         self.contact = contact
         self.background_mode = background_mode
@@ -164,6 +184,18 @@ class WeChatClient:
         self.max_reply_chars = max_reply_chars
         self.chat_type = chat_type
         self.bot_name = bot_name
+        self.message_source = message_source
+        self._wx_cli_reader = (
+            WxCliReader(
+                contact=contact,
+                chat_type=chat_type,
+                executable=wx_cli_path,
+                username=wx_cli_username,
+                timeout_seconds=wx_cli_timeout_seconds,
+            )
+            if message_source == "wx_cli"
+            else None
+        )
         self._wx: Any = None
         self._seen_order: deque[str] = deque()
         self._seen: set[str] = set()
@@ -175,28 +207,55 @@ class WeChatClient:
         self._active_chat_type = "friend"
         self._avatar_recovery_attempted = False
         self._session_watch_initialized = False
+        self._target_session_control: Any = None
+        self._last_session_lookup_at = 0.0
+        self._session_lookup_interval_seconds = 10.0
         self._target_session_signature: tuple[tuple[str, str, str], ...] | None = None
         self._target_session_unread_count: int | None = None
         self._pending_session_message_count: int | None = None
 
     def connect(self) -> None:
+        if self._wx_cli_reader is not None:
+            self._wx_cli_reader.connect()
+            return
+        self._connect_uia()
+
+    def _connect_uia(self) -> None:
+        # wxauto4 configures the process-wide root logger during import and
+        # clears handlers installed by the GUI/CLI. Preserve the host
+        # application's logging destination across that import.
+        root_logger = logging.getLogger()
+        original_handlers = list(root_logger.handlers)
+        original_level = root_logger.level
         try:
-            import psutil
-            import win32gui
-            import win32process
-            from wxauto4.uia import uiautomation as uia
-            from wxauto4.ui.chatbox import ChatBox
+            try:
+                import psutil
+                import win32gui
+                import win32process
+                from wxauto4.uia import uiautomation as uia
+                from wxauto4.ui.chatbox import ChatBox
+            finally:
+                if original_handlers:
+                    root_logger.handlers.clear()
+                    root_logger.handlers.extend(original_handlers)
+                    root_logger.setLevel(original_level)
         except ImportError as exc:  # pragma: no cover - depends on Windows package install
             raise RuntimeError("未安装 wxauto4，请运行 pip install -e .") from exc
 
         failure: Exception | None = None
         handles: list[int] = []
+        wechat_version: str | None = None
         try:
-            pids = {
-                process.info["pid"]
-                for process in psutil.process_iter(["name", "pid"])
+            processes = [
+                process.info
+                for process in psutil.process_iter(["name", "pid", "exe"])
                 if (process.info.get("name") or "").lower() == "weixin.exe"
-            }
+            ]
+            pids = {process["pid"] for process in processes}
+            wechat_version = self._detect_wechat_version(
+                process.get("exe") for process in processes
+            )
+
             def collect(hwnd: int, _: Any) -> None:
                 _, pid = win32process.GetWindowThreadProcessId(hwnd)
                 if pid not in pids:
@@ -207,6 +266,8 @@ class WeChatClient:
             win32gui.EnumWindows(collect, None)
             self._root = self._find_wechat_root(handles, uia)
             if self._root is None:
+                if handles:
+                    raise WeChatAccessibilityUnavailable(wechat_version)
                 raise LookupError("未找到已登录的微信主窗口")
 
             self._initialize_chatbox(uia, ChatBox, win32gui)
@@ -235,21 +296,53 @@ class WeChatClient:
                 failure = recovery_error
 
         assert failure is not None
+        if isinstance(failure, WeChatAccessibilityUnavailable):
+            raise failure
         raise RuntimeError(
             "无法连接 PC 微信。请确认微信 4.x 已登录、窗口未退出，并检查 contact 名称。"
             f"原始错误：{type(failure).__name__}: {failure}"
         ) from failure
+
+    @staticmethod
+    def _detect_wechat_version(executables: Iterable[str | None]) -> str | None:
+        """Read the first available Weixin.exe product version."""
+        try:
+            import win32api
+        except ImportError:  # pragma: no cover - pywin32 is required on Windows
+            return None
+
+        checked: set[str] = set()
+        for executable in executables:
+            if not executable or executable in checked:
+                continue
+            checked.add(executable)
+            try:
+                info = win32api.GetFileVersionInfo(executable, "\\")
+                ms = int(info["ProductVersionMS"])
+                ls = int(info["ProductVersionLS"])
+                return ".".join(
+                    str(part)
+                    for part in (
+                        ms >> 16,
+                        ms & 0xFFFF,
+                        ls >> 16,
+                        ls & 0xFFFF,
+                    )
+                )
+            except Exception:
+                log.debug("读取微信版本失败：%s", executable, exc_info=True)
+        return None
 
     def _initialize_chatbox(self, uia: Any, ChatBox: Any, win32gui: Any) -> None:
         """Initialize passive session watching without forcing a chat switch."""
         self._invoke_send_supported = None
         if self.background_mode:
             self._send_window_to_background(win32gui)
-        session = self._find_session_item(uia)
+        session = self._target_session(uia, force_lookup=True)
         self._target_session_signature = self._session_signature(session)
         self._target_session_unread_count = self._session_unread_count(session)
         self._session_watch_initialized = True
-        if self._current_contact(uia) != self.contact:
+        if not self._is_target_contact(self._current_contact(uia)):
             self._chatbox = None
             self._wx = None
             log.info("目标会话 %s 当前未打开，等待会话列表出现新消息", self.contact)
@@ -444,11 +537,42 @@ class WeChatClient:
                 return (control.Name or "").strip()
         return ""
 
+    def _is_target_contact(self, current: str) -> bool:
+        current = current.strip()
+        if current == self.contact:
+            return True
+        if self.chat_type in {"group", "auto"}:
+            without_member_count = re.sub(
+                r"\s*[（(]\s*\d+\s*[)）]\s*$",
+                "",
+                current,
+            )
+            return without_member_count == self.contact
+        return False
+
     def _find_session_item(self, uia: Any) -> Any:
         return self._find_control(
             uia,
             automation_id=f"session_item_{self.contact}",
         )
+
+    def _target_session(self, uia: Any, *, force_lookup: bool = False) -> Any:
+        """Reuse the UIA session item instead of searching the tree every poll."""
+        cached = self._target_session_control
+        if cached is not None and self._session_signature(cached) is not None:
+            return cached
+        self._target_session_control = None
+
+        now = time.monotonic()
+        if (
+            not force_lookup
+            and now - self._last_session_lookup_at
+            < self._session_lookup_interval_seconds
+        ):
+            return None
+        self._last_session_lookup_at = now
+        self._target_session_control = self._find_session_item(uia)
+        return self._target_session_control
 
     @staticmethod
     def _session_signature(control: Any) -> tuple[tuple[str, str, str], ...] | None:
@@ -471,7 +595,7 @@ class WeChatClient:
                     pending.extend((child, depth + 1) for child in current.GetChildren())
             except Exception:
                 continue
-        return tuple(result)
+        return tuple(result) if result else None
 
     @staticmethod
     def _session_unread_count(control: Any) -> int | None:
@@ -507,14 +631,14 @@ class WeChatClient:
         return "friend"
 
     def _ensure_contact(self, uia: Any) -> None:
-        if self._current_contact(uia) == self.contact:
+        if self._is_target_contact(self._current_contact(uia)):
             return
 
-        session = self._find_session_item(uia)
+        session = self._target_session(uia, force_lookup=True)
         if session is not None:
             self._select_without_focus(session)
             time.sleep(0.5)
-            if self._current_contact(uia) == self.contact:
+            if self._is_target_contact(self._current_contact(uia)):
                 return
 
         search = self._find_control(
@@ -550,8 +674,8 @@ class WeChatClient:
                 value.SetValue("")
             except Exception:
                 log.debug("清理微信搜索框失败", exc_info=True)
-        if self._current_contact(uia) != self.contact:
-            raise LookupError(f"未能切换到联系人 {self.contact!r}")
+        if not self._is_target_contact(self._current_contact(uia)):
+            raise LookupError(f"未能切换到会话 {self.contact!r}")
 
     @staticmethod
     def _select_without_focus(control: Any) -> None:
@@ -571,22 +695,14 @@ class WeChatClient:
 
         self._ensure_contact(uia)
         self._bind_current_chatbox(uia, ChatBox)
-        self._target_session_signature = self._session_signature(
-            self._find_session_item(uia)
-        )
-        self._target_session_unread_count = self._session_unread_count(
-            self._find_session_item(uia)
-        )
+        session = self._target_session(uia, force_lookup=True)
+        self._target_session_signature = self._session_signature(session)
+        self._target_session_unread_count = self._session_unread_count(session)
         self._session_watch_initialized = True
 
     def _activate_target_for_new_message(self, uia: Any, ChatBox: Any) -> bool:
         """Switch only when the target session's visible metadata changed."""
-        if self._current_contact(uia) == self.contact:
-            if self._wx is None:
-                self._bind_current_chatbox(uia, ChatBox)
-            return True
-
-        session = self._find_session_item(uia)
+        session = self._target_session(uia)
         signature = self._session_signature(session)
         unread_count = self._session_unread_count(session)
         if not self._session_watch_initialized:
@@ -606,17 +722,15 @@ class WeChatClient:
             self._pending_session_message_count = max(1, unread_count)
         else:
             self._pending_session_message_count = 1
-        self._select_without_focus(session)
-        time.sleep(0.5)
-        if self._current_contact(uia) != self.contact:
-            raise LookupError(f"检测到新消息，但未能切换到联系人 {self.contact!r}")
-        self._bind_current_chatbox(uia, ChatBox)
-        self._target_session_signature = self._session_signature(
-            self._find_session_item(uia)
-        )
-        self._target_session_unread_count = self._session_unread_count(
-            self._find_session_item(uia)
-        )
+        if not self._is_target_contact(self._current_contact(uia)):
+            self._select_without_focus(session)
+            time.sleep(0.5)
+            if not self._is_target_contact(self._current_contact(uia)):
+                raise LookupError(f"检测到新消息，但未能切换到会话 {self.contact!r}")
+        if self._wx is None:
+            self._bind_current_chatbox(uia, ChatBox)
+        self._target_session_signature = self._session_signature(session)
+        self._target_session_unread_count = self._session_unread_count(session)
         return True
 
     def _remember(self, key: str) -> None:
@@ -642,12 +756,9 @@ class WeChatClient:
             for raw in messages[: max(0, len(messages) - new_count)]:
                 self._remember(_message_key(raw))
             self._pending_session_message_count = None
-        self._target_session_signature = self._session_signature(
-            self._find_session_item(uia)
-        )
-        self._target_session_unread_count = self._session_unread_count(
-            self._find_session_item(uia)
-        )
+        session = self._target_session(uia)
+        self._target_session_signature = self._session_signature(session)
+        self._target_session_unread_count = self._session_unread_count(session)
         return messages
 
     def _native_messages(self) -> list[Any]:
@@ -686,6 +797,8 @@ class WeChatClient:
         return messages
 
     def baseline(self) -> int:
+        if self._wx_cli_reader is not None:
+            return self._wx_cli_reader.baseline()
         count = 0
         for raw in self._all_messages():
             message = normalize_message(raw)
@@ -695,6 +808,8 @@ class WeChatClient:
         return count
 
     def poll(self) -> list[IncomingMessage]:
+        if self._wx_cli_reader is not None:
+            return self._poll_wx_cli()
         incoming: list[IncomingMessage] = []
         for raw in self._all_messages():
             raw_key = _message_key(raw)
@@ -727,6 +842,38 @@ class WeChatClient:
                 chat_type=self._active_chat_type,
             )
             incoming.append(message)
+        return incoming
+
+    def _poll_wx_cli(self) -> list[IncomingMessage]:
+        assert self._wx_cli_reader is not None
+        incoming: list[IncomingMessage] = []
+        for raw in self._wx_cli_reader.poll():
+            if raw.key in self._seen:
+                continue
+            self._remember(raw.key)
+            if raw.content.startswith(self.response_prefix):
+                continue
+            attr = "self" if raw.is_self else "friend"
+            if attr == "self" and not self.allow_self_messages:
+                continue
+            content = raw.content
+            sender = raw.sender
+            if raw.chat_type == "group":
+                content = strip_required_group_mention(content, self.bot_name)
+                if content is None or not content:
+                    continue
+            elif not sender or sender == "friend":
+                sender = self.contact
+            incoming.append(
+                IncomingMessage(
+                    key=raw.key,
+                    content=content,
+                    sender=sender,
+                    attr=attr,
+                    conversation=raw.conversation,
+                    chat_type=raw.chat_type,
+                )
+            )
         return incoming
 
     def _recognize_voice(self, raw: Any, key: str) -> IncomingMessage | None:
@@ -773,6 +920,8 @@ class WeChatClient:
             return None
 
     def send(self, text: str) -> None:
+        if self._root is None:
+            self._connect_uia()
         self._refresh_target()
         payload_limit = max(100, self.max_reply_chars - len(self.response_prefix))
         chunks = split_text(text, payload_limit)
@@ -782,12 +931,9 @@ class WeChatClient:
             self._send_background(self.response_prefix + part + chunk)
         from wxauto4.uia import uiautomation as uia
 
-        self._target_session_signature = self._session_signature(
-            self._find_session_item(uia)
-        )
-        self._target_session_unread_count = self._session_unread_count(
-            self._find_session_item(uia)
-        )
+        session = self._target_session(uia, force_lookup=True)
+        self._target_session_signature = self._session_signature(session)
+        self._target_session_unread_count = self._session_unread_count(session)
 
     def _send_background(self, payload: str) -> None:
         """Prefer a focus-free UIA send, with a focus-restoring fallback."""
