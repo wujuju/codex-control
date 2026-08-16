@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from wechat_codex.chatgpt_runner import (
     ACCOUNT_SELECTOR,
+    BrowserSessionUnavailable,
     ChatGPTRunner,
     LOGIN_SELECTOR,
     PlaywrightChatSession,
@@ -32,6 +33,8 @@ class FakeSession:
         export_calls: list[tuple[str, str]],
         reply_number: int,
         reply_images: tuple[Path, ...],
+        ask_errors: list[Exception],
+        enter_errors: list[Exception],
     ) -> None:
         self.calls = calls
         self.image_calls = image_calls
@@ -41,8 +44,12 @@ class FakeSession:
         self.export_calls = export_calls
         self.reply_number = reply_number
         self.reply_images = reply_images
+        self.ask_errors = ask_errors
+        self.enter_errors = enter_errors
 
     def __enter__(self):
+        if self.enter_errors:
+            raise self.enter_errors.pop(0)
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:
@@ -61,6 +68,8 @@ class FakeSession:
         self.calls.append((conversation_url, prompt, conversation_title))
         self.image_calls.append(image_paths)
         self.image_expectations.append(expect_image)
+        if self.ask_errors:
+            raise self.ask_errors.pop(0)
         return f"回复{self.reply_number}", (
             conversation_url or "https://chatgpt.com/c/web-conversation-1"
         ), self.reply_images
@@ -86,6 +95,8 @@ class FakeSessionFactory:
         self.export_calls: list[tuple[str, str]] = []
         self.session_count = 0
         self.reply_images: tuple[Path, ...] = ()
+        self.ask_errors: list[Exception] = []
+        self.enter_errors: list[Exception] = []
 
     def __call__(self, profile_dir, browser_channel, headless, proxy_server):
         self.session_count += 1
@@ -98,6 +109,8 @@ class FakeSessionFactory:
             self.export_calls,
             self.session_count,
             self.reply_images,
+            self.ask_errors,
+            self.enter_errors,
         )
 
 
@@ -413,6 +426,17 @@ class ChatGPTRunnerTests(unittest.TestCase):
         self.assertEqual(page.goto_count, 3)
         self.assertEqual(page.waits, [1000, 2000])
 
+    def test_socket_disconnect_requests_a_fresh_browser_session(self) -> None:
+        page = FakeNavigationPage(
+            [RuntimeError("net::ERR_SOCKET_NOT_CONNECTED")]
+        )
+
+        with self.assertRaises(BrowserSessionUnavailable):
+            PlaywrightChatSession._navigate(page, "https://chatgpt.com/", 30)
+
+        self.assertEqual(page.goto_count, 1)
+        self.assertEqual(page.waits, [])
+
     def test_stable_reply_does_not_require_send_button(self) -> None:
         page = FakeReplyPage()
         replies = FakeReplyList("完整回复")
@@ -622,6 +646,81 @@ class ChatGPTRunnerTests(unittest.TestCase):
                 factory.calls,
                 [(None, "第一问", None), (None, "第二问", None)],
             )
+
+    def test_stale_browser_is_rebuilt_before_processing_new_job(self) -> None:
+        with TemporaryDirectory() as directory:
+            factory = FakeSessionFactory()
+            runner = make_runner(Path(directory), factory)
+            moments = iter((0.0, 3600.0, 3600.0, 3600.0, 3600.0))
+            runner._monotonic = lambda: next(moments)
+
+            self.assertTrue(runner.begin_chat("friend:测试", "隔夜后的问题")[0])
+            wait_until_idle(runner)
+            events = runner.drain_events()
+            runner.close()
+
+            self.assertEqual(factory.session_count, 2)
+            self.assertEqual(factory.calls, [(None, "隔夜后的问题", None)])
+            self.assertEqual([event.text for event in events], ["回复2"])
+
+    def test_browser_disconnect_rebuilds_and_replays_original_job(self) -> None:
+        with TemporaryDirectory() as directory:
+            factory = FakeSessionFactory()
+            factory.ask_errors.append(
+                BrowserSessionUnavailable("net::ERR_SOCKET_NOT_CONNECTED")
+            )
+            runner = make_runner(Path(directory), factory)
+
+            self.assertTrue(runner.begin_chat("friend:测试", "不应让用户重试")[0])
+            wait_until_idle(runner)
+            events = runner.drain_events()
+            runner.close()
+
+            self.assertEqual(factory.session_count, 2)
+            self.assertEqual(
+                factory.calls,
+                [
+                    (None, "不应让用户重试", None),
+                    (None, "不应让用户重试", None),
+                ],
+            )
+            self.assertEqual([event.text for event in events], ["回复2"])
+
+    def test_browser_startup_recovers_from_transient_network_failure(self) -> None:
+        with TemporaryDirectory() as directory:
+            factory = FakeSessionFactory()
+            factory.enter_errors.append(
+                BrowserSessionUnavailable("net::ERR_SOCKET_NOT_CONNECTED")
+            )
+            runner = make_runner(Path(directory), factory)
+            runner._sleep = lambda _seconds: None
+
+            runner.start()
+            running = runner.browser_running
+            runner.close()
+
+            self.assertTrue(running)
+            self.assertEqual(factory.session_count, 2)
+
+    def test_browser_recovery_has_a_bounded_failure_result(self) -> None:
+        with TemporaryDirectory() as directory:
+            factory = FakeSessionFactory()
+            factory.ask_errors.extend(
+                BrowserSessionUnavailable("net::ERR_SOCKET_NOT_CONNECTED")
+                for _ in range(4)
+            )
+            runner = make_runner(Path(directory), factory)
+
+            self.assertTrue(runner.begin_chat("friend:测试", "测试恢复上限")[0])
+            wait_until_idle(runner)
+            events = runner.drain_events()
+            runner.close()
+
+            # Four sessions execute the bounded attempts; the fifth is the
+            # clean idle replacement kept ready for future requests.
+            self.assertEqual(factory.session_count, 5)
+            self.assertEqual(len(events), 1)
+            self.assertIn("自动重建多次后仍无法恢复", events[0].text)
 
     def test_conversation_title_is_used_for_new_and_existing_web_chat(self) -> None:
         with TemporaryDirectory() as directory:

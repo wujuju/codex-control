@@ -367,6 +367,26 @@ class ChatStopped(RuntimeError):
     pass
 
 
+class BrowserSessionUnavailable(RuntimeError):
+    """The current browser process is unusable and can be safely recreated."""
+
+
+_BROWSER_SESSION_LOST_MARKERS = (
+    "ERR_SOCKET_NOT_CONNECTED",
+    "Target page, context or browser has been closed",
+    "Target closed",
+    "Browser has been closed",
+    "Page crashed",
+    "browser connection closed",
+    "Connection closed while reading from the driver",
+)
+
+
+def _browser_session_is_unavailable(error: BaseException) -> bool:
+    detail = str(error)
+    return any(marker.lower() in detail.lower() for marker in _BROWSER_SESSION_LOST_MARKERS)
+
+
 class BrowserSession(Protocol):
     def __enter__(self) -> BrowserSession: ...
 
@@ -588,30 +608,40 @@ class PlaywrightChatSession:
         if stopped():
             raise ChatStopped("ChatGPT 请求已停止")
 
-        assistant_messages = page.locator(
-            f"{ASSISTANT_SELECTOR}, {ASSISTANT_FALLBACK_SELECTOR}"
-        )
-        previous_count = assistant_messages.count()
-        if image_paths:
-            self._upload_images(page, image_paths)
-        image_baseline = self._image_baseline(
-            page,
-            usable_only=False,
-            exclude_user=False,
-        )
-        effective_expect_image = (
-            _prompt_expects_image(prompt) if expect_image is None else expect_image
-        )
-        log.info(
-            "等待 ChatGPT 回复：图片模式=%s，轮次边界=%d，已存在轮次=%d，历史图片=%d",
-            effective_expect_image,
-            image_baseline.max_turn_number,
-            len(image_baseline.prior_turn_ids),
-            len(image_baseline.media_keys),
-        )
-        composer.fill(prompt)
-        send_button = page.locator(SEND_SELECTOR).first
-        send_button.wait_for(state="visible", timeout=30_000)
+        try:
+            assistant_messages = page.locator(
+                f"{ASSISTANT_SELECTOR}, {ASSISTANT_FALLBACK_SELECTOR}"
+            )
+            previous_count = assistant_messages.count()
+            if image_paths:
+                self._upload_images(page, image_paths)
+            image_baseline = self._image_baseline(
+                page,
+                usable_only=False,
+                exclude_user=False,
+            )
+            effective_expect_image = (
+                _prompt_expects_image(prompt) if expect_image is None else expect_image
+            )
+            log.info(
+                "等待 ChatGPT 回复：图片模式=%s，轮次边界=%d，已存在轮次=%d，历史图片=%d",
+                effective_expect_image,
+                image_baseline.max_turn_number,
+                len(image_baseline.prior_turn_ids),
+                len(image_baseline.media_keys),
+            )
+            composer.fill(prompt)
+            send_button = page.locator(SEND_SELECTOR).first
+            send_button.wait_for(state="visible", timeout=30_000)
+        except BrowserSessionUnavailable:
+            raise
+        except Exception as exc:
+            if _browser_session_is_unavailable(exc):
+                raise BrowserSessionUnavailable(str(exc)) from exc
+            raise
+
+        # Do not automatically replay an exception from click itself: at that
+        # point delivery is ambiguous and replaying could duplicate a prompt.
         send_button.click(timeout=30_000)
 
         text = self._wait_for_reply(
@@ -830,6 +860,7 @@ class PlaywrightChatSession:
             "ERR_CONNECTION_CLOSED",
             "ERR_CONNECTION_RESET",
             "ERR_CONNECTION_TIMED_OUT",
+            "ERR_SOCKET_NOT_CONNECTED",
             "ERR_PROXY_CONNECTION_FAILED",
             "ERR_SOCKS_CONNECTION_FAILED",
             "frame was detached",
@@ -841,6 +872,8 @@ class PlaywrightChatSession:
                 return
             except Exception as exc:
                 detail = str(exc)
+                if _browser_session_is_unavailable(exc):
+                    raise BrowserSessionUnavailable(detail) from exc
                 if not any(marker in detail for marker in retryable_errors):
                     raise
                 interrupted_navigation = (
@@ -851,7 +884,7 @@ class PlaywrightChatSession:
                 ):
                     return
                 if attempt == max_attempts - 1:
-                    raise
+                    raise BrowserSessionUnavailable(detail) from exc
                 delay_ms = 1000 * (2**attempt)
                 log.warning(
                     "ChatGPT 页面连接失败，%s 毫秒后重试（%d/%d）：%s",
@@ -864,7 +897,12 @@ class PlaywrightChatSession:
 
     @staticmethod
     def _wait_for_composer(page: Any) -> Any:
-        account = _wait_for_account_state(page, timeout_ms=10_000)
+        try:
+            account = _wait_for_account_state(page, timeout_ms=10_000)
+        except Exception as exc:
+            if _browser_session_is_unavailable(exc):
+                raise BrowserSessionUnavailable(str(exc)) from exc
+            raise
         if not account.logged_in:
             raise RuntimeError("ChatGPT Plus 尚未登录，请先运行 chatgpt-login")
         if not account.plus:
@@ -874,6 +912,8 @@ class PlaywrightChatSession:
             composer.wait_for(state="visible", timeout=20_000)
             return composer
         except Exception as exc:
+            if _browser_session_is_unavailable(exc):
+                raise BrowserSessionUnavailable(str(exc)) from exc
             url = str(page.url)
             if "auth" in url or "login" in url:
                 raise RuntimeError(
@@ -1322,6 +1362,9 @@ class PlaywrightChatSession:
 
 
 class ChatGPTRunner:
+    _browser_max_idle_seconds = 30 * 60
+    _browser_recovery_attempts = 3
+
     def __init__(
         self,
         *,
@@ -1347,6 +1390,8 @@ class ChatGPTRunner:
         self._worker_ready = threading.Event()
         self._startup_error: Exception | None = None
         self._closing = False
+        self._monotonic = time.monotonic
+        self._sleep = time.sleep
         self._conversation_file = runtime_dir / "chatgpt_web_conversations.json"
         self._title_file = runtime_dir / "chatgpt_conversation_titles.json"
         self._history_file = runtime_dir / "chatgpt_conversation_history.json"
@@ -1613,40 +1658,129 @@ class ChatGPTRunner:
         )
 
     def _browser_loop(self) -> None:
+        pending_job: _ChatJob | _ControlJob | None = None
+        recovery_count = 0
         try:
-            with self._session_factory(
-                self.profile_dir,
-                self.browser_channel,
-                self.headless,
-                self.proxy_server,
-            ) as session:
-                self._worker_ready.set()
-                while True:
-                    job = self._jobs.get()
-                    if job is None:
+            while True:
+                try:
+                    with self._session_factory(
+                        self.profile_dir,
+                        self.browser_channel,
+                        self.headless,
+                        self.proxy_server,
+                    ) as session:
+                        self._worker_ready.set()
+                        session_last_used = self._monotonic()
+                        while True:
+                            job = pending_job if pending_job is not None else self._jobs.get()
+                            pending_job = None
+                            if job is None:
+                                return
+
+                            idle_seconds = self._monotonic() - session_last_used
+                            if idle_seconds >= self._browser_max_idle_seconds:
+                                log.info(
+                                    "ChatGPT 浏览器已空闲 %.0f 秒，处理新请求前自动重建",
+                                    idle_seconds,
+                                )
+                                pending_job = job
+                                recovery_count = 0
+                                break
+
+                            try:
+                                if isinstance(job, _ControlJob):
+                                    self._run_control(session, job)
+                                else:
+                                    self._run_chat(session, job)
+                            except BrowserSessionUnavailable as exc:
+                                if self._stopped():
+                                    self.events.put(
+                                        ChatEvent("ChatGPT 请求已停止", job.session_key)
+                                    )
+                                    self._finish()
+                                    recovery_count = 0
+                                    break
+                                recovery_count += 1
+                                if recovery_count > self._browser_recovery_attempts:
+                                    self._fail_after_browser_recovery(job, exc)
+                                    recovery_count = 0
+                                    break
+                                pending_job = job
+                                log.warning(
+                                    "ChatGPT 浏览器会话失效，正在自动重建并继续原请求（%d/%d）：%s",
+                                    recovery_count,
+                                    self._browser_recovery_attempts,
+                                    str(exc).splitlines()[0],
+                                )
+                                break
+                            else:
+                                recovery_count = 0
+                                session_last_used = self._monotonic()
+                except Exception as exc:
+                    if not self._worker_ready.is_set():
+                        if (
+                            isinstance(exc, BrowserSessionUnavailable)
+                            and recovery_count < self._browser_recovery_attempts
+                        ):
+                            recovery_count += 1
+                            delay_seconds = min(2 ** (recovery_count - 1), 8)
+                            log.warning(
+                                "ChatGPT 浏览器启动时网络不可用，%d 秒后自动重建（%d/%d）：%s",
+                                delay_seconds,
+                                recovery_count,
+                                self._browser_recovery_attempts,
+                                str(exc).splitlines()[0],
+                            )
+                            self._sleep(delay_seconds)
+                            continue
+                        self._startup_error = exc
                         return
-                    if isinstance(job, _ControlJob):
-                        self._run_control(session, job)
-                    else:
-                        self._run_chat(session, job)
+                    if pending_job is None:
+                        raise
+                    recovery_count += 1
+                    if recovery_count > self._browser_recovery_attempts:
+                        self._fail_after_browser_recovery(pending_job, exc)
+                        pending_job = None
+                        recovery_count = 0
+                        continue
+                    delay_seconds = min(2 ** (recovery_count - 1), 8)
+                    log.warning(
+                        "ChatGPT 浏览器重建失败，%d 秒后继续自动恢复（%d/%d）：%s",
+                        delay_seconds,
+                        recovery_count,
+                        self._browser_recovery_attempts,
+                        str(exc).splitlines()[0],
+                    )
+                    self._sleep(delay_seconds)
         except Exception as exc:
-            if not self._worker_ready.is_set():
-                self._startup_error = exc
-            else:
-                detail = str(exc).strip() or type(exc).__name__
-                with self._lock:
-                    session_key = self._state.session_key
-                self.events.put(ChatEvent(
-                    f"ChatGPT 专用浏览器意外退出：{detail[-1000:]}", session_key
-                ))
-                self._finish()
+            detail = str(exc).strip() or type(exc).__name__
+            with self._lock:
+                session_key = self._state.session_key
+            self.events.put(ChatEvent(
+                f"ChatGPT 专用浏览器意外退出：{detail[-1000:]}", session_key
+            ))
+            self._finish()
         finally:
             self._worker_ready.set()
             with self._lock:
                 if threading.current_thread() is self._worker:
                     self._worker = None
 
+    def _fail_after_browser_recovery(
+        self,
+        job: _ChatJob | _ControlJob,
+        error: BaseException,
+    ) -> None:
+        detail = str(error).strip() or type(error).__name__
+        self.events.put(ChatEvent(
+            "ChatGPT 浏览器自动重建多次后仍无法恢复："
+            f"{detail[-1000:]}",
+            job.session_key,
+        ))
+        self._finish()
+
     def _run_chat(self, session: BrowserSession, job: _ChatJob) -> None:
+        finish = True
         try:
             text, new_url, image_paths = session.ask(
                 job.conversation_url,
@@ -1676,15 +1810,20 @@ class ChatGPTRunner:
             self.events.put(event)
         except ChatStopped:
             self.events.put(ChatEvent("ChatGPT 请求已停止", job.session_key))
+        except BrowserSessionUnavailable:
+            finish = False
+            raise
         except Exception as exc:
             detail = str(exc).strip() or type(exc).__name__
             self.events.put(ChatEvent(
                 f"ChatGPT Plus 网页请求失败：{detail[-1000:]}", job.session_key
             ))
         finally:
-            self._finish()
+            if finish:
+                self._finish()
 
     def _run_control(self, session: BrowserSession, job: _ControlJob) -> None:
+        finish = True
         try:
             if job.kind == _ControlKind.ARCHIVE:
                 session.archive(job.conversation_url, self.timeout_seconds)
@@ -1791,6 +1930,9 @@ class ChatGPTRunner:
                 self.events.put(event)
         except ChatStopped:
             self.events.put(ChatEvent("ChatGPT 请求已停止", job.session_key))
+        except BrowserSessionUnavailable:
+            finish = False
+            raise
         except Exception as exc:
             detail = str(exc).strip() or type(exc).__name__
             self.events.put(ChatEvent(
@@ -1798,7 +1940,8 @@ class ChatGPTRunner:
                 job.session_key,
             ))
         finally:
-            self._finish()
+            if finish:
+                self._finish()
 
     def _load_conversations(self) -> dict[str, str]:
         if not self._conversation_file.is_file():
