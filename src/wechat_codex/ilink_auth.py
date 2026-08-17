@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -14,6 +13,7 @@ from .ilink_api import (
     ILinkProtocolError,
     validate_base_url,
 )
+from .state_io import atomic_write_text
 
 
 def load_credentials(path: Path) -> ILinkCredentials | None:
@@ -35,9 +35,8 @@ def load_credentials(path: Path) -> ILinkCredentials | None:
 
 
 def save_credentials(path: Path, credentials: ILinkCredentials) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
+    atomic_write_text(
+        path,
         json.dumps(
             {
                 "token": credentials.token,
@@ -49,10 +48,7 @@ def save_credentials(path: Path, credentials: ILinkCredentials) -> None:
             indent=2,
         )
         + "\n",
-        encoding="utf-8",
     )
-    os.chmod(temporary, 0o600)
-    os.replace(temporary, path)
 
 
 def _show_qr(content: str, output: Callable[[str], None]) -> None:

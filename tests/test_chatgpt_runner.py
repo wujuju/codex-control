@@ -35,6 +35,7 @@ class FakeSession:
         reply_images: tuple[Path, ...],
         ask_errors: list[Exception],
         enter_errors: list[Exception],
+        exit_calls: list[int],
     ) -> None:
         self.calls = calls
         self.image_calls = image_calls
@@ -46,6 +47,7 @@ class FakeSession:
         self.reply_images = reply_images
         self.ask_errors = ask_errors
         self.enter_errors = enter_errors
+        self.exit_calls = exit_calls
 
     def __enter__(self):
         if self.enter_errors:
@@ -53,6 +55,7 @@ class FakeSession:
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:
+        self.exit_calls.append(self.reply_number)
         return None
 
     def ask(
@@ -97,6 +100,7 @@ class FakeSessionFactory:
         self.reply_images: tuple[Path, ...] = ()
         self.ask_errors: list[Exception] = []
         self.enter_errors: list[Exception] = []
+        self.exit_calls: list[int] = []
 
     def __call__(self, profile_dir, browser_channel, headless, proxy_server):
         self.session_count += 1
@@ -111,6 +115,7 @@ class FakeSessionFactory:
             self.reply_images,
             self.ask_errors,
             self.enter_errors,
+            self.exit_calls,
         )
 
 
@@ -162,10 +167,12 @@ class FakeNavigationPage:
     def __init__(self, results: list[Exception | None]) -> None:
         self.results = results
         self.goto_count = 0
+        self.timeouts: list[int] = []
         self.waits: list[int] = []
         self.url = "about:blank"
 
     def goto(self, url, wait_until, timeout):
+        self.timeouts.append(timeout)
         result = self.results[self.goto_count]
         self.goto_count += 1
         if result is not None:
@@ -261,6 +268,14 @@ def wait_until_idle(runner: ChatGPTRunner) -> None:
         time.sleep(0.01)
     if runner.active:
         raise AssertionError("ChatGPT runner did not become idle")
+
+
+def wait_until_browser_released(runner: ChatGPTRunner) -> None:
+    deadline = time.monotonic() + 2
+    while runner.browser_running and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if runner.browser_running:
+        raise AssertionError("ChatGPT browser session was not released")
 
 
 def make_runner(runtime_dir: Path, factory: FakeSessionFactory) -> ChatGPTRunner:
@@ -437,6 +452,58 @@ class ChatGPTRunnerTests(unittest.TestCase):
         self.assertEqual(page.goto_count, 1)
         self.assertEqual(page.waits, [])
 
+    def test_navigation_honors_stop_before_starting_a_blocking_goto(self) -> None:
+        page = FakeNavigationPage([])
+
+        with self.assertRaisesRegex(RuntimeError, "已停止"):
+            PlaywrightChatSession._navigate(
+                page,
+                "https://chatgpt.com/",
+                30,
+                stopped=lambda: True,
+            )
+
+        self.assertEqual(page.goto_count, 0)
+
+    def test_control_navigation_uses_runner_stop_checker(self) -> None:
+        page = FakeNavigationPage([])
+        session = PlaywrightChatSession(Path("unused"), "msedge", True, None)
+        session._page = page
+        session.set_stop_checker(lambda: True)
+
+        with self.assertRaisesRegex(RuntimeError, "已停止"):
+            session.archive("https://chatgpt.com/c/example", 30)
+
+        self.assertEqual(page.goto_count, 0)
+
+    def test_navigation_retries_share_one_absolute_deadline(self) -> None:
+        clock = [0.0]
+
+        class DeadlineNavigationPage(FakeNavigationPage):
+            def goto(self, url, wait_until, timeout):
+                super().goto(url, wait_until, timeout)
+
+            def wait_for_timeout(self, timeout):
+                super().wait_for_timeout(timeout)
+                clock[0] += timeout / 1000
+
+        page = DeadlineNavigationPage(
+            [RuntimeError("net::ERR_CONNECTION_RESET")]
+        )
+
+        with (
+            patch(
+                "wechat_codex.chatgpt_runner.time.monotonic",
+                side_effect=lambda: clock[0],
+            ),
+            self.assertRaises(TimeoutError),
+        ):
+            PlaywrightChatSession._navigate(page, "https://chatgpt.com/", 1)
+
+        self.assertEqual(page.goto_count, 1)
+        self.assertLessEqual(sum(page.waits), 1000)
+        self.assertTrue(all(timeout <= 1000 for timeout in page.timeouts))
+
     def test_stable_reply_does_not_require_send_button(self) -> None:
         page = FakeReplyPage()
         replies = FakeReplyList("完整回复")
@@ -476,6 +543,27 @@ class ChatGPTRunnerTests(unittest.TestCase):
             )
 
         self.assertEqual(result, "第一段\n第二段")
+
+    def test_reply_activity_cannot_extend_past_absolute_deadline(self) -> None:
+        page = FakeReplyPage()
+        replies = ChangingReplyList(["第一段", "第一段\n第二段"])
+        clock = [0.0, 1.0, 3.0]
+
+        with (
+            patch(
+                "wechat_codex.chatgpt_runner.time.monotonic",
+                side_effect=clock,
+            ),
+            self.assertRaises(TimeoutError),
+        ):
+            PlaywrightChatSession._wait_for_reply(
+                page,
+                replies,
+                previous_count=0,
+                timeout_seconds=10,
+                stopped=lambda: False,
+                absolute_deadline=3.0,
+            )
 
     def test_tool_activity_extends_timeout_before_final_reply_appears(self) -> None:
         page = FakeReplyPage()
@@ -647,20 +735,95 @@ class ChatGPTRunnerTests(unittest.TestCase):
                 [(None, "第一问", None), (None, "第二问", None)],
             )
 
+    def test_start_is_lazy_until_the_first_chat_job(self) -> None:
+        with TemporaryDirectory() as directory:
+            factory = FakeSessionFactory()
+            runner = make_runner(Path(directory), factory)
+
+            runner.start()
+
+            self.assertFalse(runner.browser_running)
+            self.assertEqual(factory.session_count, 0)
+
+            self.assertTrue(runner.begin_chat("friend:测试", "首个问题")[0])
+            wait_until_idle(runner)
+
+            self.assertTrue(runner.browser_running)
+            self.assertEqual(factory.session_count, 1)
+            self.assertEqual(factory.calls, [(None, "首个问题", None)])
+            runner.close()
+
+    def test_close_before_first_job_does_not_open_browser(self) -> None:
+        with TemporaryDirectory() as directory:
+            factory = FakeSessionFactory()
+            runner = make_runner(Path(directory), factory)
+
+            runner.start()
+            runner.close()
+
+            self.assertFalse(runner.browser_running)
+            self.assertEqual(factory.session_count, 0)
+
+    def test_idle_browser_session_is_released_and_lazily_reopened(self) -> None:
+        with TemporaryDirectory() as directory:
+            factory = FakeSessionFactory()
+            runner = make_runner(Path(directory), factory)
+            runner._browser_max_idle_seconds = 0.02
+
+            runner.start()
+            self.assertFalse(runner.browser_running)
+            self.assertEqual(factory.session_count, 0)
+
+            self.assertTrue(runner.begin_chat("friend:测试", "释放前的问题")[0])
+            wait_until_idle(runner)
+            wait_until_browser_released(runner)
+
+            self.assertEqual(factory.session_count, 1)
+            self.assertEqual(factory.exit_calls, [1])
+            self.assertTrue(runner.begin_chat("friend:测试", "空闲后的问题")[0])
+            wait_until_idle(runner)
+            runner.close()
+
+            self.assertEqual(factory.session_count, 2)
+            self.assertEqual(
+                factory.calls,
+                [
+                    (None, "释放前的问题", None),
+                    (
+                        "https://chatgpt.com/c/web-conversation-1",
+                        "空闲后的问题",
+                        None,
+                    ),
+                ],
+            )
+
     def test_stale_browser_is_rebuilt_before_processing_new_job(self) -> None:
         with TemporaryDirectory() as directory:
             factory = FakeSessionFactory()
             runner = make_runner(Path(directory), factory)
-            moments = iter((0.0, 3600.0, 3600.0, 3600.0, 3600.0))
-            runner._monotonic = lambda: next(moments)
+            moments = iter((0.0, 0.0, 0.0, 0.0, 3600.0, 3600.0, 3600.0))
+            runner._monotonic = lambda: next(moments, 3600.0)
 
+            self.assertTrue(runner.begin_chat("friend:测试", "第一问")[0])
+            wait_until_idle(runner)
+            runner.drain_events()
             self.assertTrue(runner.begin_chat("friend:测试", "隔夜后的问题")[0])
             wait_until_idle(runner)
             events = runner.drain_events()
             runner.close()
 
             self.assertEqual(factory.session_count, 2)
-            self.assertEqual(factory.calls, [(None, "隔夜后的问题", None)])
+            self.assertEqual(
+                factory.calls,
+                [
+                    (None, "第一问", None),
+                    (
+                        "https://chatgpt.com/c/web-conversation-1",
+                        "隔夜后的问题",
+                        None,
+                    ),
+                ],
+            )
             self.assertEqual([event.text for event in events], ["回复2"])
 
     def test_browser_disconnect_rebuilds_and_replays_original_job(self) -> None:
@@ -696,11 +859,18 @@ class ChatGPTRunnerTests(unittest.TestCase):
             runner._sleep = lambda _seconds: None
 
             runner.start()
+            self.assertFalse(runner.browser_running)
+            self.assertEqual(factory.session_count, 0)
+
+            self.assertTrue(runner.begin_chat("friend:测试", "触发浏览器启动")[0])
+            wait_until_idle(runner)
             running = runner.browser_running
+            events = runner.drain_events()
             runner.close()
 
             self.assertTrue(running)
             self.assertEqual(factory.session_count, 2)
+            self.assertEqual([event.text for event in events], ["回复2"])
 
     def test_browser_recovery_has_a_bounded_failure_result(self) -> None:
         with TemporaryDirectory() as directory:
@@ -716,9 +886,7 @@ class ChatGPTRunnerTests(unittest.TestCase):
             events = runner.drain_events()
             runner.close()
 
-            # Four sessions execute the bounded attempts; the fifth is the
-            # clean idle replacement kept ready for future requests.
-            self.assertEqual(factory.session_count, 5)
+            self.assertEqual(factory.session_count, 4)
             self.assertEqual(len(events), 1)
             self.assertIn("自动重建多次后仍无法恢复", events[0].text)
 
@@ -754,6 +922,29 @@ class ChatGPTRunnerTests(unittest.TestCase):
                     (url, "第二问", "微信無惧"),
                 ],
             )
+
+    def test_first_control_job_opens_browser_on_demand(self) -> None:
+        with TemporaryDirectory() as directory:
+            runtime_dir = Path(directory)
+            url = "https://chatgpt.com/c/existing-conversation"
+            (runtime_dir / "chatgpt_web_conversations.json").write_text(
+                json.dumps({"friend:测试": url}),
+                encoding="utf-8",
+            )
+            factory = FakeSessionFactory()
+            runner = make_runner(runtime_dir, factory)
+
+            runner.start()
+            self.assertFalse(runner.browser_running)
+            self.assertEqual(factory.session_count, 0)
+
+            self.assertTrue(runner.begin_archive("friend:测试")[0])
+            wait_until_idle(runner)
+
+            self.assertTrue(runner.browser_running)
+            self.assertEqual(factory.session_count, 1)
+            self.assertEqual(factory.archive_calls, [url])
+            runner.close()
 
     def test_archive_runs_in_browser_and_removes_mapping(self) -> None:
         with TemporaryDirectory() as directory:
@@ -951,14 +1142,46 @@ class ChatGPTRunnerTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             factory = FakeSessionFactory()
             runner = make_runner(Path(directory), factory)
-            runner.start()
+            self.assertTrue(runner.begin_chat("friend:测试", "重启前")[0])
+            wait_until_idle(runner)
+
+            self.assertTrue(runner.browser_running)
+            self.assertEqual(factory.session_count, 1)
 
             ok, response = runner.restart()
-            runner.close()
 
             self.assertTrue(ok)
             self.assertIn("已重启", response)
+            self.assertFalse(runner.browser_running)
+            self.assertEqual(factory.session_count, 1)
+
+            self.assertTrue(runner.begin_chat("friend:测试", "重启后")[0])
+            wait_until_idle(runner)
+            runner.close()
+
             self.assertEqual(factory.session_count, 2)
+
+    def test_restart_fails_when_old_browser_worker_does_not_close(self) -> None:
+        class StuckWorker:
+            def __init__(self) -> None:
+                self.join_calls: list[float | None] = []
+
+            def is_alive(self) -> bool:
+                return True
+
+            def join(self, timeout: float | None = None) -> None:
+                self.join_calls.append(timeout)
+
+        with TemporaryDirectory() as directory:
+            runner = make_runner(Path(directory), FakeSessionFactory())
+            worker = StuckWorker()
+            runner._worker = worker  # type: ignore[assignment]
+
+            ok, response = runner.restart()
+
+            self.assertFalse(ok)
+            self.assertIn("关闭超时", response)
+            self.assertEqual(worker.join_calls, [10])
 
     def test_only_chatgpt_conversation_urls_are_persisted(self) -> None:
         self.assertTrue(_is_chat_url("https://chatgpt.com/c/abc"))

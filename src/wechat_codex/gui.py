@@ -4,6 +4,7 @@ import argparse
 import logging
 import sys
 import threading
+import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
@@ -23,10 +24,12 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap, QWindow
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuickControls2 import QQuickStyle
-from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
+from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
 
 from .app import BridgeApp
 from .config import AppConfig, load_config
+from .ilink_auth import load_credentials
+from .instance_lock import AlreadyRunningError, InstanceLock, acquire_instance_lock
 from .onboarding import ensure_logins
 
 
@@ -174,6 +177,7 @@ class BridgeController(QObject):
         self._state = "stopped"
         self._bridge: BridgeApp | None = None
         self._thread: threading.Thread | None = None
+        self._stop_thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self.bridgeEvent.connect(
             self._apply_event, Qt.ConnectionType.QueuedConnection
@@ -212,11 +216,19 @@ class BridgeController(QObject):
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 return
-            bridge = BridgeApp(
-                self.config,
-                event_sink=self.bridgeEvent.emit,
-                state_sink=self.bridgeState.emit,
-            )
+            if self._stop_thread is not None and self._stop_thread.is_alive():
+                return
+            try:
+                bridge = BridgeApp(
+                    self.config,
+                    event_sink=self.bridgeEvent.emit,
+                    state_sink=self.bridgeState.emit,
+                )
+            except Exception as exc:
+                log.exception("桥接器初始化失败")
+                self._set_state("error", f"启动失败：{exc}")
+                self.messages.add_message("system", "系统", f"启动失败：{exc}")
+                return
             self._bridge = bridge
             self._thread = threading.Thread(
                 target=bridge.run,
@@ -227,11 +239,31 @@ class BridgeController(QObject):
 
     @Slot()
     def stopBridge(self) -> None:
-        bridge = self._bridge
-        if bridge is None:
-            return
+        with self._lock:
+            bridge = self._bridge
+            if bridge is None:
+                return
+            if self._stop_thread is not None and self._stop_thread.is_alive():
+                return
+            stop_thread = threading.Thread(
+                target=self._stop_bridge_worker,
+                args=(bridge,),
+                name="wechat-bridge-stop",
+                daemon=True,
+            )
+            self._stop_thread = stop_thread
         self._set_state("stopping", "正在停止")
-        bridge.stop()
+        stop_thread.start()
+
+    def _stop_bridge_worker(self, bridge: BridgeApp) -> None:
+        try:
+            bridge.stop()
+        except Exception:
+            log.exception("停止桥接器失败")
+        finally:
+            with self._lock:
+                if self._stop_thread is threading.current_thread():
+                    self._stop_thread = None
 
     @Slot(str)
     def sendMessage(self, text: str) -> None:
@@ -239,7 +271,7 @@ class BridgeController(QObject):
         if not cleaned:
             return
         bridge = self._bridge
-        if bridge is None or not self.running:
+        if bridge is None or self._state != "running":
             self.messages.add_message("system", "系统", "桥接尚未运行，消息未发送")
             return
         bridge.enqueue_message(cleaned)
@@ -270,18 +302,93 @@ class BridgeController(QObject):
             self.runningChanged.emit()
 
     def shutdown(self) -> None:
-        bridge = self._bridge
-        if bridge is not None:
-            bridge.stop()
-        thread = self._thread
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=2)
+        # aboutToQuit runs on Qt's UI thread. Network and browser cleanup can
+        # block, so only dispatch the stop request here.
+        self.stopBridge()
+
+    def wait_for_shutdown(self, timeout_seconds: float = 30.0) -> None:
+        """Finish cleanup after Qt's event loop has stopped rendering the UI."""
+        self.stopBridge()
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
+        with self._lock:
+            stop_thread = self._stop_thread
+            bridge_thread = self._thread
+        for worker in (stop_thread, bridge_thread):
+            if worker is None or worker is threading.current_thread():
+                continue
+            remaining = max(0.0, deadline - time.monotonic())
+            worker.join(timeout=remaining)
+        if bridge_thread is not None and bridge_thread.is_alive():
+            log.warning("等待桥接线程退出超时；进程退出时将强制回收")
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="微信 Codex QML 桌面端")
     parser.add_argument("--config", default="config.yaml", help="配置文件路径")
+    parser.add_argument(
+        "--skip-login-check",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     return parser
+
+
+def _has_interactive_console() -> bool:
+    stdin = getattr(sys, "stdin", None)
+    stdout = getattr(sys, "stdout", None)
+    try:
+        return bool(stdin and stdout and stdin.isatty() and stdout.isatty())
+    except (AttributeError, OSError):
+        return False
+
+
+def _prepare_gui_logins(
+    config: AppConfig,
+    *,
+    skip_login_check: bool,
+    interactive_console: bool,
+) -> None:
+    if skip_login_check:
+        log.info("登录检查已由控制台启动器完成")
+        return
+    if interactive_console:
+        ensure_logins(config)
+        return
+
+    missing: list[str] = []
+    if load_credentials(config.ilink_credentials_file) is None:
+        missing.append("微信 iLink")
+    profile = config.chatgpt_profile_dir
+    if not profile.is_dir() or not any(profile.iterdir()):
+        missing.append("ChatGPT Plus")
+    if missing:
+        names = "、".join(missing)
+        raise RuntimeError(
+            f"未找到 {names} 登录信息。请从项目目录运行 start.ps1（或 start.cmd），"
+            "在可见控制台中完成首次登录。"
+        )
+    log.info("无交互控制台；使用已保存的登录信息启动 GUI")
+
+
+def _prepare_gui_runtime(
+    config: AppConfig,
+    *,
+    skip_login_check: bool,
+    interactive_console: bool,
+) -> InstanceLock:
+    # Acquire before onboarding: an interactive check may open the same
+    # persistent browser profile used by an already-running instance.
+    instance_lock = acquire_instance_lock(config.runtime_dir)
+    try:
+        _prepare_gui_logins(
+            config,
+            skip_login_check=skip_login_check,
+            interactive_console=interactive_console,
+        )
+    except BaseException:
+        instance_lock.release()
+        raise
+    return instance_lock
 
 
 def _install_system_tray(
@@ -385,53 +492,78 @@ def _create_app_icon() -> QIcon:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    config = load_config(args.config)
-    config.runtime_dir.mkdir(parents=True, exist_ok=True)
-    ensure_logins(config)
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(name)s] [%(levelname)s] %(message)s",
-        handlers=[
-            RotatingFileHandler(
-                config.runtime_dir / "gui.log",
-                maxBytes=5 * 1024 * 1024,
-                backupCount=3,
-                encoding="utf-8",
-            )
-        ],
-    )
-
     QQuickStyle.setStyle("Basic")
     app = QApplication(sys.argv[:1])
     app.setApplicationName("WeChat Codex Control")
     app.setOrganizationName("Sam")
 
-    controller = BridgeController(config)
-    engine = QQmlApplicationEngine()
-    engine.setInitialProperties(
-        {
-            "bridge": controller,
-            "conversationModel": controller.conversations,
-            "messageModel": controller.messages,
-        }
-    )
-
-    qml_path = Path(__file__).resolve().parent / "qml" / "Main.qml"
-    engine.load(qml_path.as_uri())
-    if not engine.rootObjects():
+    instance_lock: InstanceLock | None = None
+    try:
+        config = load_config(args.config)
+        config.runtime_dir.mkdir(parents=True, exist_ok=True)
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s [%(name)s] [%(levelname)s] %(message)s",
+            handlers=[
+                RotatingFileHandler(
+                    config.runtime_dir / "gui.log",
+                    maxBytes=5 * 1024 * 1024,
+                    backupCount=3,
+                    encoding="utf-8",
+                )
+            ],
+        )
+        instance_lock = _prepare_gui_runtime(
+            config,
+            skip_login_check=args.skip_login_check,
+            interactive_console=_has_interactive_console(),
+        )
+    except AlreadyRunningError as exc:
+        log.error("GUI 拒绝启动第二个实例：%s", exc)
+        QMessageBox.warning(None, "微信 Codex 已在运行", str(exc))
         return 1
-    window = engine.rootObjects()[0]
-    if not isinstance(window, QWindow):
-        log.error("QML 根对象不是窗口")
+    except Exception as exc:
+        log.exception("GUI 启动前检查失败")
+        QMessageBox.critical(
+            None,
+            "微信 Codex 无法启动",
+            f"{exc}\n\n请在项目目录的可见终端中运行 start.ps1 或 start.cmd。",
+        )
         return 1
-    tray = _install_system_tray(app, window)
 
-    app.aboutToQuit.connect(controller.shutdown)
-    QTimer.singleShot(0, controller.startBridge)
-    exit_code = app.exec()
-    if tray is not None:
-        tray.hide()
-    return exit_code
+    tray: QSystemTrayIcon | None = None
+    try:
+        controller = BridgeController(config)
+        engine = QQmlApplicationEngine()
+        engine.setInitialProperties(
+            {
+                "bridge": controller,
+                "conversationModel": controller.conversations,
+                "messageModel": controller.messages,
+            }
+        )
+
+        qml_path = Path(__file__).resolve().parent / "qml" / "Main.qml"
+        engine.load(qml_path.as_uri())
+        if not engine.rootObjects():
+            return 1
+        window = engine.rootObjects()[0]
+        if not isinstance(window, QWindow):
+            log.error("QML 根对象不是窗口")
+            return 1
+        tray = _install_system_tray(app, window)
+
+        app.aboutToQuit.connect(controller.shutdown)
+        QTimer.singleShot(0, controller.startBridge)
+        exit_code = app.exec()
+        # The window is already gone, so waiting here cannot freeze visible UI;
+        # retain the instance lock until browser/process cleanup is complete.
+        controller.wait_for_shutdown()
+        return exit_code
+    finally:
+        if tray is not None:
+            tray.hide()
+        instance_lock.release()
 
 
 if __name__ == "__main__":

@@ -17,6 +17,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol
 
+from .state_io import atomic_write_text
+
 
 log = logging.getLogger(__name__)
 
@@ -387,6 +389,41 @@ def _browser_session_is_unavailable(error: BaseException) -> bool:
     return any(marker.lower() in detail.lower() for marker in _BROWSER_SESSION_LOST_MARKERS)
 
 
+def _check_operation(
+    stopped: Callable[[], bool] | None,
+    deadline: float | None,
+) -> None:
+    if stopped is not None and stopped():
+        raise ChatStopped("ChatGPT 请求已停止")
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError("ChatGPT 网页操作超过总等待时间")
+
+
+def _remaining_timeout_ms(deadline: float, maximum_ms: int) -> int:
+    remaining_ms = int((deadline - time.monotonic()) * 1000)
+    if remaining_ms <= 0:
+        raise TimeoutError("ChatGPT 网页操作超过总等待时间")
+    return max(1, min(maximum_ms, remaining_ms))
+
+
+def _interruptible_wait(
+    page: Any,
+    delay_ms: int,
+    stopped: Callable[[], bool] | None,
+    deadline: float,
+) -> None:
+    remaining_delay = delay_ms
+    while remaining_delay > 0:
+        _check_operation(stopped, deadline)
+        chunk_limit = 250 if stopped is not None else remaining_delay
+        chunk_ms = min(
+            remaining_delay,
+            _remaining_timeout_ms(deadline, chunk_limit),
+        )
+        page.wait_for_timeout(chunk_ms)
+        remaining_delay -= chunk_ms
+
+
 class BrowserSession(Protocol):
     def __enter__(self) -> BrowserSession: ...
 
@@ -502,14 +539,22 @@ def _read_account_state(page: Any) -> _AccountState:
     return _AccountState(logged_in=logged_in, plus=plus)
 
 
-def _wait_for_account_state(page: Any, timeout_ms: int) -> _AccountState:
-    deadline = time.monotonic() + timeout_ms / 1000
+def _wait_for_account_state(
+    page: Any,
+    timeout_ms: int,
+    *,
+    stopped: Callable[[], bool] | None = None,
+    deadline: float | None = None,
+) -> _AccountState:
+    local_deadline = time.monotonic() + timeout_ms / 1000
+    effective_deadline = min(local_deadline, deadline) if deadline is not None else local_deadline
     last_state = _AccountState(logged_in=False, plus=False)
-    while time.monotonic() < deadline:
+    while time.monotonic() < effective_deadline:
+        _check_operation(stopped, effective_deadline)
         last_state = _read_account_state(page)
         if last_state.plus:
             return last_state
-        page.wait_for_timeout(250)
+        _interruptible_wait(page, 250, stopped, effective_deadline)
     return last_state
 
 
@@ -532,6 +577,11 @@ class PlaywrightChatSession:
         self._page: Any = None
         self._captured_media_keys: set[str] = set()
         self._saved_image_hashes: set[str] | None = None
+        self._control_stopped: Callable[[], bool] = lambda: False
+
+    def set_stop_checker(self, stopped: Callable[[], bool]) -> None:
+        """Attach the runner cancellation flag to non-chat browser controls."""
+        self._control_stopped = stopped
 
     def __enter__(self) -> PlaywrightChatSession:
         from playwright.sync_api import sync_playwright
@@ -589,24 +639,46 @@ class PlaywrightChatSession:
         page = self._page
         if page is None:
             raise RuntimeError("ChatGPT 浏览器尚未启动")
+        operation_deadline = time.monotonic() + timeout_seconds
 
         target = (
             conversation_url
             if conversation_url is not None and _is_chat_url(conversation_url)
             else CHATGPT_HOME
         )
-        self._navigate(page, target, timeout_seconds)
+        self._navigate(
+            page,
+            target,
+            timeout_seconds,
+            stopped=stopped,
+            deadline=operation_deadline,
+        )
         try:
-            composer = self._wait_for_composer(page)
+            composer = self._wait_for_composer(
+                page,
+                stopped=stopped,
+                deadline=operation_deadline,
+            )
+        except (ChatStopped, BrowserSessionUnavailable):
+            raise
         except RuntimeError:
             if not conversation_url:
                 raise
             log.warning("原 ChatGPT 网页对话不可用，改为创建新对话：%s", conversation_url)
-            self._navigate(page, CHATGPT_HOME, timeout_seconds)
-            composer = self._wait_for_composer(page)
+            self._navigate(
+                page,
+                CHATGPT_HOME,
+                timeout_seconds,
+                stopped=stopped,
+                deadline=operation_deadline,
+            )
+            composer = self._wait_for_composer(
+                page,
+                stopped=stopped,
+                deadline=operation_deadline,
+            )
 
-        if stopped():
-            raise ChatStopped("ChatGPT 请求已停止")
+        _check_operation(stopped, operation_deadline)
 
         try:
             assistant_messages = page.locator(
@@ -614,7 +686,12 @@ class PlaywrightChatSession:
             )
             previous_count = assistant_messages.count()
             if image_paths:
-                self._upload_images(page, image_paths)
+                self._upload_images(
+                    page,
+                    image_paths,
+                    stopped=stopped,
+                    deadline=operation_deadline,
+                )
             image_baseline = self._image_baseline(
                 page,
                 usable_only=False,
@@ -630,9 +707,17 @@ class PlaywrightChatSession:
                 len(image_baseline.prior_turn_ids),
                 len(image_baseline.media_keys),
             )
-            composer.fill(prompt)
+            _check_operation(stopped, operation_deadline)
+            composer.fill(
+                prompt,
+                timeout=_remaining_timeout_ms(operation_deadline, 5_000),
+            )
             send_button = page.locator(SEND_SELECTOR).first
-            send_button.wait_for(state="visible", timeout=30_000)
+            self._wait_for_visible(
+                send_button,
+                stopped=stopped,
+                deadline=operation_deadline,
+            )
         except BrowserSessionUnavailable:
             raise
         except Exception as exc:
@@ -642,7 +727,10 @@ class PlaywrightChatSession:
 
         # Do not automatically replay an exception from click itself: at that
         # point delivery is ambiguous and replaying could duplicate a prompt.
-        send_button.click(timeout=30_000)
+        _check_operation(stopped, operation_deadline)
+        send_button.click(
+            timeout=_remaining_timeout_ms(operation_deadline, 5_000)
+        )
 
         text = self._wait_for_reply(
             page,
@@ -652,15 +740,26 @@ class PlaywrightChatSession:
             stopped,
             image_baseline,
             expect_image=effective_expect_image,
+            absolute_deadline=operation_deadline,
         )
         image_paths = self._save_reply_images(
             page,
             image_baseline,
         )
-        conversation_url = self._wait_for_conversation_url(page)
+        conversation_url = self._wait_for_conversation_url(
+            page,
+            stopped=stopped,
+            deadline=operation_deadline,
+        )
         if conversation_title:
             try:
-                self._rename_conversation(page, conversation_url, conversation_title)
+                self._rename_conversation(
+                    page,
+                    conversation_url,
+                    conversation_title,
+                    stopped=stopped,
+                    deadline=operation_deadline,
+                )
             except Exception as exc:
                 log.warning(
                     "ChatGPT 对话已创建并可继续使用，但标题更新失败（%s）：%s",
@@ -673,9 +772,22 @@ class PlaywrightChatSession:
         page = self._page
         if page is None:
             raise RuntimeError("ChatGPT 浏览器尚未启动")
-        self._navigate(page, conversation_url, timeout_seconds)
-        self._wait_for_composer(page)
-        self._open_conversation_menu(page, conversation_url)
+        deadline = time.monotonic() + timeout_seconds
+        stopped = self._control_stopped
+        self._navigate(
+            page,
+            conversation_url,
+            timeout_seconds,
+            stopped=stopped,
+            deadline=deadline,
+        )
+        self._wait_for_composer(page, stopped=stopped, deadline=deadline)
+        self._open_conversation_menu(
+            page,
+            conversation_url,
+            stopped=stopped,
+            deadline=deadline,
+        )
         archive_pattern = re.compile(
             r"^(?:Archive|Archive chat|归档|归档对话)$",
             re.IGNORECASE,
@@ -685,8 +797,9 @@ class PlaywrightChatSession:
             archive_item = page.get_by_text(archive_pattern)
         if archive_item.count() == 0:
             raise RuntimeError("找不到 ChatGPT 对话归档菜单")
-        archive_item.last.click()
-        page.wait_for_timeout(750)
+        _check_operation(stopped, deadline)
+        archive_item.last.click(timeout=_remaining_timeout_ms(deadline, 5_000))
+        _interruptible_wait(page, 750, stopped, deadline)
 
     def rename(
         self,
@@ -697,9 +810,23 @@ class PlaywrightChatSession:
         page = self._page
         if page is None:
             raise RuntimeError("ChatGPT 浏览器尚未启动")
-        self._navigate(page, conversation_url, timeout_seconds)
-        self._wait_for_composer(page)
-        self._rename_conversation(page, conversation_url, title)
+        deadline = time.monotonic() + timeout_seconds
+        stopped = self._control_stopped
+        self._navigate(
+            page,
+            conversation_url,
+            timeout_seconds,
+            stopped=stopped,
+            deadline=deadline,
+        )
+        self._wait_for_composer(page, stopped=stopped, deadline=deadline)
+        self._rename_conversation(
+            page,
+            conversation_url,
+            title,
+            stopped=stopped,
+            deadline=deadline,
+        )
 
     def export_markdown(
         self,
@@ -710,8 +837,17 @@ class PlaywrightChatSession:
         page = self._page
         if page is None:
             raise RuntimeError("ChatGPT 浏览器尚未启动")
-        self._navigate(page, conversation_url, timeout_seconds)
-        self._wait_for_composer(page)
+        deadline = time.monotonic() + timeout_seconds
+        stopped = self._control_stopped
+        self._navigate(
+            page,
+            conversation_url,
+            timeout_seconds,
+            stopped=stopped,
+            deadline=deadline,
+        )
+        self._wait_for_composer(page, stopped=stopped, deadline=deadline)
+        _check_operation(stopped, deadline)
         turns = page.evaluate(EXPORT_TURNS_SCRIPT)
         if not isinstance(turns, list) or not turns:
             raise RuntimeError("当前 ChatGPT 对话没有可导出的内容")
@@ -740,24 +876,43 @@ class PlaywrightChatSession:
         return "\n".join(sections).rstrip() + "\n"
 
     @staticmethod
-    def _upload_images(page: Any, image_paths: tuple[Path, ...]) -> None:
+    def _upload_images(
+        page: Any,
+        image_paths: tuple[Path, ...],
+        *,
+        stopped: Callable[[], bool] | None = None,
+        deadline: float | None = None,
+    ) -> None:
         missing = [str(path) for path in image_paths if not path.is_file()]
         if missing:
             raise RuntimeError(f"待上传的微信图片不存在：{missing[0]}")
 
         inputs = page.locator(FILE_INPUT_SELECTOR)
-        deadline = time.monotonic() + 5
-        while inputs.count() == 0 and time.monotonic() < deadline:
-            page.wait_for_timeout(100)
+        upload_deadline = time.monotonic() + 5
+        if deadline is not None:
+            upload_deadline = min(upload_deadline, deadline)
+        while inputs.count() == 0 and time.monotonic() < upload_deadline:
+            _interruptible_wait(page, 100, stopped, upload_deadline)
             inputs = page.locator(FILE_INPUT_SELECTOR)
         if inputs.count() == 0:
             raise RuntimeError("找不到 ChatGPT 图片上传控件；网页结构可能已经更新")
 
         selected = inputs.last
-        selected.set_input_files([str(path) for path in image_paths])
+        _check_operation(stopped, upload_deadline)
+        selected.set_input_files(
+            [str(path) for path in image_paths],
+            timeout=_remaining_timeout_ms(upload_deadline, 5_000),
+        )
 
     @staticmethod
-    def _rename_conversation(page: Any, conversation_url: str, title: str) -> None:
+    def _rename_conversation(
+        page: Any,
+        conversation_url: str,
+        title: str,
+        *,
+        stopped: Callable[[], bool] | None = None,
+        deadline: float | None = None,
+    ) -> None:
         """Rename the current web conversation through ChatGPT's visible UI."""
         cleaned = " ".join(title.split()).strip()[:80]
         if not cleaned:
@@ -766,6 +921,8 @@ class PlaywrightChatSession:
             page,
             conversation_url,
             open_menu=False,
+            stopped=stopped,
+            deadline=deadline,
         )
         try:
             current_text = " ".join(anchor.inner_text(timeout=1_000).split())
@@ -773,7 +930,12 @@ class PlaywrightChatSession:
             current_text = ""
         if current_text == cleaned:
             return
-        PlaywrightChatSession._click_conversation_menu(anchor, row)
+        PlaywrightChatSession._click_conversation_menu(
+            anchor,
+            row,
+            stopped=stopped,
+            deadline=deadline,
+        )
 
         rename_pattern = re.compile(r"^(?:Rename|重命名|重新命名)$", re.IGNORECASE)
         rename_item = page.get_by_role("menuitem", name=rename_pattern)
@@ -781,7 +943,14 @@ class PlaywrightChatSession:
             rename_item = page.get_by_text(rename_pattern)
         if rename_item.count() == 0:
             raise RuntimeError("找不到 ChatGPT 对话重命名菜单")
-        rename_item.last.click()
+        _check_operation(stopped, deadline)
+        rename_item.last.click(
+            timeout=(
+                _remaining_timeout_ms(deadline, 5_000)
+                if deadline is not None
+                else 5_000
+            )
+        )
 
         editor = page.locator(
             '[role="dialog"] input, '
@@ -794,9 +963,28 @@ class PlaywrightChatSession:
         if editor.count() == 0:
             raise RuntimeError("找不到 ChatGPT 对话标题输入框")
         editor = editor.last
-        editor.wait_for(state="visible", timeout=3_000)
-        editor.fill(cleaned)
-        editor.press("Enter")
+        PlaywrightChatSession._wait_for_visible(
+            editor,
+            stopped=stopped,
+            deadline=deadline or (time.monotonic() + 3),
+            maximum_slice_ms=1_000,
+        )
+        _check_operation(stopped, deadline)
+        action_timeout = (
+            _remaining_timeout_ms(deadline, 5_000)
+            if deadline is not None
+            else 5_000
+        )
+        editor.fill(cleaned, timeout=action_timeout)
+        _check_operation(stopped, deadline)
+        editor.press(
+            "Enter",
+            timeout=(
+                _remaining_timeout_ms(deadline, 5_000)
+                if deadline is not None
+                else 5_000
+            ),
+        )
 
     @staticmethod
     def _open_conversation_menu(
@@ -804,6 +992,8 @@ class PlaywrightChatSession:
         conversation_url: str,
         *,
         open_menu: bool = True,
+        stopped: Callable[[], bool] | None = None,
+        deadline: float | None = None,
     ) -> tuple[Any, Any]:
         from urllib.parse import urlparse
 
@@ -818,27 +1008,61 @@ class PlaywrightChatSession:
                 'button[aria-label*="边栏"]'
             ).first
             if sidebar_button.count() and sidebar_button.is_visible(timeout=500):
-                sidebar_button.click()
-                page.wait_for_timeout(300)
+                _check_operation(stopped, deadline)
+                sidebar_button.click(
+                    timeout=(
+                        _remaining_timeout_ms(deadline, 5_000)
+                        if deadline is not None
+                        else 5_000
+                    )
+                )
+                menu_deadline = deadline or (time.monotonic() + 5)
+                _interruptible_wait(page, 300, stopped, menu_deadline)
                 anchor = page.locator(f'a[href="{path}"]')
-        deadline = time.monotonic() + 5
-        while anchor.count() == 0 and time.monotonic() < deadline:
-            page.wait_for_timeout(250)
+        menu_deadline = time.monotonic() + 5
+        if deadline is not None:
+            menu_deadline = min(menu_deadline, deadline)
+        while anchor.count() == 0 and time.monotonic() < menu_deadline:
+            _interruptible_wait(page, 250, stopped, menu_deadline)
             anchor = page.locator(f'a[href="{path}"]')
         if anchor.count() == 0:
             raise RuntimeError("侧边栏中找不到当前 ChatGPT 对话")
         anchor = anchor.first
-        anchor.hover()
+        _check_operation(stopped, deadline)
+        anchor.hover(
+            timeout=(
+                _remaining_timeout_ms(deadline, 5_000)
+                if deadline is not None
+                else 5_000
+            )
+        )
         row = anchor.locator("xpath=ancestor::*[self::li or @data-testid][1]")
         if row.count() == 0:
             row = anchor.locator("xpath=..")
         if open_menu:
-            PlaywrightChatSession._click_conversation_menu(anchor, row)
+            PlaywrightChatSession._click_conversation_menu(
+                anchor,
+                row,
+                stopped=stopped,
+                deadline=deadline,
+            )
         return anchor, row
 
     @staticmethod
-    def _click_conversation_menu(anchor: Any, row: Any) -> None:
-        anchor.hover()
+    def _click_conversation_menu(
+        anchor: Any,
+        row: Any,
+        *,
+        stopped: Callable[[], bool] | None = None,
+        deadline: float | None = None,
+    ) -> None:
+        _check_operation(stopped, deadline)
+        action_timeout = (
+            _remaining_timeout_ms(deadline, 5_000)
+            if deadline is not None
+            else 5_000
+        )
+        anchor.hover(timeout=action_timeout)
         options = row.locator(
             'button[aria-label*="option" i], '
             'button[aria-label*="more" i], '
@@ -850,11 +1074,29 @@ class PlaywrightChatSession:
             options = row.locator("button")
         if options.count() == 0:
             raise RuntimeError("找不到 ChatGPT 对话选项按钮")
-        options.last.click()
+        _check_operation(stopped, deadline)
+        options.last.click(
+            timeout=(
+                _remaining_timeout_ms(deadline, 5_000)
+                if deadline is not None
+                else 5_000
+            )
+        )
 
     @staticmethod
-    def _navigate(page: Any, url: str, timeout_seconds: int) -> None:
-        timeout_ms = min(timeout_seconds, 45) * 1000
+    def _navigate(
+        page: Any,
+        url: str,
+        timeout_seconds: int,
+        *,
+        stopped: Callable[[], bool] | None = None,
+        deadline: float | None = None,
+    ) -> None:
+        operation_deadline = (
+            deadline
+            if deadline is not None
+            else time.monotonic() + timeout_seconds
+        )
         retryable_errors = (
             "ERR_ABORTED",
             "ERR_CONNECTION_CLOSED",
@@ -867,6 +1109,8 @@ class PlaywrightChatSession:
         )
         max_attempts = 5
         for attempt in range(max_attempts):
+            _check_operation(stopped, operation_deadline)
+            timeout_ms = _remaining_timeout_ms(operation_deadline, 5_000)
             try:
                 page.goto(url, wait_until="commit", timeout=timeout_ms)
                 return
@@ -874,7 +1118,13 @@ class PlaywrightChatSession:
                 detail = str(exc)
                 if _browser_session_is_unavailable(exc):
                     raise BrowserSessionUnavailable(detail) from exc
-                if not any(marker in detail for marker in retryable_errors):
+                navigation_timed_out = (
+                    "timeout" in detail.lower()
+                    and ("goto" in detail.lower() or "navigation" in detail.lower())
+                )
+                if not navigation_timed_out and not any(
+                    marker in detail for marker in retryable_errors
+                ):
                     raise
                 interrupted_navigation = (
                     "ERR_ABORTED" in detail or "frame was detached" in detail
@@ -893,12 +1143,49 @@ class PlaywrightChatSession:
                     max_attempts,
                     detail.splitlines()[0],
                 )
-                page.wait_for_timeout(delay_ms)
+                _interruptible_wait(
+                    page,
+                    delay_ms,
+                    stopped,
+                    operation_deadline,
+                )
 
     @staticmethod
-    def _wait_for_composer(page: Any) -> Any:
+    def _wait_for_visible(
+        locator: Any,
+        *,
+        stopped: Callable[[], bool] | None,
+        deadline: float,
+        maximum_slice_ms: int = 1_000,
+    ) -> None:
+        while True:
+            _check_operation(stopped, deadline)
+            try:
+                locator.wait_for(
+                    state="visible",
+                    timeout=_remaining_timeout_ms(deadline, maximum_slice_ms),
+                )
+                return
+            except Exception as exc:
+                if _browser_session_is_unavailable(exc):
+                    raise BrowserSessionUnavailable(str(exc)) from exc
+                _check_operation(stopped, deadline)
+
+    @staticmethod
+    def _wait_for_composer(
+        page: Any,
+        *,
+        stopped: Callable[[], bool] | None = None,
+        deadline: float | None = None,
+    ) -> Any:
+        composer_deadline = deadline or (time.monotonic() + 30)
         try:
-            account = _wait_for_account_state(page, timeout_ms=10_000)
+            account = _wait_for_account_state(
+                page,
+                timeout_ms=10_000,
+                stopped=stopped,
+                deadline=composer_deadline,
+            )
         except Exception as exc:
             if _browser_session_is_unavailable(exc):
                 raise BrowserSessionUnavailable(str(exc)) from exc
@@ -909,8 +1196,14 @@ class PlaywrightChatSession:
             raise RuntimeError("当前 ChatGPT 账号未检测到 Plus 订阅")
         composer = page.locator(PROMPT_SELECTOR).first
         try:
-            composer.wait_for(state="visible", timeout=20_000)
+            PlaywrightChatSession._wait_for_visible(
+                composer,
+                stopped=stopped,
+                deadline=composer_deadline,
+            )
             return composer
+        except (ChatStopped, TimeoutError, BrowserSessionUnavailable):
+            raise
         except Exception as exc:
             if _browser_session_is_unavailable(exc):
                 raise BrowserSessionUnavailable(str(exc)) from exc
@@ -933,10 +1226,15 @@ class PlaywrightChatSession:
         image_baseline: _ImageBaseline = _ImageBaseline(),
         *,
         expect_image: bool = False,
+        absolute_deadline: float | None = None,
     ) -> str:
         started_at = time.monotonic()
         initial_deadline = started_at + timeout_seconds
-        deadline = initial_deadline
+        deadline = (
+            min(initial_deadline, absolute_deadline)
+            if absolute_deadline is not None
+            else initial_deadline
+        )
         last_text = ""
         last_media_keys: frozenset[str] = frozenset()
         last_activity_key: tuple[tuple[str, str, int], ...] = ()
@@ -993,6 +1291,8 @@ class PlaywrightChatSession:
                 # Treat the configured timeout as an inactivity limit once
                 # ChatGPT starts streaming or a web/tool turn changes.
                 deadline = now + timeout_seconds
+                if absolute_deadline is not None:
+                    deadline = min(deadline, absolute_deadline)
                 if now >= initial_deadline and not extension_logged:
                     log.info("ChatGPT 回复仍在更新，已根据最近活动自动延长等待")
                     extension_logged = True
@@ -1003,6 +1303,8 @@ class PlaywrightChatSession:
                     last_media_keys = new_media_keys
                     unchanged_since = now
                     deadline = now + timeout_seconds
+                    if absolute_deadline is not None:
+                        deadline = min(deadline, absolute_deadline)
                 else:
                     generating = page.locator(STOP_SELECTOR).first.is_visible(
                         timeout=500
@@ -1351,18 +1653,26 @@ class PlaywrightChatSession:
         return raw, suffix
 
     @staticmethod
-    def _wait_for_conversation_url(page: Any) -> str:
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
+    def _wait_for_conversation_url(
+        page: Any,
+        *,
+        stopped: Callable[[], bool] | None = None,
+        deadline: float | None = None,
+    ) -> str:
+        url_deadline = time.monotonic() + 5
+        if deadline is not None:
+            url_deadline = min(url_deadline, deadline)
+        while time.monotonic() < url_deadline:
+            _check_operation(stopped, url_deadline)
             url = str(page.url)
             if _is_chat_url(url):
                 return url
-            page.wait_for_timeout(100)
+            _interruptible_wait(page, 100, stopped, url_deadline)
         raise RuntimeError("ChatGPT 已回复，但未获得可继续的对话地址")
 
 
 class ChatGPTRunner:
-    _browser_max_idle_seconds = 30 * 60
+    _browser_max_idle_seconds: float = 30 * 60
     _browser_recovery_attempts = 3
 
     def __init__(
@@ -1388,7 +1698,7 @@ class ChatGPTRunner:
         self._jobs: queue.Queue[_ChatJob | _ControlJob | None] = queue.Queue()
         self._worker: threading.Thread | None = None
         self._worker_ready = threading.Event()
-        self._startup_error: Exception | None = None
+        self._browser_session_running = False
         self._closing = False
         self._monotonic = time.monotonic
         self._sleep = time.sleep
@@ -1412,30 +1722,28 @@ class ChatGPTRunner:
     @property
     def browser_running(self) -> bool:
         with self._lock:
-            return self._worker is not None and self._worker.is_alive()
+            return self._browser_session_running
 
     def start(self) -> None:
-        """Start one dedicated browser and keep it alive for this runner."""
+        """Start the lightweight worker; create Chromium only for actual work."""
         with self._lock:
             if self._closing:
                 raise RuntimeError("ChatGPT 浏览器已经关闭")
             if self._worker is not None and self._worker.is_alive():
                 return
             self._worker_ready.clear()
-            self._startup_error = None
             worker = threading.Thread(
                 target=self._browser_loop,
-                name="chatgpt-plus-browser",
+                name="chatgpt-plus-worker",
                 daemon=True,
             )
             self._worker = worker
             worker.start()
 
         if not self._worker_ready.wait(60):
-            raise RuntimeError("等待 ChatGPT 专用浏览器启动超时")
-        if self._startup_error is not None:
-            detail = str(self._startup_error).strip() or type(self._startup_error).__name__
-            raise RuntimeError(f"ChatGPT 专用浏览器启动失败：{detail}")
+            raise RuntimeError("等待 ChatGPT 后台工作器启动超时")
+        if not worker.is_alive():
+            raise RuntimeError("ChatGPT 后台工作器启动失败")
 
     def begin_chat(
         self,
@@ -1660,81 +1968,123 @@ class ChatGPTRunner:
     def _browser_loop(self) -> None:
         pending_job: _ChatJob | _ControlJob | None = None
         recovery_count = 0
+        self._worker_ready.set()
         try:
             while True:
-                try:
-                    with self._session_factory(
-                        self.profile_dir,
-                        self.browser_channel,
-                        self.headless,
-                        self.proxy_server,
-                    ) as session:
-                        self._worker_ready.set()
-                        session_last_used = self._monotonic()
-                        while True:
-                            job = pending_job if pending_job is not None else self._jobs.get()
-                            pending_job = None
-                            if job is None:
-                                return
-
-                            idle_seconds = self._monotonic() - session_last_used
-                            if idle_seconds >= self._browser_max_idle_seconds:
-                                log.info(
-                                    "ChatGPT 浏览器已空闲 %.0f 秒，处理新请求前自动重建",
-                                    idle_seconds,
-                                )
-                                pending_job = job
-                                recovery_count = 0
-                                break
-
-                            try:
-                                if isinstance(job, _ControlJob):
-                                    self._run_control(session, job)
-                                else:
-                                    self._run_chat(session, job)
-                            except BrowserSessionUnavailable as exc:
-                                if self._stopped():
-                                    self.events.put(
-                                        ChatEvent("ChatGPT 请求已停止", job.session_key)
-                                    )
-                                    self._finish()
-                                    recovery_count = 0
-                                    break
-                                recovery_count += 1
-                                if recovery_count > self._browser_recovery_attempts:
-                                    self._fail_after_browser_recovery(job, exc)
-                                    recovery_count = 0
-                                    break
-                                pending_job = job
-                                log.warning(
-                                    "ChatGPT 浏览器会话失效，正在自动重建并继续原请求（%d/%d）：%s",
-                                    recovery_count,
-                                    self._browser_recovery_attempts,
-                                    str(exc).splitlines()[0],
-                                )
-                                break
-                            else:
-                                recovery_count = 0
-                                session_last_used = self._monotonic()
-                except Exception as exc:
-                    if not self._worker_ready.is_set():
-                        if (
-                            isinstance(exc, BrowserSessionUnavailable)
-                            and recovery_count < self._browser_recovery_attempts
-                        ):
-                            recovery_count += 1
-                            delay_seconds = min(2 ** (recovery_count - 1), 8)
-                            log.warning(
-                                "ChatGPT 浏览器启动时网络不可用，%d 秒后自动重建（%d/%d）：%s",
-                                delay_seconds,
-                                recovery_count,
-                                self._browser_recovery_attempts,
-                                str(exc).splitlines()[0],
-                            )
-                            self._sleep(delay_seconds)
-                            continue
-                        self._startup_error = exc
+                if pending_job is None:
+                    pending_job = self._jobs.get()
+                    if pending_job is None:
                         return
+                    recovery_count = 0
+
+                released_for_idle = False
+                try:
+                    try:
+                        with self._session_factory(
+                            self.profile_dir,
+                            self.browser_channel,
+                            self.headless,
+                            self.proxy_server,
+                        ) as session:
+                            with self._lock:
+                                self._browser_session_running = True
+                            set_stop_checker = getattr(
+                                session,
+                                "set_stop_checker",
+                                None,
+                            )
+                            if callable(set_stop_checker):
+                                set_stop_checker(self._stopped)
+                            session_last_used = self._monotonic()
+                            while True:
+                                job_waited_in_session = False
+                                if pending_job is not None:
+                                    job = pending_job
+                                    pending_job = None
+                                else:
+                                    idle_seconds = (
+                                        self._monotonic() - session_last_used
+                                    )
+                                    idle_remaining = (
+                                        self._browser_max_idle_seconds - idle_seconds
+                                    )
+                                    if idle_remaining <= 0:
+                                        released_for_idle = True
+                                        log.info(
+                                            "ChatGPT 浏览器已空闲 %.0f 秒，自动释放会话",
+                                            idle_seconds,
+                                        )
+                                        recovery_count = 0
+                                        break
+                                    try:
+                                        job = self._jobs.get(timeout=idle_remaining)
+                                    except queue.Empty:
+                                        released_for_idle = True
+                                        log.info(
+                                            "ChatGPT 浏览器已空闲 %.0f 秒，自动释放会话",
+                                            self._browser_max_idle_seconds,
+                                        )
+                                        recovery_count = 0
+                                        break
+                                    job_waited_in_session = True
+
+                                if job is None:
+                                    return
+
+                                idle_seconds = self._monotonic() - session_last_used
+                                if (
+                                    job_waited_in_session
+                                    and idle_seconds >= self._browser_max_idle_seconds
+                                ):
+                                    pending_job = job
+                                    released_for_idle = True
+                                    recovery_count = 0
+                                    log.info(
+                                        "ChatGPT 浏览器已空闲 %.0f 秒，处理新请求前自动重建",
+                                        idle_seconds,
+                                    )
+                                    break
+
+                                try:
+                                    if isinstance(job, _ControlJob):
+                                        self._run_control(session, job)
+                                    else:
+                                        self._run_chat(session, job)
+                                except BrowserSessionUnavailable as exc:
+                                    if self._stopped():
+                                        self.events.put(
+                                            ChatEvent(
+                                                "ChatGPT 请求已停止",
+                                                job.session_key,
+                                            )
+                                        )
+                                        self._finish()
+                                        recovery_count = 0
+                                        break
+                                    recovery_count += 1
+                                    if (
+                                        recovery_count
+                                        > self._browser_recovery_attempts
+                                    ):
+                                        self._fail_after_browser_recovery(job, exc)
+                                        pending_job = None
+                                        recovery_count = 0
+                                        break
+                                    pending_job = job
+                                    log.warning(
+                                        "ChatGPT 浏览器会话失效，正在自动重建并继续原请求（%d/%d）：%s",
+                                        recovery_count,
+                                        self._browser_recovery_attempts,
+                                        str(exc).splitlines()[0],
+                                    )
+                                    break
+                                else:
+                                    recovery_count = 0
+                                    session_last_used = self._monotonic()
+                    finally:
+                        with self._lock:
+                            self._browser_session_running = False
+                except Exception as exc:
                     if pending_job is None:
                         raise
                     recovery_count += 1
@@ -1752,6 +2102,10 @@ class ChatGPTRunner:
                         str(exc).splitlines()[0],
                     )
                     self._sleep(delay_seconds)
+                    continue
+
+                if released_for_idle:
+                    continue
         except Exception as exc:
             detail = str(exc).strip() or type(exc).__name__
             with self._lock:
@@ -1763,6 +2117,7 @@ class ChatGPTRunner:
         finally:
             self._worker_ready.set()
             with self._lock:
+                self._browser_session_running = False
                 if threading.current_thread() is self._worker:
                     self._worker = None
 
@@ -1889,9 +2244,7 @@ class ChatGPTRunner:
                     f"{safe_title}-{time.strftime('%Y%m%d-%H%M%S')}-"
                     f"{uuid.uuid4().hex[:6]}.md"
                 )
-                temporary = destination.with_suffix(".md.tmp")
-                temporary.write_text(markdown, encoding="utf-8")
-                os.replace(temporary, destination)
+                atomic_write_text(destination, markdown)
                 self.events.put(ChatEvent(
                     f"对话已导出：{destination.name}",
                     job.session_key,
@@ -2074,12 +2427,10 @@ class ChatGPTRunner:
         self._save_history(snapshot)
 
     def _save_history(self, history: dict[str, list[dict[str, Any]]]) -> None:
-        temporary = self._history_file.with_suffix(".json.tmp")
-        temporary.write_text(
+        atomic_write_text(
+            self._history_file,
             json.dumps(history, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
         )
-        os.replace(temporary, self._history_file)
 
     def _set_conversation(
         self,
@@ -2102,12 +2453,10 @@ class ChatGPTRunner:
         self._save_conversations(snapshot)
 
     def _save_conversations(self, conversations: dict[str, str]) -> None:
-        temporary = self._conversation_file.with_suffix(".json.tmp")
-        temporary.write_text(
+        atomic_write_text(
+            self._conversation_file,
             json.dumps(conversations, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
         )
-        os.replace(temporary, self._conversation_file)
 
     def _set_title(self, session_key: str, title: str) -> None:
         with self._lock:
@@ -2125,12 +2474,10 @@ class ChatGPTRunner:
         self._save_titles(snapshot)
 
     def _save_titles(self, titles: dict[str, str]) -> None:
-        temporary = self._title_file.with_suffix(".json.tmp")
-        temporary.write_text(
+        atomic_write_text(
+            self._title_file,
             json.dumps(titles, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
         )
-        os.replace(temporary, self._title_file)
 
     def _stopped(self) -> bool:
         with self._lock:
@@ -2154,15 +2501,17 @@ class ChatGPTRunner:
                 return False, "ChatGPT 请求正在执行，请先发送 @停止"
         self.close()
         with self._lock:
+            if self._worker is not None and self._worker.is_alive():
+                return False, "ChatGPT 浏览器关闭超时，未执行重启"
             self._closing = False
         try:
             self.start()
         except RuntimeError as exc:
-            return False, f"ChatGPT 浏览器重启失败：{exc}"
-        return True, "ChatGPT 隐藏浏览器已重启"
+            return False, f"ChatGPT 后台工作器重启失败：{exc}"
+        return True, "ChatGPT 后台工作器已重启；浏览器将在下次请求时按需启动"
 
     def close(self, timeout_seconds: float = 10) -> None:
-        """Stop pending work and close the dedicated browser process."""
+        """Stop pending work and close the worker and any browser session."""
         with self._lock:
             self._closing = True
             if self._state.active:

@@ -22,9 +22,19 @@ from .ilink_api import (
     MAX_OUTBOUND_IMAGE_BYTES,
 )
 from .ilink_auth import load_credentials
+from .state_io import atomic_write_text
 
 
 log = logging.getLogger(__name__)
+
+MAX_PENDING_MESSAGES = 1000
+MAX_SAVED_CONTEXTS = 2000
+MAX_INBOUND_DEAD_LETTERS = 200
+MAX_OUTBOUND_TEXT_CHUNKS = 20
+
+
+class ILinkStateError(ILinkProtocolError):
+    """Persistent local iLink state is unsafe to use without operator action."""
 
 
 @dataclass(frozen=True)
@@ -72,16 +82,21 @@ def split_text(text: str, limit: int) -> list[str]:
     if len(cleaned) <= limit:
         return [cleaned]
     result: list[str] = []
-    remaining = cleaned
-    while remaining:
-        if len(remaining) <= limit:
-            result.append(remaining)
-            break
-        cut = remaining.rfind("\n", 0, limit + 1)
-        if cut < limit // 2:
-            cut = limit
-        result.append(remaining[:cut].rstrip())
-        remaining = remaining[cut:].lstrip()
+    position = 0
+    total = len(cleaned)
+    while position < total:
+        end = min(position + limit, total)
+        cut = end
+        if end < total:
+            newline = cleaned.rfind("\n", position, end + 1)
+            if newline >= position + limit // 2:
+                cut = newline
+        chunk = cleaned[position:cut].rstrip()
+        if chunk:
+            result.append(chunk)
+        position = cut
+        while position < total and cleaned[position].isspace():
+            position += 1
     return result
 
 
@@ -94,42 +109,72 @@ class _StateStore:
             return self.empty()
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            log.warning("忽略损坏的 iLink 状态文件：%s", self.path)
-            return self.empty()
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ILinkStateError(
+                f"iLink 状态文件无法读取，已停止以避免重复处理消息 {self.path}: {exc}"
+            ) from exc
         if not isinstance(raw, dict):
-            return self.empty()
+            raise ILinkStateError(f"iLink 状态文件顶层不是 JSON 对象：{self.path}")
+        raw_seen = raw.get("seen", [])
+        raw_pending = raw.get("pending", [])
+        raw_contexts = raw.get("contexts", {})
+        raw_dead_letters = raw.get("inbound_dead_letters", [])
+        if not isinstance(raw_seen, list):
+            raise ILinkStateError(f"iLink 状态 seen 不是数组：{self.path}")
+        if not isinstance(raw_pending, list) or any(
+            not isinstance(value, dict) for value in raw_pending
+        ):
+            raise ILinkStateError(f"iLink 状态 pending 不是消息数组：{self.path}")
+        for index, value in enumerate(raw_pending):
+            if any(
+                not isinstance(value.get(name), str) or not value.get(name)
+                for name in ("key", "content", "sender")
+            ):
+                raise ILinkStateError(
+                    f"iLink 状态 pending 第 {index + 1} 项缺少有效 key/content/sender："
+                    f"{self.path}"
+                )
+        if not isinstance(raw_contexts, dict):
+            raise ILinkStateError(f"iLink 状态 contexts 不是对象：{self.path}")
+        if not isinstance(raw_dead_letters, list) or any(
+            not isinstance(value, dict) for value in raw_dead_letters
+        ):
+            raise ILinkStateError(
+                f"iLink 状态 inbound_dead_letters 不是对象数组：{self.path}"
+            )
         state = self.empty()
+        state["account_id"] = str(raw.get("account_id") or "")
         state["cursor"] = str(raw.get("cursor") or "")
-        state["seen"] = [str(value) for value in raw.get("seen", [])][-2000:]
-        state["pending"] = [value for value in raw.get("pending", []) if isinstance(value, dict)]
+        state["seen"] = [str(value) for value in raw_seen][-2000:]
+        state["pending"] = [dict(value) for value in raw_pending]
         state["contexts"] = {
             str(key): str(value)
-            for key, value in (raw.get("contexts") or {}).items()
+            for key, value in list(raw_contexts.items())[-MAX_SAVED_CONTEXTS:]
             if str(key)
         }
         state["last_user_id"] = str(raw.get("last_user_id") or "")
+        state["inbound_dead_letters"] = [
+            dict(value) for value in raw_dead_letters[-MAX_INBOUND_DEAD_LETTERS:]
+        ]
         return state
 
     @staticmethod
     def empty() -> dict[str, Any]:
         return {
+            "account_id": "",
             "cursor": "",
             "seen": [],
             "pending": [],
             "contexts": {},
             "last_user_id": "",
+            "inbound_dead_letters": [],
         }
 
     def save(self, state: dict[str, Any]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
-        temporary.write_text(
+        atomic_write_text(
+            self.path,
             json.dumps(state, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
         )
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, self.path)
 
 
 class ILinkClient:
@@ -177,17 +222,20 @@ class ILinkClient:
             and self._worker_error is None
         )
 
+    @property
+    def inbound_dead_letter_count(self) -> int:
+        with self._lock:
+            return len(self._state["inbound_dead_letters"])
+
     def connect(self) -> None:
         if self._worker is not None and self._worker.is_alive():
             if self._api is not None:
                 return
             raise ILinkError("原微信 iLink 长轮询仍在停止，请稍后重试")
-        credentials = load_credentials(self.credentials_path)
-        if credentials is None:
-            raise ILinkAuthenticationError(
-                "尚未登录微信 iLink，请先运行 ilink-login"
-            )
-        self._credentials = credentials
+        self.prepare_account()
+        credentials = self._credentials
+        assert credentials is not None
+
         self._api = self._api_factory(credentials.base_url, credentials.token)
         self._stop_event.clear()
         self._worker_error = None
@@ -207,6 +255,16 @@ class ILinkClient:
             daemon=True,
         )
         self._worker.start()
+
+    def prepare_account(self) -> str:
+        credentials = load_credentials(self.credentials_path)
+        if credentials is None:
+            raise ILinkAuthenticationError(
+                "尚未登录微信 iLink，请先运行 ilink-login"
+            )
+        self._credentials = credentials
+        self._bind_account_state(credentials.account_id)
+        return credentials.account_id
 
     def close(self, timeout_seconds: float = 2) -> bool:
         self._stop_event.set()
@@ -229,12 +287,19 @@ class ILinkClient:
         return stopped
 
     def poll(self) -> list[IncomingMessage]:
-        result: list[IncomingMessage] = []
+        candidates: list[IncomingMessage] = []
         while True:
             try:
-                result.append(self._incoming.get_nowait())
+                candidates.append(self._incoming.get_nowait())
             except queue.Empty:
                 break
+        with self._lock:
+            pending_keys = {
+                str(value.get("key")) for value in self._state["pending"]
+            }
+            for message in candidates:
+                self._queued_keys.discard(message.key)
+        result = [message for message in candidates if message.key in pending_keys]
         if not result and self._worker_error is not None:
             error = self._worker_error
             self._worker_error = None
@@ -245,21 +310,46 @@ class ILinkClient:
 
     def acknowledge(self, key: str) -> None:
         with self._lock:
-            self._state["pending"] = [
-                value for value in self._state["pending"] if str(value.get("key")) != key
+            state = self._state_snapshot()
+            state["pending"] = [
+                value for value in state["pending"] if str(value.get("key")) != key
             ]
-            seen = deque((str(value) for value in self._state["seen"]), maxlen=2000)
+            seen = deque((str(value) for value in state["seen"]), maxlen=2000)
             if key not in seen:
                 seen.append(key)
-            self._state["seen"] = list(seen)
+            state["seen"] = list(seen)
+            self._store.save(state)
+            self._state = state
             self._queued_keys.discard(key)
-            self._store.save(self._state)
 
     def retry(self, message: IncomingMessage) -> None:
         """Put a durable pending message back on the in-memory work queue."""
         with self._lock:
-            if any(str(value.get("key")) == message.key for value in self._state["pending"]):
+            if (
+                message.key not in self._queued_keys
+                and any(
+                    str(value.get("key")) == message.key
+                    for value in self._state["pending"]
+                )
+            ):
+                self._queued_keys.add(message.key)
                 self._incoming.put(message)
+
+    def _bind_account_state(self, account_id: str) -> None:
+        with self._lock:
+            stored = str(self._state.get("account_id") or "")
+            if stored and stored != account_id:
+                raise ILinkStateError(
+                    "iLink 状态属于其他 Bot 账号，已停止以避免跨账号污染："
+                    f"state={stored!r}, credentials={account_id!r}。"
+                    f"请先备份并移走 {self._store.path}"
+                )
+            if stored:
+                return
+            state = self._state_snapshot()
+            state["account_id"] = account_id
+            self._store.save(state)
+            self._state = state
 
     def target_for(self, user_id: str) -> ReplyTarget:
         cleaned = user_id.strip()
@@ -279,7 +369,20 @@ class ILinkClient:
             raise ILinkProtocolError("还没有可发送的 iLink 用户")
         return self.target_for(user_id)
 
-    def send(self, text: str, target: ReplyTarget | None = None) -> None:
+    @staticmethod
+    def _client_id(value: str | None = None, *, part: str = "") -> str:
+        base = (value or "").strip() or f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+        if not base.startswith("wechat-codex:"):
+            base = f"wechat-codex:{base}"
+        return f"{base}:{part}" if part else base
+
+    def send(
+        self,
+        text: str,
+        target: ReplyTarget | None = None,
+        *,
+        client_id: str | None = None,
+    ) -> None:
         api = self._api
         if api is None:
             self.connect()
@@ -287,14 +390,27 @@ class ILinkClient:
         assert api is not None
         resolved = target or self.default_target()
         payload_limit = max(100, self.max_reply_chars - len(self.response_prefix) - 16)
-        chunks = split_text(text, payload_limit)
+        cleaned = text.strip()
+        hard_limit = payload_limit * MAX_OUTBOUND_TEXT_CHUNKS
+        truncated = len(cleaned) > hard_limit
+        chunks = split_text(cleaned[:hard_limit], payload_limit)
+        if len(chunks) > MAX_OUTBOUND_TEXT_CHUNKS:
+            chunks = chunks[:MAX_OUTBOUND_TEXT_CHUNKS]
+            truncated = True
+        if truncated and chunks:
+            note = "\n[回复过长，已截断]"
+            final = chunks[-1]
+            if len(final) + len(note) > payload_limit:
+                final = final[: payload_limit - len(note)].rstrip()
+            chunks[-1] = final + note
         for index, chunk in enumerate(chunks, start=1):
             part = f"({index}/{len(chunks)}) " if len(chunks) > 1 else ""
+            part_id = f"{index}-{len(chunks)}" if len(chunks) > 1 else ""
             api.send_message(
                 {
                     "from_user_id": "",
                     "to_user_id": resolved.user_id,
-                    "client_id": f"wechat-codex:{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}",
+                    "client_id": self._client_id(client_id, part=part_id),
                     "message_type": 2,
                     "message_state": 2,
                     "context_token": resolved.context_token or None,
@@ -311,6 +427,8 @@ class ILinkClient:
         self,
         image_path: str | Path,
         target: ReplyTarget | None = None,
+        *,
+        client_id: str | None = None,
     ) -> None:
         api = self._api
         if api is None:
@@ -328,7 +446,7 @@ class ILinkClient:
             {
                 "from_user_id": "",
                 "to_user_id": resolved.user_id,
-                "client_id": f"wechat-codex:{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}",
+                "client_id": self._client_id(client_id),
                 "message_type": 2,
                 "message_state": 2,
                 "context_token": resolved.context_token or None,
@@ -340,6 +458,8 @@ class ILinkClient:
         self,
         file_path: str | Path,
         target: ReplyTarget | None = None,
+        *,
+        client_id: str | None = None,
     ) -> None:
         api = self._api
         if api is None:
@@ -357,7 +477,7 @@ class ILinkClient:
             {
                 "from_user_id": "",
                 "to_user_id": resolved.user_id,
-                "client_id": f"wechat-codex:{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}",
+                "client_id": self._client_id(client_id),
                 "message_type": 2,
                 "message_state": 2,
                 "context_token": resolved.context_token or None,
@@ -390,11 +510,13 @@ class ILinkClient:
         updated = replace(message, image_path=str(destination.resolve()))
 
         with self._lock:
-            self._state["pending"] = [
+            state = self._state_snapshot()
+            state["pending"] = [
                 asdict(updated) if str(value.get("key")) == message.key else value
-                for value in self._state["pending"]
+                for value in state["pending"]
             ]
-            self._store.save(self._state)
+            self._store.save(state)
+            self._state = state
         return updated
 
     def _poll_loop(self) -> None:
@@ -404,13 +526,21 @@ class ILinkClient:
         while not self._stop_event.is_set():
             try:
                 with self._lock:
+                    pending_count = len(self._state["pending"])
                     cursor = str(self._state.get("cursor") or "")
+                if pending_count >= MAX_PENDING_MESSAGES:
+                    log.warning(
+                        "iLink 待处理消息已达到上限 %d，暂停拉取以施加背压",
+                        MAX_PENDING_MESSAGES,
+                    )
+                    self._stop_event.wait(1)
+                    continue
                 response = self._api.get_updates(cursor, timeout)
-                failures = 0
                 suggested = response.get("longpolling_timeout_ms")
                 if isinstance(suggested, (int, float)) and suggested > 0:
                     timeout = min(60.0, max(10.0, float(suggested) / 1000.0))
                 self._record_response(response)
+                failures = 0
             except Exception as exc:
                 if self._stop_event.is_set():
                     return
@@ -427,30 +557,90 @@ class ILinkClient:
     def _record_response(self, response: dict[str, Any]) -> None:
         messages: list[IncomingMessage] = []
         with self._lock:
-            seen = {str(value) for value in self._state["seen"]}
-            pending = {str(value.get("key")) for value in self._state["pending"]}
-            for raw in response.get("msgs") or []:
+            state = self._state_snapshot()
+            seen = {str(value) for value in state["seen"]}
+            pending = {str(value.get("key")) for value in state["pending"]}
+            raw_messages = response.get("msgs")
+            if raw_messages is None:
+                raw_messages = []
+            if not isinstance(raw_messages, list):
+                raise ILinkProtocolError("iLink 长轮询 msgs 不是 JSON 数组")
+            for raw in raw_messages:
                 if not isinstance(raw, dict):
-                    continue
+                    raise ILinkProtocolError("iLink 长轮询消息不是 JSON 对象")
                 message = self._normalize(raw)
                 if message is None:
+                    if raw.get("message_type") == 1:
+                        self._record_inbound_dead_letter(state, raw)
                     continue
-                if message.context_token:
-                    self._state["contexts"][message.reply_to] = message.context_token
-                self._state["last_user_id"] = message.reply_to
                 if message.key in seen or message.key in pending:
                     continue
-                self._state["pending"].append(asdict(message))
+                if message.context_token:
+                    state["contexts"].pop(message.reply_to, None)
+                    state["contexts"][message.reply_to] = message.context_token
+                    while len(state["contexts"]) > MAX_SAVED_CONTEXTS:
+                        oldest = next(iter(state["contexts"]))
+                        if oldest == self.user_id and len(state["contexts"]) > 1:
+                            state["contexts"][oldest] = state["contexts"].pop(oldest)
+                            continue
+                        state["contexts"].pop(oldest, None)
+                state["last_user_id"] = message.reply_to
+                state["pending"].append(asdict(message))
                 pending.add(message.key)
                 messages.append(message)
             next_cursor = response.get("get_updates_buf")
             if isinstance(next_cursor, str) and next_cursor:
-                self._state["cursor"] = next_cursor
-            self._store.save(self._state)
+                state["cursor"] = next_cursor
+            self._store.save(state)
+            self._state = state
             for message in messages:
                 if message.key not in self._queued_keys:
                     self._queued_keys.add(message.key)
                     self._incoming.put(message)
+
+    @staticmethod
+    def _record_inbound_dead_letter(
+        state: dict[str, Any], raw: dict[str, Any]
+    ) -> None:
+        item_types = [
+            value.get("type")
+            for value in (raw.get("item_list") or [])
+            if isinstance(value, dict)
+        ]
+        state["inbound_dead_letters"].append(
+            {
+                "received_at": time.time(),
+                "message_id": str(
+                    raw.get("message_id") or raw.get("seq") or raw.get("client_id") or ""
+                )[:200],
+                "from_user_id": str(raw.get("from_user_id") or "")[:200],
+                "message_type": raw.get("message_type"),
+                "item_types": item_types[:20],
+                "reason": "无法解析受支持的文本、语音或图片内容",
+            }
+        )
+        state["inbound_dead_letters"] = state["inbound_dead_letters"][
+            -MAX_INBOUND_DEAD_LETTERS:
+        ]
+        log.warning(
+            "iLink 入站消息无法解析，已记录死信：message_id=%s, item_types=%s",
+            state["inbound_dead_letters"][-1]["message_id"],
+            item_types,
+        )
+
+    def _state_snapshot(self) -> dict[str, Any]:
+        """Return a detached state copy for save-before-commit updates."""
+        return {
+            "account_id": str(self._state.get("account_id") or ""),
+            "cursor": str(self._state.get("cursor") or ""),
+            "seen": list(self._state["seen"]),
+            "pending": [dict(value) for value in self._state["pending"]],
+            "contexts": dict(self._state["contexts"]),
+            "last_user_id": str(self._state.get("last_user_id") or ""),
+            "inbound_dead_letters": [
+                dict(value) for value in self._state["inbound_dead_letters"]
+            ],
+        }
 
     def _normalize(self, raw: dict[str, Any]) -> IncomingMessage | None:
         if raw.get("message_type") != 1:

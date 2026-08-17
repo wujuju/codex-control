@@ -16,6 +16,7 @@ from .config import AppConfig, load_config
 from .ilink_api import ILinkError
 from .ilink_auth import load_credentials, login_with_qr
 from .ilink_client import ILinkClient
+from .instance_lock import runtime_instance_lock
 from .onboarding import ensure_logins
 
 
@@ -166,41 +167,49 @@ def main(argv: list[str] | None = None) -> int:
     try:
         config = load_config(Path(args.config))
         if args.command == "doctor":
+            if args.connect:
+                with runtime_instance_lock(config.runtime_dir):
+                    return doctor(config, True)
             return doctor(config, args.connect)
-        if args.command == "read":
-            return read_messages(config)
-        if args.command == "chatgpt-login":
-            from .chatgpt_runner import login_chatgpt
+        with runtime_instance_lock(config.runtime_dir):
+            if args.command == "read":
+                return read_messages(config)
+            if args.command == "chatgpt-login":
+                from .chatgpt_runner import login_chatgpt
 
-            login_chatgpt(
-                config.chatgpt_profile_dir,
-                config.chatgpt_browser_channel,
-                config.chatgpt_proxy_server,
-            )
-            return 0
-        if args.command == "ilink-login":
-            login_with_qr(
-                config.ilink_credentials_file,
-                api_base_url=config.ilink_api_base_url,
-                force=args.force,
-            )
-            return 0
-        if args.command == "send":
-            client = _ilink_client(config)
-            try:
-                client.connect()
-                target = client.target_for(args.user_id) if args.user_id else client.default_target()
-                client.send(args.text, target)
-                print(f"消息已发送到 {target.user_id}")
-            finally:
-                client.close()
-            return 0
-        if args.command == "setup":
-            ensure_logins(config)
-            return 0
-        if not args.skip_login_check:
-            ensure_logins(config)
-        BridgeApp(config).run()
+                login_chatgpt(
+                    config.chatgpt_profile_dir,
+                    config.chatgpt_browser_channel,
+                    config.chatgpt_proxy_server,
+                )
+                return 0
+            if args.command == "ilink-login":
+                login_with_qr(
+                    config.ilink_credentials_file,
+                    api_base_url=config.ilink_api_base_url,
+                    force=args.force,
+                )
+                return 0
+            if args.command == "send":
+                client = _ilink_client(config)
+                try:
+                    client.connect()
+                    target = (
+                        client.target_for(args.user_id)
+                        if args.user_id
+                        else client.default_target()
+                    )
+                    client.send(args.text, target)
+                    print(f"消息已发送到 {target.user_id}")
+                finally:
+                    client.close()
+                return 0
+            if args.command == "setup":
+                ensure_logins(config)
+                return 0
+            if not args.skip_login_check:
+                ensure_logins(config)
+            BridgeApp(config).run()
         return 0
     except (FileNotFoundError, ValueError, RuntimeError, ILinkError) as exc:
         print(f"错误：{exc}", file=sys.stderr)

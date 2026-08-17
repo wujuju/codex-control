@@ -388,9 +388,12 @@ ApplicationWindow {
                                 Keys.onReturnPressed: function(event) {
                                     if (event.modifiers & Qt.ShiftModifier) {
                                         event.accepted = false
-                                    } else {
+                                    } else if (window.bridge.statusState === "running" &&
+                                               text.trim().length > 0) {
                                         window.bridge.sendMessage(text)
                                         clear()
+                                        event.accepted = true
+                                    } else {
                                         event.accepted = true
                                     }
                                 }
@@ -402,7 +405,8 @@ ApplicationWindow {
                             Layout.preferredWidth: 92
                             Layout.fillHeight: true
                             text: "发送"
-                            enabled: composer.text.trim().length > 0 && window.bridge.running
+                            enabled: composer.text.trim().length > 0 &&
+                                     window.bridge.statusState === "running"
                             onClicked: {
                                 window.bridge.sendMessage(composer.text)
                                 composer.clear()
