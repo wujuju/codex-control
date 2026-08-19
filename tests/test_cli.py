@@ -129,6 +129,24 @@ class MainInstanceLockTests(unittest.TestCase):
         self.assertEqual(calls, ["lock", "setup", "unlock"])
         runtime_lock.assert_called_once_with(self.config.runtime_dir)
 
+    def test_gui_setup_only_checks_shared_chatgpt_login(self) -> None:
+        with patch(
+            "wechat_codex.cli.load_config", return_value=self.config
+        ), patch(
+            "wechat_codex.cli.runtime_instance_lock", return_value=nullcontext()
+        ), patch(
+            "wechat_codex.cli.ensure_chatgpt_login"
+        ) as ensure_chatgpt, patch(
+            "wechat_codex.cli.ensure_logins"
+        ) as ensure_all:
+            result = main(
+                ["--config", "config.yaml", "setup", "--chatgpt-only"]
+            )
+
+        self.assertEqual(result, 0)
+        ensure_chatgpt.assert_called_once_with(self.config)
+        ensure_all.assert_not_called()
+
     def test_doctor_does_not_take_runtime_lock(self) -> None:
         with patch("wechat_codex.cli.load_config", return_value=self.config), patch(
             "wechat_codex.cli.runtime_instance_lock"

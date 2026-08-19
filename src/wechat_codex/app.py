@@ -14,6 +14,7 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Any
 
 from .chatgpt_runner import ChatGPTRunner
 from .codex_runner import CodexRunner
@@ -85,6 +86,7 @@ class BridgeApp:
         *,
         event_sink: Callable[[str, str, str], None] | None = None,
         state_sink: Callable[[str, str], None] | None = None,
+        chat_runner: Any | None = None,
     ) -> None:
         self.config = config
         self._event_sink = event_sink
@@ -125,7 +127,7 @@ class BridgeApp:
             work_timeout_seconds=config.work_timeout_seconds,
             projects=config.projects,
         )
-        self.chat_runner = ChatGPTRunner(
+        self.chat_runner = chat_runner or ChatGPTRunner(
             browser_channel=config.chatgpt_browser_channel,
             headless=config.chatgpt_headless,
             proxy_server=config.chatgpt_proxy_server,
@@ -1167,7 +1169,12 @@ class BridgeApp:
             ),
         )
         if not ok:
-            self._send(response, target)
+            if response.startswith("已有 ChatGPT 请求在执行"):
+                queued = self._enqueue_pending_chat(pending)
+                if queued and not self.chat_runner.active:
+                    self._start_next_pending_chat()
+            else:
+                self._send(response, target)
 
     def _enqueue_pending_chat(self, pending: _PendingChat) -> bool:
         if any(item.message_key == pending.message_key for item in self._pending_chats):
@@ -1207,7 +1214,7 @@ class BridgeApp:
                 image_paths=pending.image_paths,
             ),
         )
-        if not ok and self.chat_runner.active:
+        if not ok and response.startswith("已有 ChatGPT 请求在执行"):
             return
         if not ok:
             self._queue_event(

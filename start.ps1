@@ -10,9 +10,9 @@ if (-not (Test-Path -LiteralPath $consoleExecutable) -or
 }
 
 $env:PYTHONUTF8 = "1"
-& $consoleExecutable --config $configFile setup
+& $consoleExecutable --config $configFile setup --chatgpt-only
 if ($LASTEXITCODE -ne 0) {
-    throw "Login check failed; the GUI was not started."
+    throw "ChatGPT Plus login check failed; the GUI was not started."
 }
 
 & $guiExecutable --config $configFile --skip-login-check

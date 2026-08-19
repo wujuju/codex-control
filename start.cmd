@@ -15,9 +15,9 @@ if not exist "%PROJECT_ROOT%.venv\Scripts\wechat-codex-gui.exe" (
   exit /b 1
 )
 
-"%PROJECT_ROOT%.venv\Scripts\wechat-codex.exe" --config "%PROJECT_ROOT%config.yaml" setup
+"%PROJECT_ROOT%.venv\Scripts\wechat-codex.exe" --config "%PROJECT_ROOT%config.yaml" setup --chatgpt-only
 if errorlevel 1 (
-  echo Login check failed; the GUI was not started.
+  echo ChatGPT Plus login check failed; the GUI was not started.
   exit /b 1
 )
 

@@ -17,7 +17,7 @@ from .ilink_api import ILinkError
 from .ilink_auth import load_credentials, login_with_qr
 from .ilink_client import ILinkClient
 from .instance_lock import runtime_instance_lock
-from .onboarding import ensure_logins
+from .onboarding import ensure_chatgpt_login, ensure_logins
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -32,7 +32,12 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help=argparse.SUPPRESS,
     )
-    sub.add_parser("setup", help="依次完成微信 iLink 和 ChatGPT Plus 登录")
+    setup = sub.add_parser("setup", help="完成启动所需的登录")
+    setup.add_argument(
+        "--chatgpt-only",
+        action="store_true",
+        help="只检查共享的 ChatGPT Plus 登录，微信账号稍后在 GUI 中添加",
+    )
     doctor = sub.add_parser("doctor", help="检查运行环境")
     doctor.add_argument("--connect", action="store_true", help="同时测试 iLink 连接")
     sub.add_parser("read", help="只读取并输出新的微信 Bot 消息")
@@ -205,7 +210,10 @@ def main(argv: list[str] | None = None) -> int:
                     client.close()
                 return 0
             if args.command == "setup":
-                ensure_logins(config)
+                if args.chatgpt_only:
+                    ensure_chatgpt_login(config)
+                else:
+                    ensure_logins(config)
                 return 0
             if not args.skip_login_check:
                 ensure_logins(config)

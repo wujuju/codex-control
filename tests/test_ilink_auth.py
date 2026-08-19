@@ -3,7 +3,11 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
-from wechat_codex.ilink_auth import load_credentials, login_with_qr
+from wechat_codex.ilink_auth import (
+    ILinkLoginCancelled,
+    load_credentials,
+    login_with_qr,
+)
 
 
 class FakeLoginAPI:
@@ -52,6 +56,41 @@ class ILinkAuthTests(unittest.TestCase):
             self.assertEqual(credentials.account_id, "bot-1")
             self.assertEqual(load_credentials(path), credentials)
             self.assertTrue(FakeLoginAPI.instances[0].closed)
+
+    def test_qr_content_is_reported_to_gui_callback(self) -> None:
+        received: list[str] = []
+        output: list[str] = []
+        with TemporaryDirectory() as directory:
+            login_with_qr(
+                Path(directory) / "account.json",
+                force=True,
+                output=output.append,
+                sleep=lambda _seconds: None,
+                api_factory=FakeLoginAPI,
+                qr_callback=received.append,
+            )
+
+        self.assertEqual(received, ["https://weixin.qq/qr"])
+        self.assertNotIn("https://weixin.qq/qr", output)
+
+    def test_login_can_be_cancelled_while_waiting_for_scan(self) -> None:
+        class WaitingAPI(FakeLoginAPI):
+            def get_qr_status(self, qrcode, verify_code=None):
+                return {"status": "wait"}
+
+        checks = iter((False, True))
+        with TemporaryDirectory() as directory, patch(
+            "wechat_codex.ilink_auth._show_qr"
+        ):
+            with self.assertRaises(ILinkLoginCancelled):
+                login_with_qr(
+                    Path(directory) / "account.json",
+                    force=True,
+                    output=lambda _text: None,
+                    sleep=lambda _seconds: None,
+                    api_factory=WaitingAPI,
+                    cancelled=lambda: next(checks),
+                )
 
 
 if __name__ == "__main__":

@@ -1720,6 +1720,12 @@ class ChatGPTRunner:
             return self._state.active
 
     @property
+    def active_session_key(self) -> str | None:
+        """Return the session currently using the shared browser worker."""
+        with self._lock:
+            return self._state.session_key if self._state.active else None
+
+    @property
     def browser_running(self) -> bool:
         with self._lock:
             return self._browser_session_running
@@ -2492,6 +2498,19 @@ class ChatGPTRunner:
         with self._lock:
             if not self._state.active:
                 return "当前没有执行中的 ChatGPT 请求"
+            self._state.stop_requested = True
+        return "正在停止 ChatGPT 请求"
+
+    def stop_if_session_owned(
+        self,
+        session_keys: frozenset[str],
+    ) -> str:
+        """Atomically stop only when the active session is in ``session_keys``."""
+        with self._lock:
+            if not self._state.active:
+                return "当前没有执行中的 ChatGPT 请求"
+            if self._state.session_key not in session_keys:
+                return "其他微信账号的 ChatGPT 请求正在执行，不能从当前账号停止"
             self._state.stop_requested = True
         return "正在停止 ChatGPT 请求"
 

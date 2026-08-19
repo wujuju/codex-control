@@ -26,11 +26,14 @@ from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuickControls2 import QQuickStyle
 from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
 
+from .accounts import AccountRecord, AccountRegistry
 from .app import BridgeApp
+from .chatgpt_runner import ChatGPTRunner
 from .config import AppConfig, load_config
-from .ilink_auth import load_credentials
+from .ilink_auth import ILinkLoginCancelled, load_credentials, login_with_qr
 from .instance_lock import AlreadyRunningError, InstanceLock, acquire_instance_lock
-from .onboarding import ensure_logins
+from .onboarding import ensure_chatgpt_login
+from .shared_chatgpt import SharedChatGPTPool
 
 
 log = logging.getLogger(__name__)
@@ -42,10 +45,10 @@ class ConversationModel(QAbstractListModel):
     PreviewRole = NameRole + 2
     ActiveRole = NameRole + 3
 
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(self, config: AppConfig, account_id: str = "") -> None:
         super().__init__()
         self._item = {
-            "name": "微信 iLink Bot",
+            "name": account_id or "微信 iLink Bot",
             "type": "Bot 私聊",
             "preview": "等待微信消息",
             "active": True,
@@ -168,10 +171,20 @@ class BridgeController(QObject):
     bridgeEvent = Signal(str, str, str)
     bridgeState = Signal(str, str)
 
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(
+        self,
+        config: AppConfig,
+        *,
+        account_id: str = "",
+        owner_id: str = "",
+        chat_pool: SharedChatGPTPool | None = None,
+    ) -> None:
         super().__init__()
         self.config = config
-        self.conversations = ConversationModel(config)
+        self._account_id = account_id
+        self._owner_id = owner_id
+        self._chat_pool = chat_pool
+        self.conversations = ConversationModel(config, account_id)
         self.messages = MessageModel()
         self._status = "准备启动"
         self._state = "stopped"
@@ -201,7 +214,7 @@ class BridgeController(QObject):
 
     @Property(str, constant=True)
     def conversationTitle(self) -> str:
-        return "微信 iLink Bot"
+        return self._account_id or "微信 iLink Bot"
 
     @Property(str, constant=True)
     def conversationType(self) -> str:
@@ -209,6 +222,8 @@ class BridgeController(QObject):
 
     @Property(str, constant=True)
     def policyText(self) -> str:
+        if self._owner_id:
+            return f"授权者：{self._owner_id}；仅响应已授权的 iLink 用户 ID"
         return "仅响应已授权的 iLink 用户 ID"
 
     @Slot()
@@ -219,11 +234,29 @@ class BridgeController(QObject):
             if self._stop_thread is not None and self._stop_thread.is_alive():
                 return
             try:
-                bridge = BridgeApp(
-                    self.config,
-                    event_sink=self.bridgeEvent.emit,
-                    state_sink=self.bridgeState.emit,
-                )
+                if self._account_id:
+                    credentials = load_credentials(
+                        self.config.ilink_credentials_file
+                    )
+                    if credentials is None:
+                        raise RuntimeError("微信登录凭证不存在，请重新扫码授权")
+                    if credentials.account_id != self._account_id:
+                        raise RuntimeError(
+                            "微信登录凭证与账号清单不一致，请重新扫码授权"
+                        )
+                    if self._owner_id and credentials.user_id != self._owner_id:
+                        raise RuntimeError(
+                            "微信授权者与账号清单不一致，请重新扫码授权"
+                        )
+                options: dict[str, Any] = {
+                    "event_sink": self.bridgeEvent.emit,
+                    "state_sink": self.bridgeState.emit,
+                }
+                if self._chat_pool is not None and self._account_id:
+                    options["chat_runner"] = self._chat_pool.for_account(
+                        self._account_id
+                    )
+                bridge = BridgeApp(self.config, **options)
             except Exception as exc:
                 log.exception("桥接器初始化失败")
                 self._set_state("error", f"启动失败：{exc}")
@@ -322,6 +355,389 @@ class BridgeController(QObject):
             log.warning("等待桥接线程退出超时；进程退出时将强制回收")
 
 
+class AccountListModel(QAbstractListModel):
+    KeyRole = Qt.ItemDataRole.UserRole + 1
+    NameRole = KeyRole + 1
+    OwnerRole = KeyRole + 2
+    StatusTextRole = KeyRole + 3
+    StatusStateRole = KeyRole + 4
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._items: list[tuple[AccountRecord, BridgeController]] = []
+
+    def rowCount(
+        self, parent: QModelIndex | QPersistentModelIndex = QModelIndex()
+    ) -> int:
+        return 0 if parent.isValid() else len(self._items)
+
+    def data(
+        self,
+        index: QModelIndex | QPersistentModelIndex,
+        role: int = Qt.ItemDataRole.DisplayRole,
+    ) -> Any:
+        if not index.isValid() or not 0 <= index.row() < len(self._items):
+            return None
+        record, controller = self._items[index.row()]
+        values = {
+            self.KeyRole: record.key,
+            self.NameRole: record.account_id,
+            self.OwnerRole: record.user_id,
+            self.StatusTextRole: controller.statusText,
+            self.StatusStateRole: controller.statusState,
+        }
+        return values.get(role)
+
+    def roleNames(self) -> dict[int, QByteArray]:
+        return {
+            self.KeyRole: QByteArray(b"accountKey"),
+            self.NameRole: QByteArray(b"accountName"),
+            self.OwnerRole: QByteArray(b"ownerId"),
+            self.StatusTextRole: QByteArray(b"statusText"),
+            self.StatusStateRole: QByteArray(b"statusState"),
+        }
+
+    def add_account(
+        self,
+        record: AccountRecord,
+        controller: BridgeController,
+    ) -> None:
+        row = len(self._items)
+        self.beginInsertRows(QModelIndex(), row, row)
+        self._items.append((record, controller))
+        self.endInsertRows()
+        controller.statusChanged.connect(
+            lambda key=record.key: self.refresh_account(key)
+        )
+
+    def has_key(self, key: str) -> bool:
+        return any(record.key == key for record, _controller in self._items)
+
+    def controller_for(self, key: str) -> BridgeController | None:
+        for record, controller in self._items:
+            if record.key == key:
+                return controller
+        return None
+
+    def controllers(self) -> list[BridgeController]:
+        return [controller for _record, controller in self._items]
+
+    @Slot(str)
+    def refresh_account(self, key: str) -> None:
+        for row, (record, _controller) in enumerate(self._items):
+            if record.key != key:
+                continue
+            index = self.index(row, 0)
+            self.dataChanged.emit(
+                index,
+                index,
+                [self.StatusTextRole, self.StatusStateRole],
+            )
+            return
+
+
+class AccountManager(QObject):
+    currentChanged = Signal()
+    loginChanged = Signal()
+    loginEvent = Signal(int, str, str)
+
+    def __init__(self, config: AppConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.registry = AccountRegistry(config)
+        self.accounts = AccountListModel()
+        shared_runner = ChatGPTRunner(
+            browser_channel=config.chatgpt_browser_channel,
+            headless=config.chatgpt_headless,
+            proxy_server=config.chatgpt_proxy_server,
+            timeout_seconds=config.chat_timeout_seconds,
+            runtime_dir=config.runtime_dir,
+        )
+        self._chat_pool = SharedChatGPTPool(shared_runner)
+        self._current: BridgeController | None = None
+        self._adding = False
+        self._login_busy = False
+        self._login_attempt = 0
+        self._qr_image_url = ""
+        self._login_status = ""
+        self._verify_code_required = False
+        self._login_thread: threading.Thread | None = None
+        self._login_cancel = threading.Event()
+        self._verify_ready = threading.Event()
+        self._verify_code = ""
+        self.loginEvent.connect(
+            self._apply_login_event,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        for record in self.registry.list_accounts():
+            self._add_registered_account(record)
+
+    @Property(QObject, notify=currentChanged)
+    def currentBridge(self) -> QObject | None:
+        return self._current
+
+    @Property(QObject, notify=currentChanged)
+    def currentConversationModel(self) -> QObject | None:
+        return self._current.conversations if self._current is not None else None
+
+    @Property(QObject, notify=currentChanged)
+    def currentMessageModel(self) -> QObject | None:
+        return self._current.messages if self._current is not None else None
+
+    @Property(bool, notify=loginChanged)
+    def adding(self) -> bool:
+        return self._adding
+
+    @Property(bool, notify=loginChanged)
+    def loginBusy(self) -> bool:
+        return self._login_busy
+
+    @Property(str, notify=loginChanged)
+    def qrImageUrl(self) -> str:
+        return self._qr_image_url
+
+    @Property(str, notify=loginChanged)
+    def loginStatus(self) -> str:
+        return self._login_status
+
+    @Property(bool, notify=loginChanged)
+    def verifyCodeRequired(self) -> bool:
+        return self._verify_code_required
+
+    def _add_registered_account(self, record: AccountRecord) -> BridgeController:
+        existing = self.accounts.controller_for(record.key)
+        if existing is not None:
+            return existing
+        account_config = self.registry.account_config(self.config, record)
+        controller = BridgeController(
+            account_config,
+            account_id=record.account_id,
+            owner_id=record.user_id,
+            chat_pool=self._chat_pool,
+        )
+        self.accounts.add_account(record, controller)
+        return controller
+
+    @Slot()
+    def startAll(self) -> None:
+        for controller in self.accounts.controllers():
+            controller.startBridge()
+
+    @Slot(str)
+    def selectAccount(self, key: str) -> None:
+        controller = self.accounts.controller_for(key)
+        if controller is None or controller is self._current:
+            return
+        self._current = controller
+        self.currentChanged.emit()
+
+    @Slot()
+    def beginAddAccount(self) -> None:
+        if self._login_busy:
+            return
+        if self._login_thread is not None and self._login_thread.is_alive():
+            self._login_busy = True
+            self._login_status = "正在结束上一次登录，请稍后…"
+            self.loginChanged.emit()
+            return
+        try:
+            reserved = self.registry.reserve_new()
+        except Exception as exc:
+            log.exception("创建微信账号目录失败")
+            self._login_status = f"无法创建账号目录：{exc}"
+            self._adding = True
+            self._login_busy = False
+            self.loginChanged.emit()
+            return
+        self._login_attempt += 1
+        attempt = self._login_attempt
+        self._adding = True
+        self._login_busy = True
+        self._qr_image_url = ""
+        self._login_status = "正在获取微信登录二维码…"
+        self._verify_code_required = False
+        self._verify_code = ""
+        self._login_cancel.clear()
+        self._verify_ready.clear()
+        worker = threading.Thread(
+            target=self._login_worker,
+            args=(attempt, reserved),
+            name="wechat-account-login",
+            daemon=True,
+        )
+        self._login_thread = worker
+        self.loginChanged.emit()
+        worker.start()
+
+    def _login_worker(self, attempt: int, reserved: AccountRecord) -> None:
+        def show_qr(content: str) -> None:
+            import segno
+
+            image_url = segno.make(content).png_data_uri(
+                scale=7,
+                border=2,
+                dark="#111827",
+                light="#ffffff",
+            )
+            self.loginEvent.emit(attempt, "qr", image_url)
+
+        def output(text: str) -> None:
+            cleaned = " ".join(text.split())
+            if cleaned and "二维码内容" not in cleaned:
+                self.loginEvent.emit(attempt, "status", cleaned)
+
+        def request_verify(_prompt: str) -> str:
+            self.loginEvent.emit(attempt, "verify", "请输入手机微信显示的数字")
+            while not self._verify_ready.wait(0.2):
+                if self._login_cancel.is_set():
+                    raise ILinkLoginCancelled("已取消微信登录")
+            if self._login_cancel.is_set():
+                raise ILinkLoginCancelled("已取消微信登录")
+            code = self._verify_code.strip()
+            self._verify_code = ""
+            self._verify_ready.clear()
+            self.loginEvent.emit(attempt, "verified", "正在验证…")
+            return code
+
+        try:
+            credentials = login_with_qr(
+                reserved.credentials_file,
+                api_base_url=self.config.ilink_api_base_url,
+                force=True,
+                input_fn=request_verify,
+                output=output,
+                qr_callback=show_qr,
+                cancelled=self._login_cancel.is_set,
+            )
+            registered = self.registry.register(reserved, credentials)
+            refreshed = registered.key != reserved.key
+            self.registry.discard_reservation(reserved)
+            self._login_thread = None
+            self.loginEvent.emit(
+                attempt,
+                "refreshed" if refreshed else "success",
+                registered.key,
+            )
+        except ILinkLoginCancelled:
+            self.registry.discard_reservation(reserved)
+            self._login_thread = None
+            self.loginEvent.emit(attempt, "cancelled", "已取消添加微信")
+        except Exception as exc:
+            log.exception("GUI 微信扫码登录失败")
+            try:
+                if load_credentials(reserved.credentials_file) is None:
+                    self.registry.discard_reservation(reserved)
+            except Exception:
+                pass
+            self._login_thread = None
+            self.loginEvent.emit(attempt, "error", f"微信登录失败：{exc}")
+
+    @Slot(str)
+    def submitVerifyCode(self, code: str) -> None:
+        cleaned = code.strip()
+        if not cleaned or not self._verify_code_required:
+            return
+        self._verify_code = cleaned
+        self._verify_ready.set()
+
+    @Slot()
+    def cancelAddAccount(self) -> None:
+        self._login_cancel.set()
+        self._verify_ready.set()
+        self._adding = False
+        self._verify_code_required = False
+        self._qr_image_url = ""
+        self._login_status = "已取消添加微信"
+        self.loginChanged.emit()
+
+    @Slot(int, str, str)
+    def _apply_login_event(self, attempt: int, kind: str, value: str) -> None:
+        if attempt != self._login_attempt:
+            return
+        if kind == "qr":
+            if not self._adding:
+                return
+            self._qr_image_url = value
+            self._login_status = "请使用手机微信扫码并确认授权"
+        elif kind == "status":
+            if not self._adding:
+                return
+            self._login_status = value
+        elif kind == "verify":
+            if not self._adding:
+                return
+            self._verify_code_required = True
+            self._login_status = value
+        elif kind == "verified":
+            if not self._adding:
+                return
+            self._verify_code_required = False
+            self._login_status = value
+        elif kind in {"success", "refreshed"}:
+            records = {record.key: record for record in self.registry.reload()}
+            record = records.get(value)
+            if record is not None:
+                controller = self._add_registered_account(record)
+                if kind == "refreshed":
+                    self._restart_controller(controller)
+                else:
+                    controller.startBridge()
+            self._adding = False
+            self._login_busy = False
+            self._verify_code_required = False
+            self._qr_image_url = ""
+            self._login_status = (
+                "微信登录已刷新" if kind == "refreshed" else "微信登录成功"
+            )
+        elif kind == "cancelled":
+            self._adding = False
+            self._login_busy = False
+            self._verify_code_required = False
+            self._qr_image_url = ""
+            self._login_status = value
+        elif kind == "error":
+            self._login_busy = False
+            self._verify_code_required = False
+            if self._adding:
+                self._login_status = value
+        self.loginChanged.emit()
+
+    def _restart_controller(self, controller: BridgeController) -> None:
+        controller.stopBridge()
+
+        def start_when_stopped(remaining_checks: int = 100) -> None:
+            thread = controller._thread
+            if thread is None or not thread.is_alive():
+                controller.startBridge()
+                return
+            if remaining_checks > 0:
+                QTimer.singleShot(
+                    100,
+                    lambda: start_when_stopped(remaining_checks - 1),
+                )
+            else:
+                controller._set_state("error", "重新登录成功，但旧连接停止超时")
+
+        QTimer.singleShot(0, start_when_stopped)
+
+    def shutdown(self) -> None:
+        self._login_cancel.set()
+        self._verify_ready.set()
+        for controller in self.accounts.controllers():
+            controller.shutdown()
+
+    def wait_for_shutdown(self, timeout_seconds: float = 30.0) -> None:
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
+        for controller in self.accounts.controllers():
+            controller.wait_for_shutdown(
+                max(0.0, deadline - time.monotonic())
+            )
+        login_thread = self._login_thread
+        if login_thread is not None and login_thread is not threading.current_thread():
+            login_thread.join(max(0.0, deadline - time.monotonic()))
+        self._chat_pool.close(max(0.0, deadline - time.monotonic()))
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="微信 Codex QML 桌面端")
     parser.add_argument("--config", default="config.yaml", help="配置文件路径")
@@ -352,22 +768,16 @@ def _prepare_gui_logins(
         log.info("登录检查已由控制台启动器完成")
         return
     if interactive_console:
-        ensure_logins(config)
+        ensure_chatgpt_login(config)
         return
 
-    missing: list[str] = []
-    if load_credentials(config.ilink_credentials_file) is None:
-        missing.append("微信 iLink")
     profile = config.chatgpt_profile_dir
     if not profile.is_dir() or not any(profile.iterdir()):
-        missing.append("ChatGPT Plus")
-    if missing:
-        names = "、".join(missing)
         raise RuntimeError(
-            f"未找到 {names} 登录信息。请从项目目录运行 start.ps1（或 start.cmd），"
-            "在可见控制台中完成首次登录。"
+            "未找到 ChatGPT Plus 登录信息。请从项目目录运行 start.ps1（或 "
+            "start.cmd），在可见控制台中完成首次登录。微信账号可随后在 GUI 中添加。"
         )
-    log.info("无交互控制台；使用已保存的登录信息启动 GUI")
+    log.info("无交互控制台；使用共享的 ChatGPT Plus 登录信息启动 GUI")
 
 
 def _prepare_gui_runtime(
@@ -533,13 +943,21 @@ def main(argv: list[str] | None = None) -> int:
 
     tray: QSystemTrayIcon | None = None
     try:
-        controller = BridgeController(config)
+        try:
+            manager = AccountManager(config)
+        except Exception as exc:
+            log.exception("加载微信账号清单失败")
+            QMessageBox.critical(
+                None,
+                "微信账号清单无法加载",
+                f"{exc}\n\n请检查 .runtime/wechat-accounts.json 和账号凭证文件。",
+            )
+            return 1
         engine = QQmlApplicationEngine()
         engine.setInitialProperties(
             {
-                "bridge": controller,
-                "conversationModel": controller.conversations,
-                "messageModel": controller.messages,
+                "accountManager": manager,
+                "accountModel": manager.accounts,
             }
         )
 
@@ -553,12 +971,12 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         tray = _install_system_tray(app, window)
 
-        app.aboutToQuit.connect(controller.shutdown)
-        QTimer.singleShot(0, controller.startBridge)
+        app.aboutToQuit.connect(manager.shutdown)
+        QTimer.singleShot(0, manager.startAll)
         exit_code = app.exec()
         # The window is already gone, so waiting here cannot freeze visible UI;
         # retain the instance lock until browser/process cleanup is complete.
-        controller.wait_for_shutdown()
+        manager.wait_for_shutdown()
         return exit_code
     finally:
         if tray is not None:

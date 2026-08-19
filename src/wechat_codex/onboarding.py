@@ -49,6 +49,15 @@ def ensure_logins(
         )
     output(f"[OK] 微信 iLink 已登录：{credentials.account_id}")
 
+    ensure_chatgpt_login(config, output=output)
+
+
+def ensure_chatgpt_login(
+    config: AppConfig,
+    *,
+    output: Callable[[str], None] = print,
+) -> None:
+    """Ensure the one application-level Plus profile is ready for all accounts."""
     output("正在检查 ChatGPT Plus 登录状态……")
     if not has_chatgpt_plus_login(
         config.chatgpt_profile_dir,

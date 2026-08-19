@@ -415,6 +415,28 @@ class BridgeAppTests(unittest.TestCase):
         )
         self.assertEqual(app._pending_chats, [])
 
+    def test_cross_account_chat_start_race_keeps_message_queued(self) -> None:
+        app = self.make_app()
+        incoming = message("user-a", "不能因并发丢失")
+        attempts: list[str] = []
+
+        def lose_shared_runner_race(session_key, *_args, **_kwargs):
+            attempts.append(session_key)
+            return False, "已有 ChatGPT 请求在执行，请发送 @状态 或 @停止"
+
+        app.chat_runner.begin_chat = lose_shared_runner_race
+
+        app._handle(
+            incoming,
+            incoming.reply_target,
+            app._chat_session_key(incoming),
+        )
+
+        self.assertEqual(len(app._pending_chats), 1)
+        self.assertEqual(app._pending_chats[0].message_key, incoming.key)
+        self.assertEqual(len(attempts), 2)
+        self.assertIn("已排队", app.wechat.sent[-1][0])
+
     def test_pending_claim_checkpoint_failure_restores_in_memory_queue(self) -> None:
         app = self.make_app()
         incoming = message("user-a", "可靠排队")

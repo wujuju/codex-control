@@ -1,4 +1,5 @@
-# 微信 iLink Bot API。凭证由 ilink-login 写入 .runtime，不要放进 YAML。
+# 微信 iLink Bot API。下面两项兼容旧版默认账号；GUI 新增账号会写入
+# .runtime/accounts/<账号槽位>/，所有凭证都不要放进 YAML 或版本库。
 ilink_api_base_url: "https://ilinkai.weixin.qq.com"
 ilink_credentials_file: ".runtime/ilink-account.json"
 ilink_state_file: ".runtime/ilink-state.json"

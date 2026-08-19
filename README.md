@@ -9,7 +9,9 @@
 - 通过微信扫码授权 Bot，凭证只保存在本机 `.runtime`。
 - 使用 `getupdates` 长轮询接收消息，游标和待处理消息会持久化。
 - 回复使用入站消息的 `from_user_id` 和 `context_token`，不会按昵称猜测联系人。
+- 桌面端可同时登录并监听多个微信 iLink Bot；每个账号使用独立的凭证、游标和任务状态。
 - 每个 iLink 用户有独立的 ChatGPT 网页会话。
+- 所有微信账号共用一个 ChatGPT Plus 登录和浏览器工作器，请求会串行处理。
 - 同一个 `.runtime` 同时只允许运行一个会使用登录资料或消息状态的程序实例。
 - ChatGPT/Codex 异步任务和待发送结果会先写入本地状态，再确认或投递对应消息。
 - 默认只接受扫码授权者的消息；Codex 命令有单独的用户 ID 白名单。
@@ -44,24 +46,24 @@ Copy-Item config.example.yaml config.yaml
 
 直接运行 `start.ps1`（也可双击 `start.cmd`），或在 VS Code 选择“启动微信助手（自动检查登录）”。启动器会按顺序：
 
-1. 在可见终端中检查微信 iLink 凭证；没有凭证时显示二维码。
-2. 检查 ChatGPT Plus 登录状态；未登录时自动打开登录浏览器。
-3. 两项登录都完成后启动微信助手。
+1. 在可见终端中检查共享的 ChatGPT Plus 登录；未登录时自动打开登录浏览器。
+2. 打开微信账号列表；旧版 `.runtime/ilink-account.json` 会自动显示为第一个账号。
+3. 点击“添加微信”后在 GUI 中显示二维码；扫码成功后新账号立即开始监听。
 
 ```powershell
 .\start.ps1
 ```
 
-启动脚本先通过控制台程序完成登录，再用 `--skip-login-check` 启动桌面界面，因此首次扫码或浏览器登录不会藏在 GUI 子系统的不可见终端中。若直接运行 GUI 且缺少登录资料，界面会提示改用 `start.ps1` 或 `start.cmd`。
+启动脚本先通过控制台程序完成 ChatGPT Plus 登录，再用 `--skip-login-check` 启动桌面界面，因此浏览器登录不会藏在 GUI 子系统的不可见终端中。微信登录全部在账号列表的“添加微信”窗口中完成；二维码需要数字验证时，可直接在窗口内提交。双击账号进入原控制台，点击“返回账号列表”即可返回，后台监听不会停止。
 
-扫码并在手机微信确认后，以下内容写入 `.runtime/ilink-account.json`：
+扫码并在手机微信确认后，以下内容写入该账号的 `ilink-account.json`：
 
 - `bot_token`
 - Bot 账号 ID
 - 扫码用户的稳定 iLink 用户 ID
 - 服务端返回的业务 API 地址
 
-凭证文件已被 `.gitignore` 排除，不要复制到仓库或聊天中。如需主动重新授权，可单独运行：
+新账号保存在 `.runtime/accounts/<账号槽位>/`，旧版账号继续原地使用，不会搬动或覆盖。凭证文件已被 `.gitignore` 排除，不要复制到仓库或聊天中。命令行 `ilink-login` 只管理旧版默认账号；新增账号请使用 GUI：
 
 ```powershell
 .\.venv\Scripts\wechat-codex.exe --config config.yaml ilink-login --force
@@ -184,9 +186,10 @@ Codex、项目、日志、缓存清理和故障恢复命令仅允许 `ilink_code
 
 `.runtime` 中的关键文件：
 
-- `ilink-account.json`：登录凭证，敏感。
-- `ilink-state.json`：长轮询游标、最新会话上下文、待处理和已处理消息 ID。
-- `runtime_account.json`：将消息、任务和出站队列绑定到当前 iLink Bot，阻止换号后误用旧状态。
+- `wechat-accounts.json`：桌面端微信账号清单，不包含 token。
+- `ilink-account.json`、`ilink-state.json`：兼容保留的旧版默认账号凭证与消息状态。
+- `accounts/<账号槽位>/`：新增账号各自独立的凭证、长轮询游标、任务、出站队列与缓存。
+- `runtime_account.json`（或账号目录中的同名文件）：将消息、任务和出站队列绑定到对应 iLink Bot，阻止串号。
 - `chatgpt-plus-profile/`：ChatGPT Plus 浏览器登录资料。
 - `chatgpt_web_conversations.json`：iLink 用户到 ChatGPT 对话 URL 的映射。
 - `chatgpt_conversation_titles.json`：用户手动设置的 ChatGPT 对话标题。
@@ -217,9 +220,9 @@ GUI 手工发送的消息也会先进入同一持久化出站队列；桥接处�
 
 微信 `@健康检查` 会返回 iLink 连接状态、浏览器进程状态、ChatGPT/Codex 任务状态、待发送/出站死信/入站死信数量、最近一条出站死信的时间与脱敏错误，以及图片缓存大小。`@状态` 还会显示当前 ChatGPT 排队条数；需要更多上下文时可用 `@查看日志：50` 查看已脱敏日志。
 
-- 提示“尚未登录微信 iLink”：运行 `ilink-login`。
-- 返回 `-14` 或提示凭证失效：运行 `ilink-login --force`。
-- 二维码要求数字验证：输入手机微信显示的数字。
+- 账号列表为空：点击“添加微信”并扫描窗口中的二维码。
+- 某一行返回 `-14` 或提示凭证失效：重新添加该微信；旧版默认账号也可运行 `ilink-login --force`。
+- 二维码要求数字验证：在添加微信窗口中输入手机微信显示的数字。
 - ChatGPT 登录失效：重新运行 `chatgpt-login`。
 - 提示已有实例运行：先退出 GUI、用 `Ctrl+C` 结束前台实例，或对后台实例执行 `stop.ps1`；不要通过删除锁文件绕过检查。
 - `@健康检查` 显示浏览器“未运行”但 ChatGPT 状态为空闲：通常只是超过 30 分钟后按设计释放，下一次 ChatGPT 请求会重新打开。

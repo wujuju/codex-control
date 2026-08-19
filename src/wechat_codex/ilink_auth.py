@@ -16,6 +16,10 @@ from .ilink_api import (
 from .state_io import atomic_write_text
 
 
+class ILinkLoginCancelled(ILinkProtocolError):
+    """Raised when an interactive QR login is cancelled by its owner."""
+
+
 def load_credentials(path: Path) -> ILinkCredentials | None:
     if not path.is_file():
         return None
@@ -51,7 +55,15 @@ def save_credentials(path: Path, credentials: ILinkCredentials) -> None:
     )
 
 
-def _show_qr(content: str, output: Callable[[str], None]) -> None:
+def _show_qr(
+    content: str,
+    output: Callable[[str], None],
+    qr_callback: Callable[[str], None] | None = None,
+) -> None:
+    if qr_callback is not None:
+        qr_callback(content)
+        output("请用手机微信扫描二维码并确认授权：")
+        return
     output("请用手机微信扫描二维码并确认授权：")
     try:
         import segno
@@ -72,6 +84,8 @@ def login_with_qr(
     output: Callable[[str], None] = print,
     sleep: Callable[[float], None] = time.sleep,
     api_factory: Callable[..., ILinkAPI] = ILinkAPI,
+    qr_callback: Callable[[str], None] | None = None,
+    cancelled: Callable[[], bool] | None = None,
 ) -> ILinkCredentials:
     existing = load_credentials(credentials_path)
     if existing is not None and not force:
@@ -90,15 +104,19 @@ def login_with_qr(
         qr_content = str(qr_response.get("qrcode_img_content") or "").strip()
         if not qrcode or not qr_content:
             raise ILinkProtocolError("iLink 未返回有效二维码")
-        _show_qr(qr_content, output)
+        _show_qr(qr_content, output, qr_callback)
 
         verify_code: str | None = None
         refresh_count = 0
         current_api = api
         while True:
+            if cancelled is not None and cancelled():
+                raise ILinkLoginCancelled("已取消微信登录")
             if time.monotonic() >= deadline:
                 raise ILinkProtocolError("iLink 登录等待超时，请重新运行 ilink-login")
             status_response = current_api.get_qr_status(qrcode, verify_code)
+            if cancelled is not None and cancelled():
+                raise ILinkLoginCancelled("已取消微信登录")
             status = str(status_response.get("status") or "wait")
             if status == "wait":
                 sleep(1)
@@ -129,7 +147,9 @@ def login_with_qr(
                 qr_response = api.create_qr_code(local_tokens)
                 qrcode = str(qr_response.get("qrcode") or "").strip()
                 qr_content = str(qr_response.get("qrcode_img_content") or "").strip()
-                _show_qr(qr_content, output)
+                if not qrcode or not qr_content:
+                    raise ILinkProtocolError("iLink 刷新二维码时未返回有效内容")
+                _show_qr(qr_content, output, qr_callback)
                 verify_code = None
                 continue
             if status == "binded_redirect":

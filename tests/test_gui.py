@@ -90,9 +90,9 @@ class BridgeControllerTests(unittest.TestCase):
 
 
 class GuiLoginPreparationTests(unittest.TestCase):
-    def test_interactive_gui_preserves_existing_onboarding_flow(self) -> None:
+    def test_interactive_gui_only_prepares_shared_chatgpt_login(self) -> None:
         config = cast(AppConfig, SimpleNamespace())
-        with patch("wechat_codex.gui.ensure_logins") as ensure:
+        with patch("wechat_codex.gui.ensure_chatgpt_login") as ensure:
             _prepare_gui_logins(
                 config, skip_login_check=False, interactive_console=True
             )
@@ -101,7 +101,7 @@ class GuiLoginPreparationTests(unittest.TestCase):
 
     def test_start_script_can_skip_duplicate_login_check(self) -> None:
         config = cast(AppConfig, SimpleNamespace())
-        with patch("wechat_codex.gui.ensure_logins") as ensure:
+        with patch("wechat_codex.gui.ensure_chatgpt_login") as ensure:
             _prepare_gui_logins(
                 config, skip_login_check=True, interactive_console=False
             )

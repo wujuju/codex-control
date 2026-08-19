@@ -34,14 +34,17 @@ class AppConfig:
     work_timeout_seconds: int
     default_project: str
     projects: dict[str, Path]
+    account_runtime_dir: Path | None = None
 
     @property
     def runtime_dir(self) -> Path:
-        return self.source.parent / ".runtime"
+        return self.account_runtime_dir or self.source.parent / ".runtime"
 
     @property
     def chatgpt_profile_dir(self) -> Path:
-        return self.runtime_dir / "chatgpt-plus-profile"
+        # The Plus browser profile is application-scoped even when a cloned
+        # config points BridgeApp at one account's private runtime directory.
+        return self.source.parent / ".runtime" / "chatgpt-plus-profile"
 
 
 def _required_text(data: dict[str, Any], key: str) -> str:
