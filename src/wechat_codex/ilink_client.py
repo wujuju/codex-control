@@ -23,6 +23,7 @@ from .ilink_api import (
 )
 from .ilink_auth import load_credentials
 from .state_io import atomic_write_text
+from .wechat_format import format_wechat_text
 
 
 log = logging.getLogger(__name__)
@@ -390,7 +391,7 @@ class ILinkClient:
         assert api is not None
         resolved = target or self.default_target()
         payload_limit = max(100, self.max_reply_chars - len(self.response_prefix) - 16)
-        cleaned = text.strip()
+        cleaned = format_wechat_text(text)
         hard_limit = payload_limit * MAX_OUTBOUND_TEXT_CHUNKS
         truncated = len(cleaned) > hard_limit
         chunks = split_text(cleaned[:hard_limit], payload_limit)

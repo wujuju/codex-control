@@ -7,7 +7,7 @@ ilink_long_poll_timeout_seconds: 40
 ilink_allowed_user_ids: []
 ilink_codex_user_ids: []
 
-response_prefix: "[Codex助手] "
+response_prefix: "[AI助手] "
 send_received_ack: true
 received_ack_text: "已收到，正在处理中，请稍等…"
 poll_seconds: 0.5
