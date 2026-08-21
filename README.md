@@ -101,6 +101,8 @@ chatgpt_conversation_title: "微信助手"
 
 标题会在下一次成功回复后同步到对应的 ChatGPT 对话。微信图片会从官方 CDN 下载、解密并上传到 ChatGPT，缓存位于 `.runtime/inbound-images/`；ChatGPT 回复中的图片也会被保存、加密上传到微信 CDN，再作为原生图片消息发回微信，缓存位于 `.runtime/chatgpt-images/`。单张图片限制为 20 MB。语音消息使用 iLink 提供的 `voice_item.text` 转写原文；没有转写文本的音频不会发送给 ChatGPT。
 
+ChatGPT/Codex 等耗时任务执行期间会通过 iLink `sendTyping` 显示微信原生“正在输入”，完成、失败、停止或程序退出时自动取消，并在长任务期间定时续期。默认不再额外发送“已收到，正在处理中”文本；如需恢复旧行为，可将 `send_received_ack` 设为 `true`。
+
 ## 启动
 
 先检查环境：

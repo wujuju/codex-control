@@ -14,6 +14,40 @@ from wechat_codex.ilink_api import (
 
 
 class ILinkAPITests(unittest.TestCase):
+    def test_get_config_and_send_typing_use_dedicated_endpoints(self) -> None:
+        captured: list[tuple[str, dict]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            captured.append((request.url.path, body))
+            if request.url.path.endswith("/getconfig"):
+                return httpx.Response(200, json={"ret": 0, "typing_ticket": "ticket-1"})
+            return httpx.Response(200, json={"ret": 0})
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        api = ILinkAPI("https://ilinkai.weixin.qq.com", "secret", client=client)
+
+        config = api.get_config("user-a", "ctx-1")
+        api.send_typing("user-a", config["typing_ticket"], 1)
+        api.send_typing("user-a", config["typing_ticket"], 2)
+
+        self.assertEqual(config["typing_ticket"], "ticket-1")
+        self.assertEqual(
+            [path for path, _body in captured],
+            [
+                "/ilink/bot/getconfig",
+                "/ilink/bot/sendtyping",
+                "/ilink/bot/sendtyping",
+            ],
+        )
+        self.assertEqual(captured[0][1]["context_token"], "ctx-1")
+        self.assertEqual(captured[1][1]["status"], 1)
+        self.assertEqual(captured[2][1]["status"], 2)
+        self.assertEqual(captured[1][1]["typing_ticket"], "ticket-1")
+
+        with self.assertRaisesRegex(ValueError, "输入状态"):
+            api.send_typing("user-a", "ticket-1", 3)
+
     def test_upload_image_encrypts_payload_and_returns_image_item(self) -> None:
         plaintext = b"\x89PNG\r\n\x1a\noutbound-image"
         captured = {}

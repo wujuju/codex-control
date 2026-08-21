@@ -170,7 +170,7 @@ def load_config(path: str | Path) -> AppConfig:
         raise ValueError("ilink_long_poll_timeout_seconds 必须在 10 到 60 之间")
 
     response_prefix = str(raw.get("response_prefix", "[AI助手] "))
-    send_received_ack = _boolean(raw, "send_received_ack", True)
+    send_received_ack = _boolean(raw, "send_received_ack", False)
     received_ack_text = str(
         raw.get("received_ack_text", "已收到，正在处理中，请稍等…")
     ).strip()

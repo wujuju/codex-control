@@ -205,6 +205,7 @@ class ILinkClient:
         self._credentials = None
         self._worker_error: BaseException | None = None
         self._inbound_image_dir = state_path.parent / "inbound-images"
+        self._typing_tickets: dict[str, str] = {}
 
     @property
     def account_id(self) -> str:
@@ -238,6 +239,8 @@ class ILinkClient:
         assert credentials is not None
 
         self._api = self._api_factory(credentials.base_url, credentials.token)
+        with self._lock:
+            self._typing_tickets.clear()
         self._stop_event.clear()
         self._worker_error = None
         with self._lock:
@@ -285,6 +288,8 @@ class ILinkClient:
         else:
             log.warning("等待 iLink 长轮询线程停止超时")
         self._api = None
+        with self._lock:
+            self._typing_tickets.clear()
         return stopped
 
     def poll(self) -> list[IncomingMessage]:
@@ -423,6 +428,35 @@ class ILinkClient:
                     ],
                 }
             )
+
+    def set_typing(self, active: bool, target: ReplyTarget | None = None) -> None:
+        """Show or clear WeChat's native typing indicator for one user."""
+        api = self._api
+        if api is None:
+            raise ILinkProtocolError("iLink 尚未连接，无法更新输入状态")
+        resolved = target or self.default_target()
+        with self._lock:
+            ticket = self._typing_tickets.get(resolved.user_id, "")
+        if not ticket:
+            config = api.get_config(
+                resolved.user_id,
+                resolved.context_token or None,
+            )
+            ticket = str(config.get("typing_ticket") or "").strip()
+            if not ticket:
+                raise ILinkProtocolError("iLink 未返回 typing_ticket")
+            with self._lock:
+                self._typing_tickets[resolved.user_id] = ticket
+        try:
+            api.send_typing(resolved.user_id, ticket, 1 if active else 2)
+        except Exception:
+            # A typing ticket can expire independently from the login token.
+            # Force the next refresh to obtain a new one instead of retrying a
+            # stale ticket forever.
+            with self._lock:
+                if self._typing_tickets.get(resolved.user_id) == ticket:
+                    self._typing_tickets.pop(resolved.user_id, None)
+            raise
 
     def send_image(
         self,

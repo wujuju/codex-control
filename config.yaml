@@ -8,7 +8,7 @@ ilink_allowed_user_ids: []
 ilink_codex_user_ids: []
 
 response_prefix: "[AI助手] "
-send_received_ack: true
+send_received_ack: false
 received_ack_text: "已收到，正在处理中，请稍等…"
 poll_seconds: 0.5
 max_reply_chars: 1800

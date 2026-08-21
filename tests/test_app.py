@@ -20,6 +20,7 @@ class FakeWeChat:
         self.sent: list[tuple[str, ReplyTarget]] = []
         self.sent_images: list[tuple[str, ReplyTarget]] = []
         self.sent_files: list[tuple[str, ReplyTarget]] = []
+        self.typing: list[tuple[bool, ReplyTarget]] = []
         self.reconnect_calls = 0
         self.inbound_dead_letter_count = 0
         self.send_failures = 0
@@ -63,6 +64,9 @@ class FakeWeChat:
     ) -> None:
         self.client_ids.append(client_id)
         self.sent_files.append((file_path, target))
+
+    def set_typing(self, active: bool, target: ReplyTarget) -> None:
+        self.typing.append((active, target))
 
     def reconnect(self) -> None:
         self.reconnect_calls += 1
@@ -201,7 +205,7 @@ class BridgeAppTests(unittest.TestCase):
         app._current_message_key = None
         app._current_send_index = 0
         app.config = SimpleNamespace(
-            send_received_ack=True,
+            send_received_ack=False,
             received_ack_text="已收到",
             ilink_allowed_user_ids=frozenset(),
             ilink_codex_user_ids=frozenset(),
@@ -224,22 +228,70 @@ class BridgeAppTests(unittest.TestCase):
         app._active_jobs_file = app.config.runtime_dir / "active_jobs.json"
         app._active_jobs = {}
         app._completion_backlog = deque()
+        app._typing_targets = {}
+        app._typing_last_attempt = {}
         app._pending_file = app.config.runtime_dir / "pending_chats.json"
         app._pending_chats = []
         app._runtime_account_file = app.config.runtime_dir / "runtime_account.json"
         return app
 
-    def test_incoming_ack_uses_same_reply_context(self) -> None:
+    def test_incoming_starts_native_typing_without_text_ack(self) -> None:
         app = self.make_app()
+        incoming = message()
+
+        app._process_incoming(incoming)
+
+        self.assertEqual(app.wechat.sent, [])
+        self.assertEqual(
+            app.wechat.typing,
+            [(True, ReplyTarget("owner-id", "ctx-1"))],
+        )
+        self.assertEqual(
+            app._reply_targets["ilink:bot-1:owner-id"], ReplyTarget("owner-id", "ctx-1")
+        )
+
+    def test_async_completion_cancels_native_typing(self) -> None:
+        app = self.make_app()
+        incoming = message("user-a", "耗时问题")
+        target = incoming.reply_target
+        session_key = app._chat_session_key(incoming)
+
+        app._handle(incoming, target, session_key)
+        app._queue_async_result("完成结果", session_key)
+
+        self.assertEqual(
+            app.wechat.typing,
+            [(True, target), (False, target)],
+        )
+        self.assertNotIn(session_key, app._typing_targets)
+
+    def test_long_running_job_refreshes_native_typing(self) -> None:
+        app = self.make_app()
+        incoming = message("user-a", "长任务")
+        target = incoming.reply_target
+        session_key = app._chat_session_key(incoming)
+
+        app._handle(incoming, target, session_key)
+        app._typing_last_attempt[session_key] = 0.0
+        app._refresh_typing()
+
+        self.assertEqual(
+            app.wechat.typing,
+            [(True, target), (True, target)],
+        )
+
+    def test_explicit_text_ack_option_remains_available(self) -> None:
+        app = self.make_app()
+        app.config = SimpleNamespace(**{
+            **app.config.__dict__,
+            "send_received_ack": True,
+        })
         incoming = message()
         app._handle = lambda *_args: None
 
         app._process_incoming(incoming)
 
-        self.assertEqual(app.wechat.sent, [("已收到", ReplyTarget("owner-id", "ctx-1"))])
-        self.assertEqual(
-            app._reply_targets["ilink:bot-1:owner-id"], ReplyTarget("owner-id", "ctx-1")
-        )
+        self.assertEqual(app.wechat.sent, [("已收到", incoming.reply_target)])
 
     def test_incoming_batch_retries_current_and_unprocessed_tail(self) -> None:
         app = self.make_app()

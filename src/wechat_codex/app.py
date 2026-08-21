@@ -36,6 +36,7 @@ _OUTBOX_MAX_ATTEMPTS = 20
 _OUTBOX_MAX_DEAD_LETTERS = 200
 _OUTBOX_MAX_SENDS_PER_FLUSH = 20
 _MAX_PENDING_CHATS = 100
+_TYPING_REFRESH_SECONDS = 8.0
 
 
 @dataclass(frozen=True)
@@ -105,6 +106,8 @@ class BridgeApp:
         self._dead_letter_file = config.runtime_dir / "outbound_dead_letters.json"
         self._active_jobs_file = config.runtime_dir / "active_jobs.json"
         self._completion_backlog: deque[_CompletionEvent] = deque()
+        self._typing_targets: dict[str, ReplyTarget] = {}
+        self._typing_last_attempt: dict[str, float] = {}
         self._pending_file = config.runtime_dir / "pending_chats.json"
         self._runtime_account_file = config.runtime_dir / "runtime_account.json"
         self.wechat = ILinkClient(
@@ -177,6 +180,7 @@ class BridgeApp:
                 self._flush_ack_backlog()
             except Exception:
                 log.exception("关闭时保存消息确认失败；下次启动可能重新投递该消息")
+            self._cancel_all_typing()
             self.wechat.close()
             self.chat_runner.close()
             self.runner.close()
@@ -195,6 +199,7 @@ class BridgeApp:
 
     def stop(self) -> None:
         self._stop_event.set()
+        self._cancel_all_typing()
         self.wechat.close()
         self.chat_runner.stop()
         self.runner.stop()
@@ -246,6 +251,43 @@ class BridgeApp:
             self._state_sink(state, text)
         except Exception:
             log.exception("界面状态回调失败")
+
+    def _start_typing(self, session_key: str, target: ReplyTarget) -> None:
+        self._typing_targets[session_key] = target
+        self._send_typing(session_key, target, active=True)
+
+    def _stop_typing(self, session_key: str) -> None:
+        target = self._typing_targets.pop(session_key, None)
+        self._typing_last_attempt.pop(session_key, None)
+        if target is not None:
+            self._send_typing(session_key, target, active=False)
+
+    def _send_typing(
+        self,
+        session_key: str,
+        target: ReplyTarget,
+        *,
+        active: bool,
+    ) -> None:
+        try:
+            self.wechat.set_typing(active, target)
+        except Exception as exc:
+            action = "显示" if active else "取消"
+            log.warning("%s微信输入状态失败，继续处理消息：%s", action, exc)
+        finally:
+            if active and session_key in self._typing_targets:
+                self._typing_last_attempt[session_key] = time.monotonic()
+
+    def _refresh_typing(self) -> None:
+        now = time.monotonic()
+        for session_key, target in list(self._typing_targets.items()):
+            last_attempt = self._typing_last_attempt.get(session_key, 0.0)
+            if now - last_attempt >= _TYPING_REFRESH_SECONDS:
+                self._send_typing(session_key, target, active=True)
+
+    def _cancel_all_typing(self) -> None:
+        for session_key in list(self._typing_targets):
+            self._stop_typing(session_key)
 
     def _send(self, text: str, target: ReplyTarget) -> None:
         client_id: str | None = None
@@ -679,7 +721,10 @@ class BridgeApp:
                 if item.message_key != job.message_key
             ]
             self._save_pending_chats()
+            self._stop_typing(job.session_key)
             self._discard_active_job(job.session_key, job.job_id)
+        elif session_key:
+            self._stop_typing(session_key)
 
     def _recover_active_jobs(self) -> None:
         if not self._active_jobs:
@@ -798,6 +843,7 @@ class BridgeApp:
                 self._persist_completion_backlog()
                 self._flush_outbox()
                 self._start_next_pending_chat()
+                self._refresh_typing()
 
                 self._process_incoming_batch(self.wechat.poll())
                 consecutive_errors = 0
@@ -877,6 +923,8 @@ class BridgeApp:
             raise
         if not ok:
             self._discard_active_job(session_key, job.job_id)
+        else:
+            self._start_typing(session_key, target)
         return ok, response, ok
 
     def _handle(

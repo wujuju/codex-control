@@ -43,7 +43,7 @@ class ConfigTests(unittest.TestCase):
             )
             self.assertEqual(config.ilink_allowed_user_ids, frozenset())
             self.assertEqual(config.ilink_codex_user_ids, frozenset())
-            self.assertTrue(config.send_received_ack)
+            self.assertFalse(config.send_received_ack)
             self.assertEqual(config.chatgpt_browser_channel, "chrome")
             self.assertTrue(config.chatgpt_headless)
             self.assertEqual(config.chatgpt_conversation_title, "微信助手")

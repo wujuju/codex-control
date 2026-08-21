@@ -257,6 +257,47 @@ class ILinkAPI:
         data = self._decode(response, "发送 iLink 消息")
         self._check_api_result(data, "发送 iLink 消息")
 
+    def get_config(
+        self,
+        ilink_user_id: str,
+        context_token: str | None = None,
+    ) -> dict[str, Any]:
+        response = self._client.post(
+            self._url("ilink/bot/getconfig"),
+            headers=self._headers(),
+            json={
+                "ilink_user_id": ilink_user_id,
+                "context_token": context_token or None,
+                "base_info": self.base_info(),
+            },
+            timeout=httpx.Timeout(5.0, connect=5.0),
+        )
+        data = self._decode(response, "获取 iLink 配置")
+        self._check_api_result(data, "获取 iLink 配置")
+        return data
+
+    def send_typing(
+        self,
+        ilink_user_id: str,
+        typing_ticket: str,
+        status: int,
+    ) -> None:
+        if status not in {1, 2}:
+            raise ValueError("iLink 输入状态只能是 1（输入中）或 2（取消）")
+        response = self._client.post(
+            self._url("ilink/bot/sendtyping"),
+            headers=self._headers(),
+            json={
+                "ilink_user_id": ilink_user_id,
+                "typing_ticket": typing_ticket,
+                "status": status,
+                "base_info": self.base_info(),
+            },
+            timeout=httpx.Timeout(5.0, connect=5.0),
+        )
+        data = self._decode(response, "发送 iLink 输入状态")
+        self._check_api_result(data, "发送 iLink 输入状态")
+
     def upload_image(self, payload: bytes, to_user_id: str) -> dict[str, Any]:
         """Encrypt and upload an image, returning an iLink ImageItem."""
         if not payload:

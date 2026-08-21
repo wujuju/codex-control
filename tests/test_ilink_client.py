@@ -11,9 +11,18 @@ from wechat_codex.ilink_client import ILinkClient, ReplyTarget, split_text
 class FakeAPI:
     def __init__(self) -> None:
         self.messages = []
+        self.config_calls = []
+        self.typing_calls = []
 
     def send_message(self, message):
         self.messages.append(message)
+
+    def get_config(self, user_id, context_token):
+        self.config_calls.append((user_id, context_token))
+        return {"ret": 0, "typing_ticket": f"ticket-{user_id}"}
+
+    def send_typing(self, user_id, typing_ticket, status):
+        self.typing_calls.append((user_id, typing_ticket, status))
 
     def download_image(self, _image_item):
         return b"\x89PNG\r\n\x1a\nimage-data"
@@ -345,6 +354,25 @@ class ILinkClientTests(unittest.TestCase):
             second = [item["client_id"] for item in api.messages[2:]]
             self.assertEqual(first, second)
             self.assertEqual(len(set(first)), 2)
+
+    def test_typing_indicator_reuses_ticket_and_sends_start_then_cancel(self) -> None:
+        with TemporaryDirectory() as directory:
+            client = self.make_client(Path(directory))
+            api = FakeAPI()
+            client._api = api
+            target = ReplyTarget("user-a", "ctx-typing")
+
+            client.set_typing(True, target)
+            client.set_typing(False, target)
+
+            self.assertEqual(api.config_calls, [("user-a", "ctx-typing")])
+            self.assertEqual(
+                api.typing_calls,
+                [
+                    ("user-a", "ticket-user-a", 1),
+                    ("user-a", "ticket-user-a", 2),
+                ],
+            )
 
     def test_send_caps_pathological_text_reply_chunk_count(self) -> None:
         with TemporaryDirectory() as directory:
