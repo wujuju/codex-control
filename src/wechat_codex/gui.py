@@ -29,7 +29,7 @@ from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
 from .accounts import AccountRecord, AccountRegistry
 from .app import BridgeApp
 from .chatgpt_runner import ChatGPTRunner
-from .config import AppConfig, load_config
+from .config import AppConfig, default_config_path, load_config
 from .ilink_auth import ILinkLoginCancelled, load_credentials, login_with_qr
 from .instance_lock import AlreadyRunningError, InstanceLock, acquire_instance_lock
 from .onboarding import ensure_chatgpt_login
@@ -740,7 +740,12 @@ class AccountManager(QObject):
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="微信 Codex QML 桌面端")
-    parser.add_argument("--config", default="config.yaml", help="配置文件路径")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=default_config_path(),
+        help="配置文件路径（默认使用程序同目录的 config.yaml）",
+    )
     parser.add_argument(
         "--skip-login-check",
         action="store_true",

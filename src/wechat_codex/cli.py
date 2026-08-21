@@ -12,7 +12,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from .app import BridgeApp
-from .config import AppConfig, load_config
+from .config import AppConfig, default_config_path, load_config
 from .ilink_api import ILinkError
 from .ilink_auth import load_credentials, login_with_qr
 from .ilink_client import ILinkClient
@@ -22,7 +22,12 @@ from .onboarding import ensure_chatgpt_login, ensure_logins
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="微信 iLink Bot 到 ChatGPT/Codex 的桥接器")
-    parser.add_argument("--config", default="config.yaml", help="配置文件路径")
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=default_config_path(),
+        help="配置文件路径（打包后默认使用程序同目录的 config.yaml）",
+    )
     parser.add_argument("--verbose", action="store_true", help="显示调试日志")
     parser.add_argument("--log-file", help="将日志写入滚动文件，而不是标准错误")
     sub = parser.add_subparsers(dest="command", required=True)

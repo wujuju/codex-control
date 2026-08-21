@@ -1,11 +1,22 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
-from wechat_codex.config import load_config
+from wechat_codex.config import default_config_path, load_config
 
 
 class ConfigTests(unittest.TestCase):
+    def test_frozen_app_uses_config_beside_executable(self) -> None:
+        executable = Path("C:/Program Files/WeChat Codex/wechat-codex-gui.exe")
+        with patch("wechat_codex.config.sys.frozen", True, create=True), patch(
+            "wechat_codex.config.sys.executable", str(executable)
+        ):
+            self.assertEqual(
+                default_config_path(),
+                executable.resolve().parent / "config.yaml",
+            )
+
     def _write_config(self, root: Path, extra: str = "") -> Path:
         source = root / "config.yaml"
         source.write_text(

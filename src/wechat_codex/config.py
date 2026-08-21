@@ -3,12 +3,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 from pathlib import Path
+import sys
 from typing import Any
 from urllib.parse import urlsplit
 
 import yaml
 
 from .ilink_api import DEFAULT_API_BASE_URL, validate_base_url
+
+
+def default_config_path() -> Path:
+    """Return the config beside a frozen executable, or in the working directory."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent / "config.yaml"
+    return Path("config.yaml")
 
 
 @dataclass(frozen=True)
