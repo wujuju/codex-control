@@ -5,6 +5,8 @@ import logging
 import sys
 import threading
 import time
+import uuid
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
@@ -28,6 +30,12 @@ from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
 
 from .accounts import AccountRecord, AccountRegistry
 from .app import BridgeApp
+from .chat_history import (
+    PERSISTED_KINDS,
+    ChatHistoryError,
+    ChatHistoryStore,
+    ChatMessage,
+)
 from .chatgpt_runner import ChatGPTRunner
 from .config import AppConfig, default_config_path, load_config
 from .ilink_auth import ILinkLoginCancelled, load_credentials, login_with_qr
@@ -101,9 +109,13 @@ class MessageModel(QAbstractListModel):
     TimeRole = KindRole + 3
     OutgoingRole = KindRole + 4
 
-    def __init__(self) -> None:
+    def __init__(self, messages: list[ChatMessage] | None = None) -> None:
         super().__init__()
         self._items: list[dict[str, Any]] = []
+        self._message_ids: set[str] = set()
+        if messages:
+            self._items = [self._item_from_message(message) for message in messages]
+            self._message_ids = {message.message_id for message in messages}
 
     def rowCount(
         self, parent: QModelIndex | QPersistentModelIndex = QModelIndex()
@@ -136,25 +148,66 @@ class MessageModel(QAbstractListModel):
             self.OutgoingRole: QByteArray(b"outgoing"),
         }
 
-    def add_message(self, kind: str, sender: str, text: str) -> None:
-        from datetime import datetime
-
-        if len(self._items) >= 500:
-            self.beginRemoveRows(QModelIndex(), 0, 0)
-            self._items.pop(0)
-            self.endRemoveRows()
+    def add_message(self, message: ChatMessage) -> bool:
+        if message.message_id in self._message_ids:
+            return False
         row = len(self._items)
         self.beginInsertRows(QModelIndex(), row, row)
-        self._items.append(
-            {
-                "kind": kind,
-                "sender": sender,
-                "text": text,
-                "time": datetime.now().strftime("%H:%M"),
-                "outgoing": kind == "outgoing",
-            }
-        )
+        self._items.append(self._item_from_message(message))
+        self._message_ids.add(message.message_id)
         self.endInsertRows()
+        return True
+
+    def add_system_message(self, text: str) -> None:
+        self.add_message(
+            ChatMessage.create(
+                message_id=f"system:{uuid.uuid4().hex}",
+                kind="system",
+                sender="系统",
+                peer_id="",
+                text=text,
+            )
+        )
+
+    def prepend_messages(self, messages: list[ChatMessage]) -> int:
+        fresh = [
+            message
+            for message in messages
+            if message.message_id not in self._message_ids
+        ]
+        if not fresh:
+            return 0
+        self.beginInsertRows(QModelIndex(), 0, len(fresh) - 1)
+        self._items[0:0] = [self._item_from_message(message) for message in fresh]
+        self._message_ids.update(message.message_id for message in fresh)
+        self.endInsertRows()
+        return len(fresh)
+
+    def oldest_persisted(self) -> ChatMessage | None:
+        for item in self._items:
+            message = item["message"]
+            if message.kind in PERSISTED_KINDS:
+                return message
+        return None
+
+    def latest_persisted(self) -> ChatMessage | None:
+        for item in reversed(self._items):
+            message = item["message"]
+            if message.kind in PERSISTED_KINDS:
+                return message
+        return None
+
+    @staticmethod
+    def _item_from_message(message: ChatMessage) -> dict[str, Any]:
+        timestamp = datetime.fromtimestamp(message.occurred_at_ms / 1000)
+        return {
+            "kind": message.kind,
+            "sender": message.sender,
+            "text": message.text,
+            "time": timestamp.strftime("%Y-%m-%d %H:%M"),
+            "outgoing": message.kind == "outgoing",
+            "message": message,
+        }
 
     @Slot()
     def clear(self) -> None:
@@ -162,13 +215,15 @@ class MessageModel(QAbstractListModel):
             return
         self.beginResetModel()
         self._items.clear()
+        self._message_ids.clear()
         self.endResetModel()
 
 
 class BridgeController(QObject):
     statusChanged = Signal()
     runningChanged = Signal()
-    bridgeEvent = Signal(str, str, str)
+    historyChanged = Signal()
+    bridgeEvent = Signal(object)
     bridgeState = Signal(str, str)
 
     def __init__(
@@ -185,9 +240,22 @@ class BridgeController(QObject):
         self._owner_id = owner_id
         self._chat_pool = chat_pool
         self.conversations = ConversationModel(config, account_id)
-        self.messages = MessageModel()
         self._status = "准备启动"
         self._state = "stopped"
+        self._history: ChatHistoryStore | None = None
+        self._history_error = ""
+        self._history_has_older = False
+        history_messages: list[ChatMessage] = []
+        if account_id:
+            try:
+                self._history = ChatHistoryStore(config.runtime_dir, account_id)
+                history_messages = self._history.latest(200)
+                self._history_has_older = self._history.count() > len(history_messages)
+            except ChatHistoryError as exc:
+                self._history_error = str(exc)
+                self._state = "error"
+                self._status = self._history_error
+        self.messages = MessageModel(history_messages)
         self._bridge: BridgeApp | None = None
         self._thread: threading.Thread | None = None
         self._stop_thread: threading.Thread | None = None
@@ -198,7 +266,12 @@ class BridgeController(QObject):
         self.bridgeState.connect(
             self._apply_state, Qt.ConnectionType.QueuedConnection
         )
-        self.messages.add_message("system", "系统", "界面已启动，正在连接微信 iLink")
+        latest = self.messages.latest_persisted()
+        if latest is not None:
+            self.conversations.set_preview(latest.text)
+        self.messages.add_system_message(
+            self._history_error or "界面已启动，正在连接微信 iLink"
+        )
 
     @Property(str, notify=statusChanged)
     def statusText(self) -> str:
@@ -211,6 +284,10 @@ class BridgeController(QObject):
     @Property(bool, notify=runningChanged)
     def running(self) -> bool:
         return self._state in {"connecting", "running", "reconnecting", "stopping"}
+
+    @Property(bool, notify=historyChanged)
+    def hasOlderMessages(self) -> bool:
+        return self._history_has_older
 
     @Property(str, constant=True)
     def conversationTitle(self) -> str:
@@ -229,6 +306,9 @@ class BridgeController(QObject):
     @Slot()
     def startBridge(self) -> None:
         with self._lock:
+            if self._history_error:
+                self._set_state("error", self._history_error)
+                return
             if self._thread is not None and self._thread.is_alive():
                 return
             if self._stop_thread is not None and self._stop_thread.is_alive():
@@ -249,7 +329,7 @@ class BridgeController(QObject):
                             "微信授权者与账号清单不一致，请重新扫码授权"
                         )
                 options: dict[str, Any] = {
-                    "event_sink": self.bridgeEvent.emit,
+                    "event_sink": self._record_event,
                     "state_sink": self.bridgeState.emit,
                 }
                 if self._chat_pool is not None and self._account_id:
@@ -260,7 +340,7 @@ class BridgeController(QObject):
             except Exception as exc:
                 log.exception("桥接器初始化失败")
                 self._set_state("error", f"启动失败：{exc}")
-                self.messages.add_message("system", "系统", f"启动失败：{exc}")
+                self.messages.add_system_message(f"启动失败：{exc}")
                 return
             self._bridge = bridge
             self._thread = threading.Thread(
@@ -305,24 +385,65 @@ class BridgeController(QObject):
             return
         bridge = self._bridge
         if bridge is None or self._state != "running":
-            self.messages.add_message("system", "系统", "桥接尚未运行，消息未发送")
+            self.messages.add_system_message("桥接尚未运行，消息未发送")
             return
         bridge.enqueue_message(cleaned)
 
     @Slot()
     def clearMessages(self) -> None:
+        if self._history is not None:
+            try:
+                self._history.clear()
+            except ChatHistoryError as exc:
+                self.messages.add_system_message(str(exc))
+                return
         self.messages.clear()
+        if self._history_has_older:
+            self._history_has_older = False
+            self.historyChanged.emit()
 
-    @Slot(str, str, str)
-    def _apply_event(self, kind: str, sender: str, text: str) -> None:
-        self.messages.add_message(kind, sender, text)
-        self.conversations.set_preview(text)
+    @Slot(result=int)
+    def loadOlderMessages(self) -> int:
+        history = self._history
+        cursor = self.messages.oldest_persisted()
+        if history is None or cursor is None or not self._history_has_older:
+            return 0
+        try:
+            page = history.before(cursor, 201)
+        except ChatHistoryError as exc:
+            self.messages.add_system_message(str(exc))
+            self._history_has_older = False
+            self.historyChanged.emit()
+            return 0
+        has_older = len(page) > 200
+        older = page[1:] if has_older else page
+        added = self.messages.prepend_messages(older)
+        if has_older != self._history_has_older:
+            self._history_has_older = has_older
+            self.historyChanged.emit()
+        return added
+
+    def _record_event(self, message: ChatMessage) -> None:
+        if message.kind in PERSISTED_KINDS:
+            if self._history is None:
+                raise ChatHistoryError("当前微信账号没有可用的历史记录数据库")
+            if not self._history.append(message):
+                return
+        self.bridgeEvent.emit(message)
+
+    @Slot(object)
+    def _apply_event(self, message: object) -> None:
+        if not isinstance(message, ChatMessage):
+            log.error("忽略无效的界面消息事件：%r", message)
+            return
+        if self.messages.add_message(message) and message.kind in PERSISTED_KINDS:
+            self.conversations.set_preview(message.text)
 
     @Slot(str, str)
     def _apply_state(self, state: str, text: str) -> None:
         self._set_state(state, text)
         if state in {"running", "reconnecting", "stopped"}:
-            self.messages.add_message("system", "系统", text)
+            self.messages.add_system_message(text)
 
     def _set_state(self, state: str, text: str) -> None:
         was_running = self.running
@@ -351,8 +472,12 @@ class BridgeController(QObject):
                 continue
             remaining = max(0.0, deadline - time.monotonic())
             worker.join(timeout=remaining)
-        if bridge_thread is not None and bridge_thread.is_alive():
+        bridge_still_running = bridge_thread is not None and bridge_thread.is_alive()
+        if bridge_still_running:
             log.warning("等待桥接线程退出超时；进程退出时将强制回收")
+        if self._history is not None and not bridge_still_running:
+            self._history.close()
+            self._history = None
 
 
 class AccountListModel(QAbstractListModel):

@@ -632,12 +632,12 @@ ApplicationWindow {
                                     }
                                 }
                                 Button {
-                                    text: "清空"
+                                    text: "清除记录"
                                     flat: true
                                     enabled: window.currentBridge !== null
                                     onClicked: {
                                         if (window.currentBridge)
-                                            window.currentBridge.clearMessages()
+                                            clearHistoryDialog.open()
                                     }
                                 }
                                 Button {
@@ -661,8 +661,39 @@ ApplicationWindow {
                             model: window.currentMessageModel
                             boundsBehavior: Flickable.StopAtBounds
                             ScrollBar.vertical: ScrollBar {}
+                            property bool loadingOlder: false
+                            property real heightBeforeOlderLoad: 0
+                            property real yBeforeOlderLoad: 0
 
-                            onCountChanged: positionViewAtEnd()
+                            onCountChanged: {
+                                if (!loadingOlder)
+                                    positionViewAtEnd()
+                            }
+
+                            header: Item {
+                                width: messageList.width
+                                height: window.currentBridge && window.currentBridge.hasOlderMessages ? 40 : 0
+                                visible: height > 0
+
+                                Button {
+                                    anchors.centerIn: parent
+                                    text: "加载更早消息"
+                                    flat: true
+                                    onClicked: {
+                                        if (!window.currentBridge || messageList.loadingOlder)
+                                            return
+                                        messageList.loadingOlder = true
+                                        messageList.heightBeforeOlderLoad = messageList.contentHeight
+                                        messageList.yBeforeOlderLoad = messageList.contentY
+                                        window.currentBridge.loadOlderMessages()
+                                        Qt.callLater(function() {
+                                            const addedHeight = messageList.contentHeight - messageList.heightBeforeOlderLoad
+                                            messageList.contentY = messageList.yBeforeOlderLoad + addedHeight
+                                            messageList.loadingOlder = false
+                                        })
+                                    }
+                                }
+                            }
 
                             delegate: Item {
                                 id: messageDelegate
@@ -675,6 +706,12 @@ ApplicationWindow {
 
                                 width: messageList.width
                                 height: messageDelegate.kind === "system" ? systemLabel.height + 14 : bubble.height + 24
+
+                                TextMetrics {
+                                    id: messageMetrics
+                                    text: messageDelegate.messageText
+                                    font.pixelSize: 14
+                                }
 
                                 Text {
                                     id: systemLabel
@@ -690,7 +727,7 @@ ApplicationWindow {
                                 Rectangle {
                                     id: bubble
                                     visible: messageDelegate.kind !== "system"
-                                    width: Math.min(Math.max(messageBody.implicitWidth + 28, 100), parent.width * 0.72)
+                                    width: Math.min(Math.max(messageMetrics.boundingRect.width + 28, 100), parent.width * 0.72)
                                     height: bubbleColumn.implicitHeight + 20
                                     x: messageDelegate.outgoing ? parent.width - width - 10 : 10
                                     radius: 14
@@ -713,20 +750,50 @@ ApplicationWindow {
                                             font.pixelSize: 11
                                             font.bold: true
                                         }
-                                        Text {
+                                        TextEdit {
                                             id: messageBody
                                             Layout.fillWidth: true
+                                            Layout.preferredHeight: contentHeight
                                             text: messageDelegate.messageText
                                             color: messageDelegate.outgoing ? "white" : "#202630"
                                             font.pixelSize: 14
-                                            wrapMode: Text.Wrap
-                                            textFormat: Text.PlainText
+                                            wrapMode: TextEdit.Wrap
+                                            textFormat: TextEdit.PlainText
+                                            readOnly: true
+                                            selectByMouse: true
+                                            selectByKeyboard: true
+                                            persistentSelection: true
+                                            selectionColor: messageDelegate.outgoing ? "#184f9f" : "#b9d5ff"
+                                            selectedTextColor: messageDelegate.outgoing ? "white" : "#101820"
                                         }
                                         Text {
                                             Layout.alignment: Qt.AlignRight
                                             text: messageDelegate.messageTime
                                             color: messageDelegate.outgoing ? "#d3e2ff" : "#a0a8b4"
                                             font.pixelSize: 10
+                                        }
+                                    }
+
+                                    TapHandler {
+                                        acceptedButtons: Qt.RightButton
+                                        onTapped: messageMenu.popup()
+                                    }
+
+                                    Menu {
+                                        id: messageMenu
+
+                                        MenuItem {
+                                            text: "复制所选文字"
+                                            enabled: messageBody.selectedText.length > 0
+                                            onTriggered: messageBody.copy()
+                                        }
+                                        MenuItem {
+                                            text: "复制整条消息"
+                                            onTriggered: {
+                                                messageBody.selectAll()
+                                                messageBody.copy()
+                                                messageBody.deselect()
+                                            }
                                         }
                                     }
                                 }
@@ -810,6 +877,25 @@ ApplicationWindow {
                     }
                 }
             }
+        }
+    }
+
+    Dialog {
+        id: clearHistoryDialog
+        anchors.centerIn: parent
+        modal: true
+        title: "清除当前账号历史？"
+        standardButtons: Dialog.Cancel | Dialog.Ok
+
+        Label {
+            width: 340
+            wrapMode: Text.Wrap
+            text: "该操作只删除当前微信账号的全部私聊历史，且无法撤销；其他账号不受影响。"
+        }
+
+        onAccepted: {
+            if (window.currentBridge)
+                window.currentBridge.clearMessages()
         }
     }
 

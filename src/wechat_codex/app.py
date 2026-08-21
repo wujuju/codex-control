@@ -16,6 +16,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+from .chat_history import ChatHistoryError, ChatMessage
 from .chatgpt_runner import ChatGPTRunner
 from .codex_runner import CodexRunner
 from .config import AppConfig
@@ -85,7 +86,7 @@ class BridgeApp:
         self,
         config: AppConfig,
         *,
-        event_sink: Callable[[str, str, str], None] | None = None,
+        event_sink: Callable[[ChatMessage], None] | None = None,
         state_sink: Callable[[str, str], None] | None = None,
         chat_runner: Any | None = None,
     ) -> None:
@@ -236,13 +237,14 @@ class BridgeApp:
         if cleaned:
             self._manual_messages.put((uuid.uuid4().hex, cleaned))
 
-    def _emit_event(self, kind: str, sender: str, text: str) -> None:
+    def _emit_event(self, message: ChatMessage) -> None:
         if self._event_sink is None:
             return
         try:
-            self._event_sink(kind, sender, text)
+            self._event_sink(message)
         except Exception:
             log.exception("界面消息回调失败")
+            raise
 
     def _emit_state(self, state: str, text: str) -> None:
         if self._state_sink is None:
@@ -298,7 +300,15 @@ class BridgeApp:
             client_id = f"inbound:{digest}:reply:{self._current_send_index}"
             self._current_send_index += 1
         self.wechat.send(text, target, client_id=client_id)
-        self._emit_event("outgoing", "微信 Bot", text)
+        self._emit_event(
+            ChatMessage.create(
+                message_id=f"outgoing:{client_id or uuid.uuid4().hex}",
+                kind="outgoing",
+                sender="微信 Bot",
+                peer_id=target.user_id,
+                text=text,
+            )
+        )
 
     def _send_event(
         self,
@@ -506,14 +516,31 @@ class BridgeApp:
                         item.target,
                         client_id=item.item_id,
                     )
-                    self._emit_event("outgoing", "微信 Bot", item.payload)
+                    self._emit_event(
+                        ChatMessage.create(
+                            message_id=f"outgoing:{item.item_id}",
+                            kind="outgoing",
+                            sender="微信 Bot",
+                            peer_id=item.target.user_id,
+                            text=item.payload,
+                        )
+                    )
                 elif item.kind == "image":
                     self.wechat.send_image(
                         item.payload,
                         item.target,
                         client_id=item.item_id,
                     )
-                    self._emit_event("outgoing", "微信 Bot", "[图片]")
+                    self._emit_event(
+                        ChatMessage.create(
+                            message_id=f"outgoing:{item.item_id}",
+                            kind="outgoing",
+                            sender="微信 Bot",
+                            peer_id=item.target.user_id,
+                            text="[图片]",
+                            content_type="image",
+                        )
+                    )
                 else:
                     self.wechat.send_file(
                         item.payload,
@@ -521,8 +548,30 @@ class BridgeApp:
                         client_id=item.item_id,
                     )
                     self._emit_event(
-                        "outgoing", "微信 Bot", f"[文件] {Path(item.payload).name}"
+                        ChatMessage.create(
+                            message_id=f"outgoing:{item.item_id}",
+                            kind="outgoing",
+                            sender="微信 Bot",
+                            peer_id=item.target.user_id,
+                            text=f"[文件] {Path(item.payload).name}",
+                            content_type="file",
+                        )
                     )
+            except ChatHistoryError as exc:
+                remaining.append(
+                    replace(
+                        item,
+                        next_attempt_at=now + 5.0,
+                        last_error=str(exc)[-1000:],
+                    )
+                )
+                remaining.extend(self._outbox[index + 1 :])
+                changed = True
+                log.error(
+                    "出站消息已投递，但历史记录尚未落盘；保留队列并稍后幂等重试：%s",
+                    exc,
+                )
+                break
             except Exception as exc:
                 attempts = item.attempts + 1
                 detail = f"{type(exc).__name__}: {exc}"[-1000:]
@@ -573,10 +622,16 @@ class BridgeApp:
                 self._dead_letters = original_dead_letters
                 raise
             self._emit_event(
-                "system",
-                "系统",
-                f"有异步回复发送失败并进入死信队列；当前共 {len(dead_letters)} 条，"
-                "可发送 @健康检查 查看详情",
+                ChatMessage.create(
+                    message_id=f"system:{uuid.uuid4().hex}",
+                    kind="system",
+                    sender="系统",
+                    peer_id="",
+                    text=(
+                        f"有异步回复发送失败并进入死信队列；当前共 {len(dead_letters)} 条，"
+                        "可发送 @健康检查 查看详情"
+                    ),
+                )
             )
         if changed:
             self._outbox = remaining
@@ -884,7 +939,16 @@ class BridgeApp:
                     self._send(f"图片接收失败，请重新发送（{exc}）", target)
                     return
             log.info("收到 iLink 消息（%s）：%s", message.sender_id, message.content)
-            self._emit_event("incoming", message.sender, message.content)
+            self._emit_event(
+                ChatMessage.create(
+                    message_id=self._inbound_event_id(message.key, "gui-message"),
+                    kind="incoming",
+                    sender=message.sender,
+                    peer_id=message.sender_id,
+                    text=message.content,
+                    content_type="image" if message.image_path else "text",
+                )
+            )
             session_key = self._chat_session_key(message)
             self._reply_targets[session_key] = target
             self._acknowledge(message, target)

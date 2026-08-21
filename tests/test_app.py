@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import unittest
 
 from wechat_codex.app import BridgeApp
+from wechat_codex.chat_history import ChatHistoryError, ChatMessage
 from wechat_codex.chatgpt_runner import ChatEvent
 from wechat_codex.ilink_client import ILinkStateError, IncomingMessage, ReplyTarget
 
@@ -250,6 +251,23 @@ class BridgeAppTests(unittest.TestCase):
             app._reply_targets["ilink:bot-1:owner-id"], ReplyTarget("owner-id", "ctx-1")
         )
 
+    def test_incoming_publishes_structured_message_with_stable_id(self) -> None:
+        app = self.make_app()
+        events: list[ChatMessage] = []
+        app._event_sink = events.append
+        incoming = message("owner-id", "保留历史")
+
+        app._process_incoming(incoming)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].kind, "incoming")
+        self.assertEqual(events[0].peer_id, "owner-id")
+        self.assertEqual(events[0].text, "保留历史")
+        self.assertEqual(
+            events[0].message_id,
+            app._inbound_event_id(incoming.key, "gui-message"),
+        )
+
     def test_async_completion_cancels_native_typing(self) -> None:
         app = self.make_app()
         incoming = message("user-a", "耗时问题")
@@ -327,6 +345,22 @@ class BridgeAppTests(unittest.TestCase):
         app.wechat.send_failures = 1
         app._flush_outbox()
         self.assertEqual([item.payload for item in app._outbox], ["GUI 手工消息"])
+
+    def test_delivered_outbox_item_is_retained_until_history_is_durable(self) -> None:
+        app = self.make_app()
+        app.enqueue_message("必须同时写入历史")
+        app._persist_manual_messages()
+
+        def fail_history(_message: ChatMessage) -> None:
+            raise ChatHistoryError("disk")
+
+        app._event_sink = fail_history
+        app._flush_outbox()
+
+        self.assertEqual(len(app.wechat.sent), 1)
+        self.assertEqual(len(app._outbox), 1)
+        self.assertEqual(app._outbox[0].attempts, 0)
+        self.assertGreater(app._outbox[0].next_attempt_at, 0)
 
     def test_resend_replay_reuses_stable_outbox_client_id(self) -> None:
         app = self.make_app()

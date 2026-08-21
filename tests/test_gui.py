@@ -9,8 +9,10 @@ from unittest.mock import patch
 from PySide6.QtCore import QCoreApplication
 
 from wechat_codex.config import AppConfig
+from wechat_codex.chat_history import ChatHistoryStore, ChatMessage
 from wechat_codex.gui import (
     BridgeController,
+    MessageModel,
     _prepare_gui_logins,
     _prepare_gui_runtime,
 )
@@ -87,6 +89,103 @@ class BridgeControllerTests(unittest.TestCase):
         controller.sendMessage("不应入队")
 
         self.assertEqual(enqueued, [])
+
+    def test_account_history_survives_controller_recreation_and_deduplicates(self) -> None:
+        with TemporaryDirectory() as directory:
+            config = cast(
+                AppConfig,
+                SimpleNamespace(runtime_dir=Path(directory)),
+            )
+            message = ChatMessage(
+                message_id="incoming:stable",
+                kind="incoming",
+                sender="用户 A",
+                peer_id="user-a",
+                text="需要永久保留",
+                occurred_at_ms=1_700_000_000_000,
+            )
+            first = BridgeController(config, account_id="bot-a")
+            first._record_event(message)
+            first._record_event(message)
+            self.qt_app.processEvents()
+            self.assertEqual(first.messages.rowCount(), 2)
+            first.wait_for_shutdown()
+
+            reopened = BridgeController(config, account_id="bot-a")
+            self.assertEqual(reopened.messages.rowCount(), 2)
+            index = reopened.messages.index(0, 0)
+            self.assertEqual(
+                reopened.messages.data(index, MessageModel.TextRole),
+                "需要永久保留",
+            )
+            reopened.wait_for_shutdown()
+
+    def test_clear_messages_deletes_only_current_accounts_database(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            first_config = cast(
+                AppConfig,
+                SimpleNamespace(runtime_dir=root / "account-a"),
+            )
+            second_config = cast(
+                AppConfig,
+                SimpleNamespace(runtime_dir=root / "account-b"),
+            )
+            first = BridgeController(first_config, account_id="bot-a")
+            second = BridgeController(second_config, account_id="bot-b")
+            first._record_event(
+                ChatMessage.create(
+                    message_id="a",
+                    kind="incoming",
+                    sender="A",
+                    peer_id="user-a",
+                    text="A 的消息",
+                )
+            )
+            second._record_event(
+                ChatMessage.create(
+                    message_id="b",
+                    kind="incoming",
+                    sender="B",
+                    peer_id="user-b",
+                    text="B 的消息",
+                )
+            )
+            self.qt_app.processEvents()
+
+            first.clearMessages()
+
+            self.assertEqual(first.messages.rowCount(), 0)
+            self.assertEqual(second._history.count(), 1)  # type: ignore[union-attr]
+            first.wait_for_shutdown()
+            second.wait_for_shutdown()
+
+    def test_older_history_is_loaded_without_discarding_database_rows(self) -> None:
+        with TemporaryDirectory() as directory:
+            runtime = Path(directory)
+            store = ChatHistoryStore(runtime, "bot-a")
+            for index in range(401):
+                store.append(
+                    ChatMessage(
+                        message_id=f"message-{index:03d}",
+                        kind="incoming",
+                        sender="A",
+                        peer_id="user-a",
+                        text=str(index),
+                        occurred_at_ms=index,
+                    )
+                )
+            store.close()
+            config = cast(AppConfig, SimpleNamespace(runtime_dir=runtime))
+            controller = BridgeController(config, account_id="bot-a")
+
+            self.assertTrue(controller.hasOlderMessages)
+            self.assertEqual(controller.loadOlderMessages(), 200)
+            self.assertTrue(controller.hasOlderMessages)
+            self.assertEqual(controller.loadOlderMessages(), 1)
+            self.assertFalse(controller.hasOlderMessages)
+            self.assertEqual(controller.messages.rowCount(), 402)
+            controller.wait_for_shutdown()
 
 
 class GuiLoginPreparationTests(unittest.TestCase):

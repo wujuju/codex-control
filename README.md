@@ -9,7 +9,7 @@
 - 通过微信扫码授权 Bot，凭证只保存在本机 `.runtime`。
 - 使用 `getupdates` 长轮询接收消息，游标和待处理消息会持久化。
 - 回复使用入站消息的 `from_user_id` 和 `context_token`，不会按昵称猜测联系人。
-- 桌面端可同时登录并监听多个微信 iLink Bot；每个账号使用独立的凭证、游标和任务状态。
+- 桌面端可同时登录并监听多个微信 iLink Bot；每个账号使用独立的凭证、游标、任务状态和私聊历史。
 - 每个 iLink 用户有独立的 ChatGPT 网页会话。
 - 所有微信账号共用一个 ChatGPT Plus 登录和浏览器工作器，请求会串行处理。
 - 同一个 `.runtime` 同时只允许运行一个会使用登录资料或消息状态的程序实例。
@@ -63,7 +63,7 @@ Copy-Item config.example.yaml config.yaml
 - 扫码用户的稳定 iLink 用户 ID
 - 服务端返回的业务 API 地址
 
-新账号保存在 `.runtime/accounts/<账号槽位>/`，旧版账号继续原地使用，不会搬动或覆盖。凭证文件已被 `.gitignore` 排除，不要复制到仓库或聊天中。命令行 `ilink-login` 只管理旧版默认账号；新增账号请使用 GUI：
+新账号保存在 `.runtime/accounts/<账号槽位>/`，旧版账号继续原地使用，不会搬动或覆盖。凭证文件已被 `.gitignore` 排除，不要复制到仓库或聊天中。私聊正文可以用鼠标选择并按 `Ctrl+C`，也可以右键复制所选文字或整条消息。命令行 `ilink-login` 只管理旧版默认账号；新增账号请使用 GUI：
 
 ```powershell
 .\.venv\Scripts\wechat-codex.exe --config config.yaml ilink-login --force
@@ -192,6 +192,7 @@ Codex、项目、日志、缓存清理和故障恢复命令仅允许 `ilink_code
 - `ilink-account.json`、`ilink-state.json`：兼容保留的旧版默认账号凭证与消息状态。
 - `accounts/<账号槽位>/`：新增账号各自独立的凭证、长轮询游标、任务、出站队列与缓存。
 - `runtime_account.json`（或账号目录中的同名文件）：将消息、任务和出站队列绑定到对应 iLink Bot，阻止串号。
+- `gui-chat-history.sqlite3`（或账号目录中的同名文件）：当前微信账号独立的桌面私聊历史；使用稳定消息 ID 去重，并支持分页读取。
 - `chatgpt-plus-profile/`：ChatGPT Plus 浏览器登录资料。
 - `chatgpt_web_conversations.json`：iLink 用户到 ChatGPT 对话 URL 的映射。
 - `chatgpt_conversation_titles.json`：用户手动设置的 ChatGPT 对话标题。
